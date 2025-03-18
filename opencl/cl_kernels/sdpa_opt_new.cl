@@ -3085,10 +3085,10 @@ DECLARE_BLOCK_WRITE_EMULATION(8, 8)
 #    define DECLARE_SUB_GROUP_SHUFFLE(type)    \
         DECLARE_SUB_GROUP_SHUFFLE1(type, type) \
         DECLARE_SUB_GROUP_SHUFFLE2(type, type) DECLARE_SUB_GROUP_SHUFFLE4(type, type) DECLARE_SUB_GROUP_SHUFFLE8(type, type) DECLARE_SUB_GROUP_SHUFFLE16(type, type)
-#    define DECLARE_SUB_GROUP_SHUFFLE_CASTED(type, cast_type)                                                                               \
-        DECLARE_SUB_GROUP_SHUFFLE1(type, cast_type)                                                                                         \
-        DECLARE_SUB_GROUP_SHUFFLE2(type, cast_type) DECLARE_SUB_GROUP_SHUFFLE4(type, cast_type) DECLARE_SUB_GROUP_SHUFFLE8(type, cast_type) \
-            DECLARE_SUB_GROUP_SHUFFLE16(type, cast_type)
+#    define DECLARE_SUB_GROUP_SHUFFLE_CASTED(type, cast_type) \
+        DECLARE_SUB_GROUP_SHUFFLE1(type, cast_type)           \
+        DECLARE_SUB_GROUP_SHUFFLE2(type, cast_type)           \
+        DECLARE_SUB_GROUP_SHUFFLE4(type, cast_type) DECLARE_SUB_GROUP_SHUFFLE8(type, cast_type) DECLARE_SUB_GROUP_SHUFFLE16(type, cast_type)
 DECLARE_SUB_GROUP_SHUFFLE(int)
 DECLARE_SUB_GROUP_SHUFFLE(uint)
 DECLARE_SUB_GROUP_SHUFFLE(float)
