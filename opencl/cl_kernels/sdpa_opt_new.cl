@@ -3398,14 +3398,14 @@ typedef struct float0 {
 #define ACTIVATION_PARAMS                 NL_M, NL_N
 #define ACTIVATION_FUNC(input, m, n)      input
 #define ACTIVATION(input, params)         ACTIVATION_FUNC(input, params)
-#define INPUT0_SIZE_X                     HEAD_SIZE
-#define INPUT0_SIZE_Y                     (shape_info[6])
+#define INPUT0_SIZE_X                     64
+#define INPUT0_SIZE_Y                     1357
 #define INPUT0_SIZE_Z                     1
 #define INPUT0_SIZE_W                     1
 #define INPUT0_SIZE_U                     1
 #define INPUT0_SIZE_V                     1
-#define INPUT0_FEATURE_NUM                28
-#define INPUT0_BATCH_NUM                  (shape_info[0])
+#define INPUT0_FEATURE_NUM                38
+#define INPUT0_BATCH_NUM                  2
 #define INPUT0_PAD_BEFORE_SIZE_X          0
 #define INPUT0_PAD_BEFORE_SIZE_Y          0
 #define INPUT0_PAD_BEFORE_SIZE_Z          0
@@ -3423,18 +3423,18 @@ typedef struct float0 {
 #define INPUT0_PAD_AFTER_FEATURE_NUM      0
 #define INPUT0_PAD_AFTER_BATCH_NUM        0
 #define INPUT0_X_PITCH                    1
-#define INPUT0_Y_PITCH                    HEAD_SIZE
-#define INPUT0_Z_PITCH                    (HEAD_SIZE * (shape_info[6] + 0))
-#define INPUT0_W_PITCH                    (HEAD_SIZE * (shape_info[6] + 0) * 1)
-#define INPUT0_U_PITCH                    (HEAD_SIZE * (shape_info[6] + 0) * 1 * 1)
-#define INPUT0_V_PITCH                    (HEAD_SIZE * (shape_info[6] + 0) * 1 * 1 * 1)
-#define INPUT0_FEATURE_PITCH              (HEAD_SIZE * (shape_info[6] + 0) * 1 * 1 * 1 * 1)
-#define INPUT0_BATCH_PITCH                (HEAD_SIZE * (shape_info[6] + 0) * 1 * 1 * 1 * 1 * 28)
+#define INPUT0_Y_PITCH                    64
+#define INPUT0_Z_PITCH                    1
+#define INPUT0_W_PITCH                    1
+#define INPUT0_U_PITCH                    1
+#define INPUT0_V_PITCH                    1
+#define INPUT0_FEATURE_PITCH              86848
+#define INPUT0_BATCH_PITCH                3300224
 #define INPUT0_GET_INDEX_SAFE(b, f, y, x) GET_DATA_INDEX_SAFE(INPUT0, b, f, y, x)
 #define INPUT0_GET_INDEX(b, f, y, x)      GET_DATA_INDEX(INPUT0, b, f, y, x)
 #define INPUT0_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(INPUT0, b, f, y, x)
 #define INPUT0_VIEW_OFFSET                0
-#define INPUT0_LENGTH                     0
+#define INPUT0_LENGTH                     6600448
 #define INPUT0_DIMS                       4
 #define INPUT0_SIMPLE                     1
 #define INPUT0_GROUPED                    0
@@ -3452,9 +3452,25 @@ typedef struct float0 {
 #define INPUT0_ABS_FUNC                   fabs
 #define INPUT0_TYPE_SIZE                  2
 #define INPUT0_IS_FP                      1
-#define INPUT0_OFFSET                                                                                                                          \
-    ((INPUT0_X_PITCH * INPUT0_PAD_BEFORE_SIZE_X) + (INPUT0_Y_PITCH * INPUT0_PAD_BEFORE_SIZE_Y) + (INPUT0_Z_PITCH * INPUT0_PAD_BEFORE_SIZE_Z) + \
-     (INPUT0_W_PITCH * INPUT0_PAD_BEFORE_SIZE_W) + (INPUT0_FEATURE_PITCH * INPUT0_PAD_BEFORE_FEATURE_NUM) + (INPUT0_BATCH_PITCH * INPUT0_PAD_BEFORE_BATCH_NUM))
+#define INPUT0_OFFSET                     0
+#define INPUT0_SIZES_DATA \
+    {                     \
+        64,               \
+        1357,             \
+        38,               \
+        2,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+    }
+CONST_ARRAY_DECL(INPUT0_SIZES) = INPUT0_SIZES_DATA;
+#define INPUT0_SIZES CONST_ARRAY_REF(INPUT0_SIZES)
+#define INPUT0_PITCHES                        \
+    (size_t[]) {                              \
+        1, 64, 86848, 3300224, 1, 1, 1, 1, 1, \
+    }
 #define INPUT0_PAD_BEFORE          \
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
@@ -3463,16 +3479,16 @@ typedef struct float0 {
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
     }
-#define INPUT1_SIZE_X                     HEAD_SIZE
-#define INPUT1_SIZE_Y                     (shape_info[14])
+#define INPUT1_SIZE_X                     64
+#define INPUT1_SIZE_Y                     1357
 #define INPUT1_SIZE_Z                     1
 #define INPUT1_SIZE_W                     1
 #define INPUT1_SIZE_U                     1
 #define INPUT1_SIZE_V                     1
-#define INPUT1_FEATURE_NUM                7
-#define INPUT1_BATCH_NUM                  (shape_info[8])
+#define INPUT1_FEATURE_NUM                38
+#define INPUT1_BATCH_NUM                  2
 #define INPUT1_PAD_BEFORE_SIZE_X          0
-#define INPUT1_PAD_BEFORE_SIZE_Y          (shape_info[16])
+#define INPUT1_PAD_BEFORE_SIZE_Y          0
 #define INPUT1_PAD_BEFORE_SIZE_Z          0
 #define INPUT1_PAD_BEFORE_SIZE_W          0
 #define INPUT1_PAD_BEFORE_SIZE_U          0
@@ -3480,7 +3496,7 @@ typedef struct float0 {
 #define INPUT1_PAD_BEFORE_FEATURE_NUM     0
 #define INPUT1_PAD_BEFORE_BATCH_NUM       0
 #define INPUT1_PAD_AFTER_SIZE_X           0
-#define INPUT1_PAD_AFTER_SIZE_Y           (shape_info[17])
+#define INPUT1_PAD_AFTER_SIZE_Y           0
 #define INPUT1_PAD_AFTER_SIZE_Z           0
 #define INPUT1_PAD_AFTER_SIZE_W           0
 #define INPUT1_PAD_AFTER_SIZE_U           0
@@ -3488,18 +3504,18 @@ typedef struct float0 {
 #define INPUT1_PAD_AFTER_FEATURE_NUM      0
 #define INPUT1_PAD_AFTER_BATCH_NUM        0
 #define INPUT1_X_PITCH                    1
-#define INPUT1_Y_PITCH                    HEAD_SIZE
-#define INPUT1_Z_PITCH                    (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])))
-#define INPUT1_W_PITCH                    (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])) * 1)
-#define INPUT1_U_PITCH                    (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])) * 1 * 1)
-#define INPUT1_V_PITCH                    (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])) * 1 * 1 * 1)
-#define INPUT1_FEATURE_PITCH              (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])) * 1 * 1 * 1 * 1)
-#define INPUT1_BATCH_PITCH                (HEAD_SIZE * (shape_info[14] + (shape_info[16] + shape_info[17])) * 1 * 1 * 1 * 1 * 7)
+#define INPUT1_Y_PITCH                    64
+#define INPUT1_Z_PITCH                    1
+#define INPUT1_W_PITCH                    1
+#define INPUT1_U_PITCH                    1
+#define INPUT1_V_PITCH                    1
+#define INPUT1_FEATURE_PITCH              86848
+#define INPUT1_BATCH_PITCH                3300224
 #define INPUT1_GET_INDEX_SAFE(b, f, y, x) GET_DATA_INDEX_SAFE(INPUT1, b, f, y, x)
 #define INPUT1_GET_INDEX(b, f, y, x)      GET_DATA_INDEX(INPUT1, b, f, y, x)
 #define INPUT1_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(INPUT1, b, f, y, x)
 #define INPUT1_VIEW_OFFSET                0
-#define INPUT1_LENGTH                     0
+#define INPUT1_LENGTH                     6600448
 #define INPUT1_DIMS                       4
 #define INPUT1_SIMPLE                     1
 #define INPUT1_GROUPED                    0
@@ -3517,9 +3533,25 @@ typedef struct float0 {
 #define INPUT1_ABS_FUNC                   fabs
 #define INPUT1_TYPE_SIZE                  2
 #define INPUT1_IS_FP                      1
-#define INPUT1_OFFSET                                                                                                                          \
-    ((INPUT1_X_PITCH * INPUT1_PAD_BEFORE_SIZE_X) + (INPUT1_Y_PITCH * INPUT1_PAD_BEFORE_SIZE_Y) + (INPUT1_Z_PITCH * INPUT1_PAD_BEFORE_SIZE_Z) + \
-     (INPUT1_W_PITCH * INPUT1_PAD_BEFORE_SIZE_W) + (INPUT1_FEATURE_PITCH * INPUT1_PAD_BEFORE_FEATURE_NUM) + (INPUT1_BATCH_PITCH * INPUT1_PAD_BEFORE_BATCH_NUM))
+#define INPUT1_OFFSET                     0
+#define INPUT1_SIZES_DATA \
+    {                     \
+        64,               \
+        1357,             \
+        38,               \
+        2,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+    }
+CONST_ARRAY_DECL(INPUT1_SIZES) = INPUT1_SIZES_DATA;
+#define INPUT1_SIZES CONST_ARRAY_REF(INPUT1_SIZES)
+#define INPUT1_PITCHES                        \
+    (size_t[]) {                              \
+        1, 64, 86848, 3300224, 1, 1, 1, 1, 1, \
+    }
 #define INPUT1_PAD_BEFORE          \
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
@@ -3528,16 +3560,16 @@ typedef struct float0 {
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
     }
-#define INPUT2_SIZE_X                     HEAD_SIZE
-#define INPUT2_SIZE_Y                     (shape_info[24])
+#define INPUT2_SIZE_X                     64
+#define INPUT2_SIZE_Y                     1357
 #define INPUT2_SIZE_Z                     1
 #define INPUT2_SIZE_W                     1
 #define INPUT2_SIZE_U                     1
 #define INPUT2_SIZE_V                     1
-#define INPUT2_FEATURE_NUM                7
-#define INPUT2_BATCH_NUM                  (shape_info[18])
+#define INPUT2_FEATURE_NUM                38
+#define INPUT2_BATCH_NUM                  2
 #define INPUT2_PAD_BEFORE_SIZE_X          0
-#define INPUT2_PAD_BEFORE_SIZE_Y          (shape_info[26])
+#define INPUT2_PAD_BEFORE_SIZE_Y          0
 #define INPUT2_PAD_BEFORE_SIZE_Z          0
 #define INPUT2_PAD_BEFORE_SIZE_W          0
 #define INPUT2_PAD_BEFORE_SIZE_U          0
@@ -3545,7 +3577,7 @@ typedef struct float0 {
 #define INPUT2_PAD_BEFORE_FEATURE_NUM     0
 #define INPUT2_PAD_BEFORE_BATCH_NUM       0
 #define INPUT2_PAD_AFTER_SIZE_X           0
-#define INPUT2_PAD_AFTER_SIZE_Y           (shape_info[27])
+#define INPUT2_PAD_AFTER_SIZE_Y           0
 #define INPUT2_PAD_AFTER_SIZE_Z           0
 #define INPUT2_PAD_AFTER_SIZE_W           0
 #define INPUT2_PAD_AFTER_SIZE_U           0
@@ -3553,18 +3585,18 @@ typedef struct float0 {
 #define INPUT2_PAD_AFTER_FEATURE_NUM      0
 #define INPUT2_PAD_AFTER_BATCH_NUM        0
 #define INPUT2_X_PITCH                    1
-#define INPUT2_Y_PITCH                    HEAD_SIZE
-#define INPUT2_Z_PITCH                    (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])))
-#define INPUT2_W_PITCH                    (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])) * 1)
-#define INPUT2_U_PITCH                    (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])) * 1 * 1)
-#define INPUT2_V_PITCH                    (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])) * 1 * 1 * 1)
-#define INPUT2_FEATURE_PITCH              (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])) * 1 * 1 * 1 * 1)
-#define INPUT2_BATCH_PITCH                (HEAD_SIZE * (shape_info[24] + (shape_info[26] + shape_info[27])) * 1 * 1 * 1 * 1 * 7)
+#define INPUT2_Y_PITCH                    64
+#define INPUT2_Z_PITCH                    1
+#define INPUT2_W_PITCH                    1
+#define INPUT2_U_PITCH                    1
+#define INPUT2_V_PITCH                    1
+#define INPUT2_FEATURE_PITCH              86848
+#define INPUT2_BATCH_PITCH                3300224
 #define INPUT2_GET_INDEX_SAFE(b, f, y, x) GET_DATA_INDEX_SAFE(INPUT2, b, f, y, x)
 #define INPUT2_GET_INDEX(b, f, y, x)      GET_DATA_INDEX(INPUT2, b, f, y, x)
 #define INPUT2_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(INPUT2, b, f, y, x)
 #define INPUT2_VIEW_OFFSET                0
-#define INPUT2_LENGTH                     0
+#define INPUT2_LENGTH                     6600448
 #define INPUT2_DIMS                       4
 #define INPUT2_SIMPLE                     1
 #define INPUT2_GROUPED                    0
@@ -3582,9 +3614,25 @@ typedef struct float0 {
 #define INPUT2_ABS_FUNC                   fabs
 #define INPUT2_TYPE_SIZE                  2
 #define INPUT2_IS_FP                      1
-#define INPUT2_OFFSET                                                                                                                          \
-    ((INPUT2_X_PITCH * INPUT2_PAD_BEFORE_SIZE_X) + (INPUT2_Y_PITCH * INPUT2_PAD_BEFORE_SIZE_Y) + (INPUT2_Z_PITCH * INPUT2_PAD_BEFORE_SIZE_Z) + \
-     (INPUT2_W_PITCH * INPUT2_PAD_BEFORE_SIZE_W) + (INPUT2_FEATURE_PITCH * INPUT2_PAD_BEFORE_FEATURE_NUM) + (INPUT2_BATCH_PITCH * INPUT2_PAD_BEFORE_BATCH_NUM))
+#define INPUT2_OFFSET                     0
+#define INPUT2_SIZES_DATA \
+    {                     \
+        64,               \
+        1357,             \
+        38,               \
+        2,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+    }
+CONST_ARRAY_DECL(INPUT2_SIZES) = INPUT2_SIZES_DATA;
+#define INPUT2_SIZES CONST_ARRAY_REF(INPUT2_SIZES)
+#define INPUT2_PITCHES                        \
+    (size_t[]) {                              \
+        1, 64, 86848, 3300224, 1, 1, 1, 1, 1, \
+    }
 #define INPUT2_PAD_BEFORE          \
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
@@ -3593,160 +3641,14 @@ typedef struct float0 {
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
     }
-#define INPUT3_SIZE_X                     (shape_info[35])
-#define INPUT3_SIZE_Y                     (shape_info[34])
-#define INPUT3_SIZE_Z                     1
-#define INPUT3_SIZE_W                     1
-#define INPUT3_SIZE_U                     1
-#define INPUT3_SIZE_V                     1
-#define INPUT3_FEATURE_NUM                1
-#define INPUT3_BATCH_NUM                  1
-#define INPUT3_PAD_BEFORE_SIZE_X          0
-#define INPUT3_PAD_BEFORE_SIZE_Y          0
-#define INPUT3_PAD_BEFORE_SIZE_Z          0
-#define INPUT3_PAD_BEFORE_SIZE_W          0
-#define INPUT3_PAD_BEFORE_SIZE_U          0
-#define INPUT3_PAD_BEFORE_SIZE_V          0
-#define INPUT3_PAD_BEFORE_FEATURE_NUM     0
-#define INPUT3_PAD_BEFORE_BATCH_NUM       0
-#define INPUT3_PAD_AFTER_SIZE_X           0
-#define INPUT3_PAD_AFTER_SIZE_Y           0
-#define INPUT3_PAD_AFTER_SIZE_Z           0
-#define INPUT3_PAD_AFTER_SIZE_W           0
-#define INPUT3_PAD_AFTER_SIZE_U           0
-#define INPUT3_PAD_AFTER_SIZE_V           0
-#define INPUT3_PAD_AFTER_FEATURE_NUM      0
-#define INPUT3_PAD_AFTER_BATCH_NUM        0
-#define INPUT3_X_PITCH                    1
-#define INPUT3_Y_PITCH                    (shape_info[35] + 0)
-#define INPUT3_Z_PITCH                    ((shape_info[35] + 0) * (shape_info[34] + 0))
-#define INPUT3_W_PITCH                    ((shape_info[35] + 0) * (shape_info[34] + 0) * 1)
-#define INPUT3_U_PITCH                    ((shape_info[35] + 0) * (shape_info[34] + 0) * 1 * 1)
-#define INPUT3_V_PITCH                    ((shape_info[35] + 0) * (shape_info[34] + 0) * 1 * 1 * 1)
-#define INPUT3_FEATURE_PITCH              ((shape_info[35] + 0) * (shape_info[34] + 0) * 1 * 1 * 1 * 1)
-#define INPUT3_BATCH_PITCH                ((shape_info[35] + 0) * (shape_info[34] + 0) * 1 * 1 * 1 * 1 * 1)
-#define INPUT3_GET_INDEX_SAFE(b, f, y, x) GET_DATA_INDEX_SAFE(INPUT3, b, f, y, x)
-#define INPUT3_GET_INDEX(b, f, y, x)      GET_DATA_INDEX(INPUT3, b, f, y, x)
-#define INPUT3_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(INPUT3, b, f, y, x)
-#define INPUT3_VIEW_OFFSET                0
-#define INPUT3_LENGTH                     0
-#define INPUT3_DIMS                       4
-#define INPUT3_SIMPLE                     1
-#define INPUT3_GROUPED                    0
-#define INPUT3_LAYOUT_BFYX                1
-#define INPUT3_TYPE                       half
-#define INPUT3_VAL_MAX                    HALF_MAX
-#define INPUT3_VAL_MIN                    -INPUT3_VAL_MAX
-#define INPUT3_VAL_ONE                    1.0h
-#define INPUT3_VAL_ZERO                   0.0h
-#define TO_INPUT3_TYPE(v)                 convert_half(v)
-#define TO_INPUT3_TYPE_SAT(v)             convert_half(v)
-#define AS_INPUT3_TYPE(v)                 as_half(v)
-#define INPUT3_MAX_FUNC                   fmax
-#define INPUT3_MIN_FUNC                   fmin
-#define INPUT3_ABS_FUNC                   fabs
-#define INPUT3_TYPE_SIZE                  2
-#define INPUT3_IS_FP                      1
-#define INPUT3_OFFSET                                                                                                                          \
-    ((INPUT3_X_PITCH * INPUT3_PAD_BEFORE_SIZE_X) + (INPUT3_Y_PITCH * INPUT3_PAD_BEFORE_SIZE_Y) + (INPUT3_Z_PITCH * INPUT3_PAD_BEFORE_SIZE_Z) + \
-     (INPUT3_W_PITCH * INPUT3_PAD_BEFORE_SIZE_W) + (INPUT3_FEATURE_PITCH * INPUT3_PAD_BEFORE_FEATURE_NUM) + (INPUT3_BATCH_PITCH * INPUT3_PAD_BEFORE_BATCH_NUM))
-#define INPUT3_PAD_BEFORE          \
-    (size_t[]) {                   \
-        0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    }
-#define INPUT3_PAD_AFTER           \
-    (size_t[]) {                   \
-        0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    }
-#define INPUT4_SIZE_X                     1
-#define INPUT4_SIZE_Y                     1
-#define INPUT4_SIZE_Z                     1
-#define INPUT4_SIZE_W                     1
-#define INPUT4_SIZE_U                     1
-#define INPUT4_SIZE_V                     1
-#define INPUT4_FEATURE_NUM                1
-#define INPUT4_BATCH_NUM                  1
-#define INPUT4_PAD_BEFORE_SIZE_X          0
-#define INPUT4_PAD_BEFORE_SIZE_Y          0
-#define INPUT4_PAD_BEFORE_SIZE_Z          0
-#define INPUT4_PAD_BEFORE_SIZE_W          0
-#define INPUT4_PAD_BEFORE_SIZE_U          0
-#define INPUT4_PAD_BEFORE_SIZE_V          0
-#define INPUT4_PAD_BEFORE_FEATURE_NUM     0
-#define INPUT4_PAD_BEFORE_BATCH_NUM       0
-#define INPUT4_PAD_AFTER_SIZE_X           0
-#define INPUT4_PAD_AFTER_SIZE_Y           0
-#define INPUT4_PAD_AFTER_SIZE_Z           0
-#define INPUT4_PAD_AFTER_SIZE_W           0
-#define INPUT4_PAD_AFTER_SIZE_U           0
-#define INPUT4_PAD_AFTER_SIZE_V           0
-#define INPUT4_PAD_AFTER_FEATURE_NUM      0
-#define INPUT4_PAD_AFTER_BATCH_NUM        0
-#define INPUT4_X_PITCH                    1
-#define INPUT4_Y_PITCH                    1
-#define INPUT4_Z_PITCH                    1
-#define INPUT4_W_PITCH                    1
-#define INPUT4_U_PITCH                    1
-#define INPUT4_V_PITCH                    1
-#define INPUT4_FEATURE_PITCH              1
-#define INPUT4_BATCH_PITCH                1
-#define INPUT4_GET_INDEX_SAFE(b, f, y, x) 0
-#define INPUT4_GET_INDEX(b, f, y, x)      0
-#define INPUT4_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(INPUT4, b, f, y, x)
-#define INPUT4_VIEW_OFFSET                0
-#define INPUT4_LENGTH                     1
-#define INPUT4_DIMS                       4
-#define INPUT4_SIMPLE                     1
-#define INPUT4_GROUPED                    0
-#define INPUT4_LAYOUT_BFYX                1
-#define INPUT4_TYPE                       half
-#define INPUT4_VAL_MAX                    HALF_MAX
-#define INPUT4_VAL_MIN                    -INPUT4_VAL_MAX
-#define INPUT4_VAL_ONE                    1.0h
-#define INPUT4_VAL_ZERO                   0.0h
-#define TO_INPUT4_TYPE(v)                 convert_half(v)
-#define TO_INPUT4_TYPE_SAT(v)             convert_half(v)
-#define AS_INPUT4_TYPE(v)                 as_half(v)
-#define INPUT4_MAX_FUNC                   fmax
-#define INPUT4_MIN_FUNC                   fmin
-#define INPUT4_ABS_FUNC                   fabs
-#define INPUT4_TYPE_SIZE                  2
-#define INPUT4_IS_FP                      1
-#define INPUT4_OFFSET                     0
-#define INPUT4_SIZES_DATA \
-    {                     \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-        1,                \
-    }
-CONST_ARRAY_DECL(INPUT4_SIZES) = INPUT4_SIZES_DATA;
-#define INPUT4_SIZES CONST_ARRAY_REF(INPUT4_SIZES)
-#define INPUT4_PITCHES             \
-    (size_t[]) {                   \
-        1, 1, 1, 1, 1, 1, 1, 1, 1, \
-    }
-#define INPUT4_PAD_BEFORE          \
-    (size_t[]) {                   \
-        0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    }
-#define INPUT4_PAD_AFTER           \
-    (size_t[]) {                   \
-        0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    }
-#define OUTPUT_SIZE_X                     HEAD_SIZE
-#define OUTPUT_SIZE_Y                     (shape_info[42])
+#define OUTPUT_SIZE_X                     64
+#define OUTPUT_SIZE_Y                     1357
 #define OUTPUT_SIZE_Z                     1
 #define OUTPUT_SIZE_W                     1
 #define OUTPUT_SIZE_U                     1
 #define OUTPUT_SIZE_V                     1
-#define OUTPUT_FEATURE_NUM                28
-#define OUTPUT_BATCH_NUM                  (shape_info[36])
+#define OUTPUT_FEATURE_NUM                38
+#define OUTPUT_BATCH_NUM                  2
 #define OUTPUT_PAD_BEFORE_SIZE_X          0
 #define OUTPUT_PAD_BEFORE_SIZE_Y          0
 #define OUTPUT_PAD_BEFORE_SIZE_Z          0
@@ -3764,18 +3666,18 @@ CONST_ARRAY_DECL(INPUT4_SIZES) = INPUT4_SIZES_DATA;
 #define OUTPUT_PAD_AFTER_FEATURE_NUM      0
 #define OUTPUT_PAD_AFTER_BATCH_NUM        0
 #define OUTPUT_X_PITCH                    1
-#define OUTPUT_Y_PITCH                    HEAD_SIZE
-#define OUTPUT_Z_PITCH                    (HEAD_SIZE * (shape_info[42] + 0))
-#define OUTPUT_W_PITCH                    (HEAD_SIZE * (shape_info[42] + 0) * 1)
-#define OUTPUT_U_PITCH                    (HEAD_SIZE * (shape_info[42] + 0) * 1 * 1)
-#define OUTPUT_V_PITCH                    (HEAD_SIZE * (shape_info[42] + 0) * 1 * 1 * 1)
-#define OUTPUT_FEATURE_PITCH              (HEAD_SIZE * (shape_info[42] + 0) * 1 * 1 * 1 * 1)
-#define OUTPUT_BATCH_PITCH                (HEAD_SIZE * (shape_info[42] + 0) * 1 * 1 * 1 * 1 * 28)
+#define OUTPUT_Y_PITCH                    64
+#define OUTPUT_Z_PITCH                    1
+#define OUTPUT_W_PITCH                    1
+#define OUTPUT_U_PITCH                    1
+#define OUTPUT_V_PITCH                    1
+#define OUTPUT_FEATURE_PITCH              86848
+#define OUTPUT_BATCH_PITCH                3300224
 #define OUTPUT_GET_INDEX_SAFE(b, f, y, x) GET_DATA_INDEX_SAFE(OUTPUT, b, f, y, x)
 #define OUTPUT_GET_INDEX(b, f, y, x)      GET_DATA_INDEX(OUTPUT, b, f, y, x)
 #define OUTPUT_GET_INDEX_RAW(b, f, y, x)  GET_DATA_INDEX_RAW(OUTPUT, b, f, y, x)
 #define OUTPUT_VIEW_OFFSET                0
-#define OUTPUT_LENGTH                     0
+#define OUTPUT_LENGTH                     6600448
 #define OUTPUT_DIMS                       4
 #define OUTPUT_SIMPLE                     1
 #define OUTPUT_GROUPED                    0
@@ -3793,9 +3695,25 @@ CONST_ARRAY_DECL(INPUT4_SIZES) = INPUT4_SIZES_DATA;
 #define OUTPUT_ABS_FUNC                   fabs
 #define OUTPUT_TYPE_SIZE                  2
 #define OUTPUT_IS_FP                      1
-#define OUTPUT_OFFSET                                                                                                                          \
-    ((OUTPUT_X_PITCH * OUTPUT_PAD_BEFORE_SIZE_X) + (OUTPUT_Y_PITCH * OUTPUT_PAD_BEFORE_SIZE_Y) + (OUTPUT_Z_PITCH * OUTPUT_PAD_BEFORE_SIZE_Z) + \
-     (OUTPUT_W_PITCH * OUTPUT_PAD_BEFORE_SIZE_W) + (OUTPUT_FEATURE_PITCH * OUTPUT_PAD_BEFORE_FEATURE_NUM) + (OUTPUT_BATCH_PITCH * OUTPUT_PAD_BEFORE_BATCH_NUM))
+#define OUTPUT_OFFSET                     0
+#define OUTPUT_SIZES_DATA \
+    {                     \
+        64,               \
+        1357,             \
+        38,               \
+        2,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+        1,                \
+    }
+CONST_ARRAY_DECL(OUTPUT_SIZES) = OUTPUT_SIZES_DATA;
+#define OUTPUT_SIZES CONST_ARRAY_REF(OUTPUT_SIZES)
+#define OUTPUT_PITCHES                        \
+    (size_t[]) {                              \
+        1, 64, 86848, 3300224, 1, 1, 1, 1, 1, \
+    }
 #define OUTPUT_PAD_BEFORE          \
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
@@ -3804,24 +3722,20 @@ CONST_ARRAY_DECL(INPUT4_SIZES) = INPUT4_SIZES_DATA;
     (size_t[]) {                   \
         0, 0, 0, 0, 0, 0, 0, 0, 0, \
     }
-#define IS_DYNAMIC                 1
-#define OPTIONAL_SHAPE_INFO_ARG    __global const int *shape_info,
-#define OPTIONAL_SHAPE_INFO_TENSOR shape_info,
+#define OPTIONAL_SHAPE_INFO_ARG
+#define OPTIONAL_SHAPE_INFO_TENSOR
 #define LayerID \
     sdpa:       \
-    sdpa
-// #define BROADCAST_GROUP_SIZE               4
-#define DO_BROADCAST_KEY_VALUE f /= BROADCAST_GROUP_SIZE;
-#define IS_CAUSAL              0
-#define HAS_ATTN_MASK_INPUT    1
-#define HAS_SCALE_INPUT        1
-#define INPUT0_DIMS_ORDER      b, f, w, z, y, x
-#define INPUT1_DIMS_ORDER      b, f, w, z, y, x
-#define INPUT2_DIMS_ORDER      b, f, w, z, y, x
-#define TARGET_SEQ_LEN         (shape_info[6])
-// #define NUM_HEADS                          28
-// #define NUM_KV_HEADS                       -1
-#define SOURCE_SEQ_LEN                     (shape_info[14])
+    __module.transformer_blocks .0.attn / aten::scaled_dot_product_attention / ScaledDotProductAttention
+#define BROADCAST_GROUP_SIZE               1
+#define IS_CAUSAL                          0
+#define HAS_ATTN_MASK_INPUT                0
+#define HAS_SCALE_INPUT                    0
+#define IS_KV_COMPRESSED                   0
+#define TARGET_SEQ_LEN                     1357
+#define NUM_HEADS                          38
+#define NUM_KV_HEADS                       -1
+#define SOURCE_SEQ_LEN                     1357
 #define SOFTMAX_ACCUMULATOR_TYPE           float
 #define SOFTMAX_ACCUMULATOR_VAL_MAX        FLT_MAX
 #define SOFTMAX_ACCUMULATOR_VAL_MIN        -SOFTMAX_ACCUMULATOR_VAL_MAX
@@ -3836,14 +3750,13 @@ CONST_ARRAY_DECL(INPUT4_SIZES) = INPUT4_SIZES_DATA;
 #define SOFTMAX_ACCUMULATOR_TYPE_SIZE      4
 #define SOFTMAX_ACCUMULATOR_IS_FP          1
 #define SUBGROUP_SIZE                      16
-// #define HEAD_SIZE                          HEAD_SIZE
-// #define SEQ_LEN_PARTITION_SIZE             (SG_SCALE_FACTOR * HEAD_SIZE)
-#define TARGET_SEQ_LEN_BLOCK_SIZE 16
-#define SDPA_STAGE_0              1
-// #define SG_SCALE_FACTOR                    2
-#define STATIC_SCALE_VALUE_INV          as_float(0x413504f3) /*1.131371e+01*/
-#define STATIC_SCALE_VALUE              as_float(0x3db504f3) /*8.838835e-02*/
-#define LOAD_KEY_LEFTOVERS_IN_CALC_LOOP 1
+#define HEAD_SIZE                          64
+#define SEQ_LEN_PARTITION_SIZE             128
+#define TARGET_SEQ_LEN_BLOCK_SIZE          16
+#define SDPA_STAGE_0                       1
+#define SG_SCALE_FACTOR                    2
+#define STATIC_SCALE_VALUE_INV             as_float(0x41000000) /*8.000000e+00*/
+#define STATIC_SCALE_VALUE                 as_float(0x3e000000) /*1.250000e-01*/
 
 // query_input   [batch, heads_num, q_len, head_size]
 // key_input     [batch, kv_heads_num, kv_len, head_size]
@@ -4109,6 +4022,15 @@ KERNEL(sdpa_opt)
  const __global int* blocked_indexes_start,
  const __global int* blocked_indexes_end,
  const __global int* gws_seq_indexes_correspondence
+#    if PAGED_ATTENTION_SCORES_OUTPUT
+ ,
+ __global SOFTMAX_ACCUMULATOR_TYPE* softmax_results,
+ const __global int* subsequence_offsets,
+ __global SOFTMAX_ACCUMULATOR_TYPE* exp_sums,
+ __global SOFTMAX_ACCUMULATOR_TYPE* max_logits,
+ __global OUTPUT_TYPE* tmp_out,
+ const uint aligned_max_context_len
+#    endif
 #else
  __global SOFTMAX_ACCUMULATOR_TYPE* exp_sums,
  __global SOFTMAX_ACCUMULATOR_TYPE* max_logits,
@@ -4118,32 +4040,25 @@ KERNEL(sdpa_opt)
 #if TARGET_SEQ_LEN_BLOCK_SIZE != 16
 #    error sdpa_opt.cl: unsupported TARGET_SEQ_LEN_BLOCK_SIZE
 #endif
-
-// Define indexes variables using macro declarations to avoid register spills
 #define batch_idx      ((uint)get_global_id(0))
 #define num_heads_dim  ((uint)get_global_id(0))
 #define b0_idx         (batch_idx / NUM_HEADS)
 #define b1_idx         (batch_idx % NUM_HEADS)
 #define target_seq_dim ((uint)get_global_id(1))
-#define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
-#define head_size_idx  ((uint)get_local_id(2) % HEAD_SIZE)
-#define sglid          (uint) get_sub_group_local_id()
-#define sgid           (uint) get_sub_group_id()
-
-    // SLM buffer for query inputs
+#if IS_PAGED_ATTENTION
+#    define target_seq_idx ((uint)block_start_pos - subsequence_begins[gws_seq_indexes_correspondence[target_seq_dim]])
+#else
+#    define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
+#endif
+#define head_size_idx ((uint)get_local_id(2) % HEAD_SIZE)
+#define sglid         (uint) get_sub_group_local_id()
+#define sgid          (uint) get_sub_group_id()
     __local INPUT0_TYPE slm_query[HEAD_SIZE * TARGET_SEQ_LEN_BLOCK_SIZE];
-
-    // SLM buffer for intermediate QK results
     __local OUTPUT_TYPE slm_qk_vals[TARGET_SEQ_LEN_BLOCK_SIZE][SEQ_LEN_PARTITION_SIZE];
-
-    // SLM buffers for SoftMax calculation and qk_max/qk_sums results aggregation across all WGs
     __local SOFTMAX_ACCUMULATOR_TYPE slm_qk_max_vals[TARGET_SEQ_LEN_BLOCK_SIZE][SUBGROUPS_PER_WG];
-
-    // SLM buffers for SoftMax recalculation for current iteration based on the previous results
     __local SOFTMAX_ACCUMULATOR_TYPE slm_exp_sum_prev[TARGET_SEQ_LEN_BLOCK_SIZE];
     __local SOFTMAX_ACCUMULATOR_TYPE slm_max_val_prev[TARGET_SEQ_LEN_BLOCK_SIZE];
     __local SOFTMAX_ACCUMULATOR_TYPE slm_update_factor[TARGET_SEQ_LEN_BLOCK_SIZE];
-
 #if IS_PAGED_ATTENTION
     const uint block_start_pos = blocked_indexes_start[target_seq_dim];
     const uint block_end_pos = blocked_indexes_end[target_seq_dim];
@@ -4152,7 +4067,6 @@ KERNEL(sdpa_opt)
     const uint seq_idx_end = min(TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
 #endif
     {
-        // Load Q input to SLM and transpose it
 #if IS_PAGED_ATTENTION
         uint query_offset =
             INPUT0_OFFSET + block_start_pos * (HEAD_SIZE * NUM_HEADS + INPUT0_PAD_BEFORE_FEATURE_NUM + INPUT0_PAD_AFTER_FEATURE_NUM) + num_heads_dim * HEAD_SIZE + head_size_idx;
@@ -4168,7 +4082,6 @@ KERNEL(sdpa_opt)
 #    endif
 #endif
         uint query_local_offset = head_size_idx * TARGET_SEQ_LEN_BLOCK_SIZE;
-
 #if APPLY_SCALES_TO_QUERY
 #    if HAS_SCALE_INPUT
         const INPUT0_TYPE scale_val = *scale;
@@ -4178,12 +4091,10 @@ KERNEL(sdpa_opt)
 #else
         const INPUT0_TYPE scale_val = INPUT0_VAL_ONE;
 #endif
-
         if (seq_idx_end != TARGET_SEQ_LEN_BLOCK_SIZE) {
             if (sgid * SUBGROUP_SIZE < HEAD_SIZE) {
                 for (uint seq_idx = 0; seq_idx < seq_idx_end; seq_idx++) {
                     INPUT0_TYPE val = BLOCK_READN(INPUT0_TYPE, 1, query_input, query_offset);
-
                     slm_query[query_local_offset] = val * scale_val;
                     query_offset += query_pitch;
                     query_local_offset++;
@@ -4194,7 +4105,6 @@ KERNEL(sdpa_opt)
             if ((sgid < (SUBGROUPS_PER_WG / SG_SCALE_FACTOR))) {
                 unroll_for(uint seq_idx = 0; seq_idx < (TARGET_SEQ_LEN_BLOCK_SIZE / SG_SCALE_FACTOR); seq_idx++) {
                     INPUT0_TYPE val = BLOCK_READN(INPUT0_TYPE, 1, query_input, query_offset);
-
                     slm_query[query_local_offset] = val * scale_val;
                     query_offset += query_pitch;
                     query_local_offset++;
@@ -4204,7 +4114,6 @@ KERNEL(sdpa_opt)
                 query_offset += query_pitch * (TARGET_SEQ_LEN_BLOCK_SIZE / SG_SCALE_FACTOR);
                 unroll_for(uint seq_idx = 0; seq_idx < (TARGET_SEQ_LEN_BLOCK_SIZE / SG_SCALE_FACTOR); seq_idx++) {
                     INPUT0_TYPE val = BLOCK_READN(INPUT0_TYPE, 1, query_input, query_offset);
-
                     slm_query[query_local_offset] = val * scale_val;
                     query_offset += query_pitch;
                     query_local_offset++;
@@ -4215,7 +4124,6 @@ KERNEL(sdpa_opt)
             query_offset += query_pitch * (sgid / (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) * (TARGET_SEQ_LEN_BLOCK_SIZE / SG_SCALE_FACTOR);
             unroll_for(uint seq_idx = 0; seq_idx < (TARGET_SEQ_LEN_BLOCK_SIZE / SG_SCALE_FACTOR); seq_idx++) {
                 INPUT0_TYPE val = BLOCK_READN(INPUT0_TYPE, 1, query_input, query_offset);
-
                 slm_query[query_local_offset] = val * scale_val;
                 query_offset += query_pitch;
                 query_local_offset++;
@@ -4223,7 +4131,6 @@ KERNEL(sdpa_opt)
 #else
             unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                 INPUT0_TYPE val = BLOCK_READN(INPUT0_TYPE, 1, query_input, query_offset);
-
                 slm_query[query_local_offset] = val * scale_val;
                 query_offset += query_pitch;
                 query_local_offset++;
@@ -4232,10 +4139,8 @@ KERNEL(sdpa_opt)
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-
     {
 #if TARGET_SEQ_LEN_BLOCK_SIZE <= SUBGROUP_SIZE
-        // Initialize slm buffers with MIN and ZERO values
         if (sgid == 0 && sglid < TARGET_SEQ_LEN_BLOCK_SIZE) {
             slm_max_val_prev[sglid] = SOFTMAX_ACCUMULATOR_VAL_MIN;
             slm_exp_sum_prev[sglid] = SOFTMAX_ACCUMULATOR_VAL_ZERO;
@@ -4244,23 +4149,27 @@ KERNEL(sdpa_opt)
 #    error sdpa_opt.cl: unsupported TARGET_SEQ_LEN_BLOCK_SIZE
 #endif
     }
-
-    // Q*K calculation loop
     MAKE_VECTOR_TYPE(OUTPUT_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) output_acc = OUTPUT_VAL_ZERO;
-
     __attribute__((opencl_unroll_hint(1))) for (uint start_partition_idx = 0; start_partition_idx < SOURCE_SEQ_LEN; start_partition_idx += SEQ_LEN_PARTITION_SIZE) {
         const uint seq_len = start_partition_idx + sgid * SUBGROUP_SIZE;
+#if IS_CAUSAL
+        const uint partition_seq_len = min((uint)SEQ_LEN_PARTITION_SIZE, (uint)max(0, (int)(target_seq_idx + seq_idx_end) - (int)start_partition_idx));
+#else
         const uint partition_seq_len = min((uint)SOURCE_SEQ_LEN - start_partition_idx, (uint)SEQ_LEN_PARTITION_SIZE);
-
+#endif
+        MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_acc = INPUT0_VAL_ZERO;
+#if IS_CAUSAL
+        if (seq_len <= target_seq_idx) {
+#endif
 #if IS_PAGED_ATTENTION
 #    ifdef BROADCAST_GROUP_SIZE
-        const uint heads_dim = num_heads_dim / BROADCAST_GROUP_SIZE;
+            const uint heads_dim = num_heads_dim / BROADCAST_GROUP_SIZE;
 #    else
-        const uint heads_dim = num_heads_dim;
+            const uint heads_dim = num_heads_dim;
 #    endif
 #    define KEY_SEQ_OFFSET subsequence_begins[gws_seq_indexes_correspondence[target_seq_dim]]
-        const uint key_pitch = (HEAD_SIZE * NUM_KV_HEADS + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM);
-        uint key_offset = INPUT1_OFFSET + KEY_SEQ_OFFSET * key_pitch + heads_dim * HEAD_SIZE + seq_len * key_pitch;
+            const uint key_pitch = (HEAD_SIZE * NUM_KV_HEADS + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM);
+            uint key_offset = INPUT1_OFFSET + KEY_SEQ_OFFSET * key_pitch + heads_dim * HEAD_SIZE + seq_len * key_pitch;
 #else
 #    ifdef BEAM_TABLE_TYPE
         const uint b_idx = beam_table[FUNC_CALL(get_bt_index_key)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, 0, 0, seq_len + sglid, 0)];
@@ -4277,70 +4186,55 @@ KERNEL(sdpa_opt)
 #        endif
 #    endif
 #endif
-
-        int seq_len_calc_size = min((int)(SOURCE_SEQ_LEN) - (int)seq_len, (int)SUBGROUP_SIZE);
-        MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_acc;
-
-        qk_acc = FUNC_CALL(load_attn_mask)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx,
-                                           b1_idx,
-#if IS_PAGED_ATTENTION
-                                           block_start_pos - subsequence_begins[gws_seq_indexes_correspondence[target_seq_dim]] + sglid,
-#else
-                                           target_seq_idx + sglid,
+            int seq_len_calc_size = min((int)(SOURCE_SEQ_LEN) - (int)seq_len, (int)SUBGROUP_SIZE);
+#if !IS_CAUSAL
+            qk_acc = FUNC_CALL(load_attn_mask)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, target_seq_idx + sglid, seq_len ATTN_MASK_BUFFER ATTN_SCALE_BUFFER PA_BUFFERS);
 #endif
-                                           // TODO: pass seq_len_calc_size here
-                                           seq_len ATTN_MASK_BUFFER ATTN_SCALE_BUFFER PA_BUFFERS);
-
-        if (seq_len_calc_size >= SUBGROUP_SIZE) {
+            if (seq_len_calc_size >= SUBGROUP_SIZE) {
 #if IS_KV_COMPRESSED
-            const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + sglid, 0);
-            KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+                const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + sglid, 0);
+                KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
 #    if USE_ASYMMETRIC_QUANTIZATION
-            KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+                KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
 #    endif
 #endif
-            __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+                __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
 #define KEY_BLOCK_READ(ptr, offset) BLOCK_READN(INPUT1_TYPE, 1, ptr, offset);
 #define QUERY_VEC                   MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE)
-
-                QUERY_VEC queries_vec;
-                uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
-                unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
-                    queries_vec[q_row_idx] = slm_query[query_local_offset];
-                    query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
-                }
-
-                unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+                    QUERY_VEC queries_vec;
+                    uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+                    unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+                        queries_vec[q_row_idx] = slm_query[query_local_offset];
+                        query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+                    }
+                    unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
 #ifdef BEAM_TABLE_TYPE
-                    const INPUT1_TYPE key_packed = KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index);
+                        const INPUT1_TYPE key_packed = KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index);
 #else
                     const INPUT1_TYPE key_packed = KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index);
 #endif
-
 #if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
-                    KEY_COMPRESSION_SCALE_TYPE key_vals =
-                        (TO_KEY_COMPRESSION_SCALE_TYPE(key_packed) - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+                        KEY_COMPRESSION_SCALE_TYPE key_vals =
+                            (TO_KEY_COMPRESSION_SCALE_TYPE(key_packed) - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
 #elif IS_KV_COMPRESSED
                     KEY_COMPRESSION_SCALE_TYPE key_vals = (TO_KEY_COMPRESSION_SCALE_TYPE(key_packed) * sub_group_broadcast(comp_scale, key_row_idx));
 #else
                     INPUT1_TYPE key_vals = key_packed;
 #endif
-
-                    unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
-                        qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                        unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                        }
                     }
                 }
-            }
-        } else if (seq_len_calc_size > 0) {
+            } else if (seq_len_calc_size > 0) {
 #if IS_KV_COMPRESSED
-            const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + min(sglid, (uint)seq_len_calc_size - 1), 0);
-            // const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + sglid, 0);
-            KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+                const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + min(sglid, (uint)seq_len_calc_size - 1), 0);
+                KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
 #    if USE_ASYMMETRIC_QUANTIZATION
-            KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+                KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
 #    endif
 #endif
-            __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+                __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
 #define KEY_BLOCK_READ(ptr, offset) BLOCK_READN(INPUT1_TYPE, 1, ptr, offset)
 #define QUERY_VEC_TYPE              MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE)
 #if IS_KV_COMPRESSED
@@ -4352,114 +4246,105 @@ KERNEL(sdpa_opt)
 #    define KEY_UNPACKED_VEC_TYPE     MAKE_VECTOR_TYPE(INPUT1_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE)
 #    define TO_KEY_UNPACKED_TYPE(val) TO_INPUT1_TYPE(val)
 #endif
-
-                QUERY_VEC_TYPE queries_vec;
-                uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
-                unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
-                    queries_vec[q_row_idx] = slm_query[query_local_offset];
-                    query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
-                }
-
+                    QUERY_VEC_TYPE queries_vec;
+                    uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+                    unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+                        queries_vec[q_row_idx] = slm_query[query_local_offset];
+                        query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+                    }
 #ifndef LOAD_KEY_LEFTOVERS_IN_CALC_LOOP
-                KEY_UNPACKED_VEC_TYPE key_vec = 0;
-                unroll_for(uint key_row_idx = 0; key_row_idx < seq_len_calc_size; key_row_idx++) {
+                    KEY_UNPACKED_VEC_TYPE key_vec = 0;
+                    unroll_for(uint key_row_idx = 0; key_row_idx < seq_len_calc_size; key_row_idx++) {
 #    ifdef BEAM_TABLE_TYPE
-                    key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+                        key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
 #    else
-                    key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+                        key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
 #    endif
-
 #    if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
-                    key_vec[key_row_idx] = (key_vec[key_row_idx] - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+                        key_vec[key_row_idx] = (key_vec[key_row_idx] - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
 #    elif IS_KV_COMPRESSED
-                    key_vec[key_row_idx] *= sub_group_broadcast(comp_scale, key_row_idx);
-#    endif
-                }
-#endif
-
-                unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
-#ifdef LOAD_KEY_LEFTOVERS_IN_CALC_LOOP
-                    KEY_UNPACKED_TYPE key_vals = 0;
-                    if (key_row_idx < seq_len_calc_size) {
-#    ifdef BEAM_TABLE_TYPE
-                        key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
-#    else
-                        key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+                        key_vec[key_row_idx] *= sub_group_broadcast(comp_scale, key_row_idx);
 #    endif
                     }
+#endif
+                    unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+#ifdef LOAD_KEY_LEFTOVERS_IN_CALC_LOOP
+                        KEY_UNPACKED_TYPE key_vals = 0;
+                        if (key_row_idx < seq_len_calc_size) {
+#    ifdef BEAM_TABLE_TYPE
+                            key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+#    else
+                            key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+#    endif
+                        }
 #    if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
-                    key_vals = (key_vals - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+                        key_vals = (key_vals - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
 #    elif IS_KV_COMPRESSED
-                    key_vals *= sub_group_broadcast(comp_scale, key_row_idx);
+                        key_vals *= sub_group_broadcast(comp_scale, key_row_idx);
 #    endif
 #else
 #    define key_vals key_vec[key_row_idx]
 #endif
-                    unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
-                        qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                        unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+                            qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+                        }
                     }
                 }
             }
-        }
-
-        {
-            SOFTMAX_ACCUMULATOR_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
-            unroll_for(uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+            {
+                SOFTMAX_ACCUMULATOR_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+                unroll_for(uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+#if IS_CAUSAL
+#    if defined(IS_PAGED_ATTENTION) && SLIDING_WINDOW_SIZE != 0
+                    if ((seq_len + i <= target_seq_idx + sglid) && (target_seq_idx + sglid < SLIDING_WINDOW_SIZE || seq_len + i >= target_seq_idx + sglid - SLIDING_WINDOW_SIZE)) {
+#    else
+                    if (seq_len + i <= target_seq_idx + sglid) {
+#    endif
+#endif
 #if !APPLY_SCALES_TO_QUERY
 #    if HAS_SCALE_INPUT
-                const OUTPUT_TYPE scale_val = *scale;
+                        const OUTPUT_TYPE scale_val = *scale;
 #    else
-                const OUTPUT_TYPE scale_val = TO_OUTPUT_TYPE(STATIC_SCALE_VALUE);
+                        const OUTPUT_TYPE scale_val = TO_OUTPUT_TYPE(STATIC_SCALE_VALUE);
 #    endif
-                qk_acc[i] *= scale_val;
+                        qk_acc[i] *= scale_val;
 #endif
-
 #ifdef HAS_ALIBI
-                const int alibi_val = (1 - SOURCE_SEQ_LEN) + seq_len + i;
-                qk_acc[i] += alibi_slopes[num_heads_dim] * alibi_val;
+                        const int alibi_val = (1 - SOURCE_SEQ_LEN) + seq_len + i;
+                        qk_acc[i] += alibi_slopes[num_heads_dim] * alibi_val;
 #endif
-
-                qk_acc[i] = INPUT0_MIN_FUNC(INPUT0_MAX_FUNC(qk_acc[i], INPUT0_VAL_MIN), INPUT0_VAL_MAX);
-
-                qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_TYPE(qk_acc[i]));
-                slm_qk_vals[sglid][sgid * TARGET_SEQ_LEN_BLOCK_SIZE + i] = qk_acc[i];
+                        qk_acc[i] = INPUT0_MIN_FUNC(INPUT0_MAX_FUNC(qk_acc[i], INPUT0_VAL_MIN), INPUT0_VAL_MAX);
+#if IS_CAUSAL
+                    } else {
+                        qk_acc[i] = INPUT0_VAL_MIN;
+                    }
+#endif
+                    qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_TYPE(qk_acc[i]));
+                    slm_qk_vals[sglid][sgid * TARGET_SEQ_LEN_BLOCK_SIZE + i] = qk_acc[i];
+                }
+                slm_qk_max_vals[sglid][sgid] = qk_max;
             }
-            slm_qk_max_vals[sglid][sgid] = qk_max;
+#if IS_CAUSAL
+        } else {
+            slm_qk_max_vals[sglid][sgid] = SOFTMAX_ACCUMULATOR_VAL_MIN;
         }
-
+#endif
         barrier(CLK_LOCAL_MEM_FENCE);
-
         {
-            // SoftMax calculation
-            // each sg will compute a whole row of query
             uint aligned_width = ((SUBGROUPS_PER_WG + (SUBGROUP_SIZE - 1)) & ~(SUBGROUP_SIZE - 1));
             for (uint m = sgid; m < seq_idx_end; m += SUBGROUPS_PER_WG) {
-                // rowmax
-#if 1
-                SOFTMAX_ACCUMULATOR_TYPE max_val_prev = slm_max_val_prev[m];
-                SOFTMAX_ACCUMULATOR_TYPE qk_max_new, qk_max_last = max_val_prev;
+                SOFTMAX_ACCUMULATOR_TYPE qk_max_new, qk_max_cur = SOFTMAX_ACCUMULATOR_VAL_MIN;
                 for (uint k = sglid; k < aligned_width; k += SUBGROUP_SIZE) {
                     if (k < SUBGROUPS_PER_WG) {
                         qk_max_new = slm_qk_max_vals[m][k];
                     } else {
                         qk_max_new = SOFTMAX_ACCUMULATOR_VAL_MIN;
                     }
-                    qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_reduce_max(qk_max_new), qk_max_last);
-                    qk_max_last = qk_max_new;
+                    qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_reduce_max(qk_max_new), qk_max_cur);
+                    qk_max_cur = qk_max_new;
                 }
-#else
-                SOFTMAX_ACCUMULATOR_TYPE qk_max_new;
-                if (sglid < SUBGROUPS_PER_WG) {
-                    qk_max_new = slm_qk_max_vals[m][sglid];
-                } else {
-                    qk_max_new = SOFTMAX_ACCUMULATOR_VAL_MIN;
-                }
-                qk_max_new = sub_group_reduce_max(qk_max_new);
                 SOFTMAX_ACCUMULATOR_TYPE max_val_prev = slm_max_val_prev[m];
-                qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max_new, max_val_prev);
-#endif
-
-                // softmax
+                qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_reduce_max(qk_max_cur), max_val_prev);
                 SOFTMAX_ACCUMULATOR_TYPE exp_sum_new = SOFTMAX_ACCUMULATOR_VAL_ZERO;
                 for (uint k = sglid; k < partition_seq_len; k += SUBGROUP_SIZE) {
                     SOFTMAX_ACCUMULATOR_TYPE a = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][k]) - qk_max_new);
@@ -4467,26 +4352,41 @@ KERNEL(sdpa_opt)
                     exp_sum_new += a;
                 }
                 exp_sum_new = sub_group_reduce_add(exp_sum_new);
-
-                // update
+#if PAGED_ATTENTION_SCORES_OUTPUT
+                const uint subsequence_idx = gws_seq_indexes_correspondence[target_seq_dim];
+                const uint subsequence_end_pos = subsequence_begins[subsequence_idx + 1];
+                if (subsequence_end_pos == block_end_pos) {
+                    const uint last_row_idx = block_end_pos - block_start_pos - 1;
+                    if (m == last_row_idx) {
+                        const uint partition_idx = start_partition_idx / SEQ_LEN_PARTITION_SIZE;
+                        SOFTMAX_ACCUMULATOR_TYPE correction_factor = native_exp(qk_max_new - qk_max_cur);
+                        if (sglid == 0) {
+                            const uint max_partitions_num = aligned_max_context_len / SEQ_LEN_PARTITION_SIZE;
+                            const uint exp_sums_output_offset = subsequence_idx * NUM_HEADS * max_partitions_num + num_heads_dim * max_partitions_num + partition_idx;
+                            exp_sums[exp_sums_output_offset] = exp_sum_new * correction_factor;
+                            max_logits[exp_sums_output_offset] = qk_max_cur;
+                        }
+                        const uint output_offset =
+                            subsequence_idx * NUM_HEADS * aligned_max_context_len + num_heads_dim * aligned_max_context_len + partition_idx * SEQ_LEN_PARTITION_SIZE;
+                        for (uint i = sglid; i < partition_seq_len; i += SUBGROUP_SIZE) {
+                            softmax_results[output_offset + i] = TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][i]) / exp_sum_new;
+                        }
+                    }
+                }
+#endif
                 if (sglid == 0) {
-                    float pre_exp_sum = slm_exp_sum_prev[m];
-                    float correction_factor = native_exp(max_val_prev - qk_max_new);
-                    float pre_exp_sum_fixed = pre_exp_sum * correction_factor;
+                    SOFTMAX_ACCUMULATOR_TYPE pre_exp_sum = slm_exp_sum_prev[m];
+                    SOFTMAX_ACCUMULATOR_TYPE correction_factor = native_exp(max_val_prev - qk_max_new);
+                    SOFTMAX_ACCUMULATOR_TYPE pre_exp_sum_fixed = pre_exp_sum * correction_factor;
                     exp_sum_new += pre_exp_sum_fixed;
-
                     slm_update_factor[m] = correction_factor;
                     slm_max_val_prev[m] = qk_max_new;
                     slm_exp_sum_prev[m] = exp_sum_new;
-
-                    // printf("[%d, %d, %d, %d] qk_max_new = %f, %f, %f\n", target_seq_idx, sgid, sglid, start_partition_idx, qk_max_new, exp_sum_new, correction_factor);
                 }
             }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
         {
-            // QK*V calculation
             MAKE_VECTOR_TYPE(OUTPUT_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) acc_output_res = OUTPUT_VAL_ZERO;
 #if IS_PAGED_ATTENTION
             const uint value_pitch = (HEAD_SIZE * NUM_KV_HEADS + INPUT2_PAD_BEFORE_FEATURE_NUM + INPUT2_PAD_AFTER_FEATURE_NUM);
@@ -4499,7 +4399,6 @@ KERNEL(sdpa_opt)
             const uint value_pitch = HEAD_SIZE;
 #    endif
 #endif
-
             if (partition_seq_len == SEQ_LEN_PARTITION_SIZE) {
                 uint seq_len_start = (sgid / (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) * (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR);
                 for (uint seq_len = seq_len_start; seq_len < seq_len_start + (SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR); seq_len += SUBGROUP_SIZE) {
@@ -4526,12 +4425,10 @@ KERNEL(sdpa_opt)
 #        endif
 #    endif
 #endif
-
                     MAKE_VECTOR_TYPE(OUTPUT_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_val;
                     unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                         qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len + sglid];
                     }
-
 #if IS_KV_COMPRESSED
                     const uint comp_offset = GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, start_partition_idx + seq_len + sglid, 0);
                     VALUE_COMPRESSION_SCALE_TYPE comp_scale = val_scale[comp_offset];
@@ -4545,7 +4442,6 @@ KERNEL(sdpa_opt)
 #else
                         const INPUT2_TYPE value_packed = VALUE_BLOCK_READ(value_input, value_offset);
 #endif
-
 #if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
                         VALUE_COMPRESSION_SCALE_TYPE value_val = (value_packed - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
 #elif IS_KV_COMPRESSED
@@ -4553,11 +4449,9 @@ KERNEL(sdpa_opt)
 #else
                         INPUT2_TYPE value_val = value_packed;
 #endif
-
                         unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                             acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
                         }
-
 #ifndef BEAM_TABLE_TYPE
                         value_offset += value_pitch;
 #endif
@@ -4569,7 +4463,6 @@ KERNEL(sdpa_opt)
                 if (seq_len_start < partition_seq_len)
                     seq_len_end = seq_len_start + min(partition_seq_len - seq_len_start, (uint)(SEQ_LEN_PARTITION_SIZE / SG_SCALE_FACTOR));
                 ;
-
                 for (uint seq_len = seq_len_start / SUBGROUP_SIZE; seq_len < seq_len_end / SUBGROUP_SIZE; seq_len++) {
 #if IS_PAGED_ATTENTION
 #    ifdef BROADCAST_GROUP_SIZE
@@ -4596,7 +4489,6 @@ KERNEL(sdpa_opt)
 #        endif
 #    endif
 #endif
-
 #if IS_KV_COMPRESSED
                     const uint comp_offset =
                         GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, start_partition_idx + (seq_len * SUBGROUP_SIZE) + sglid, 0);
@@ -4605,19 +4497,16 @@ KERNEL(sdpa_opt)
                     VALUE_COMPRESSION_SCALE_TYPE comp_zp = val_scale[comp_offset + 1];
 #    endif
 #endif
-
                     MAKE_VECTOR_TYPE(OUTPUT_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_val;
                     unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                         qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len * SUBGROUP_SIZE + sglid];
                     }
-
                     unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
 #ifdef BEAM_TABLE_TYPE
                         const INPUT2_TYPE value_packed = VALUE_BLOCK_READ(value_input, sub_group_broadcast(value_offset, i));
 #else
                         const INPUT2_TYPE value_packed = VALUE_BLOCK_READ(value_input, value_offset);
 #endif
-
 #if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
                         VALUE_COMPRESSION_SCALE_TYPE value_val = (value_packed - sub_group_broadcast(comp_zp, i)) * sub_group_broadcast(comp_scale, i);
 #elif IS_KV_COMPRESSED
@@ -4628,14 +4517,11 @@ KERNEL(sdpa_opt)
                         unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                             acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], i), value_val, acc_output_res[seq_idx]);
                         }
-
 #ifndef BEAM_TABLE_TYPE
                         value_offset += value_pitch;
 #endif
                     }
                 }
-
-                // QK*V leftovers processing
                 const uint seq_len_leftovers_start = ((seq_len_end / SUBGROUP_SIZE) * SUBGROUP_SIZE);
                 if (seq_len_leftovers_start != seq_len_end) {
                     MAKE_VECTOR_TYPE(OUTPUT_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_val;
@@ -4666,28 +4552,23 @@ KERNEL(sdpa_opt)
 #        endif
 #    endif
 #endif
-
 #if IS_KV_COMPRESSED
                     const uint comp_offset = GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE,
                                                                    b_idx,
                                                                    b1_idx / BROADCAST_GROUP_SIZE,
                                                                    start_partition_idx + min(seq_len_leftovers_start + sglid, seq_len_end - 1),
                                                                    0);
-                    // const uint comp_offset = GET_COMPRESSION_INDEX(VALUE_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, start_partition_idx + seq_len_leftovers_start +
-                    // sglid, 0);
                     VALUE_COMPRESSION_SCALE_TYPE comp_scale = val_scale[comp_offset];
 #    if USE_ASYMMETRIC_QUANTIZATION
                     VALUE_COMPRESSION_SCALE_TYPE comp_zp = val_scale[comp_offset + 1];
 #    endif
 #endif
-
                     for (uint seq_len_idx = 0; seq_len_idx < partition_seq_len - seq_len_leftovers_start; seq_len_idx++) {
 #ifdef BEAM_TABLE_TYPE
                         const INPUT2_TYPE value_packed = VALUE_BLOCK_READ(value_input, sub_group_broadcast(value_offset, seq_len_idx));
 #else
                         const INPUT2_TYPE value_packed = VALUE_BLOCK_READ(value_input, value_offset);
 #endif
-
 #if IS_KV_COMPRESSED && USE_ASYMMETRIC_QUANTIZATION
                         VALUE_COMPRESSION_SCALE_TYPE value_val = (value_packed - sub_group_broadcast(comp_zp, seq_len_idx)) * sub_group_broadcast(comp_scale, seq_len_idx);
 #elif IS_KV_COMPRESSED
@@ -4695,23 +4576,17 @@ KERNEL(sdpa_opt)
 #else
                         INPUT2_TYPE value_val = value_packed;
 #endif
-
                         for (uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
                             acc_output_res[seq_idx] = mad(sub_group_broadcast(qk_val[seq_idx], seq_len_idx), value_val, acc_output_res[seq_idx]);
                         }
-
 #ifndef BEAM_TABLE_TYPE
                         value_offset += value_pitch;
 #endif
                     }
                 }
             }
-
-            // protect slm_qk_vals as it is read in w*v stage and write in next round q*k stage.
             barrier(CLK_LOCAL_MEM_FENCE);
-
             {
-                // Rescale acc_output_res values and save current iter results to global accumulator
                 for (uint seq_idx = 0; seq_idx < seq_idx_end; seq_idx++) {
                     if (start_partition_idx > 0) {
                         OUTPUT_TYPE updated_prev_res = TO_SOFTMAX_ACCUMULATOR_TYPE(output_acc[seq_idx]) * slm_update_factor[seq_idx];
@@ -4722,24 +4597,18 @@ KERNEL(sdpa_opt)
             }
         }
     }
-
-    // Combine results from multiple SGs and store to output buffer
-
     if (sgid >= (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) {
         unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
             slm_qk_vals[seq_idx][(uint)get_local_id(2)] = output_acc[seq_idx];
         }
     }
-
     barrier(CLK_LOCAL_MEM_FENCE);
-
     if (sgid < (SUBGROUPS_PER_WG / SG_SCALE_FACTOR)) {
         unroll_for(uint seq_idx = 0; seq_idx < TARGET_SEQ_LEN_BLOCK_SIZE; seq_idx++) {
             unroll_for(uint i = 1; i < SG_SCALE_FACTOR; i++) {
                 output_acc[seq_idx] += slm_qk_vals[seq_idx][(i * HEAD_SIZE) + head_size_idx];
             }
         }
-
 #if IS_PAGED_ATTENTION
         uint output_offset = block_start_pos * HEAD_SIZE * NUM_HEADS + num_heads_dim * HEAD_SIZE + sgid * SUBGROUP_SIZE;
         const uint output_pitch = HEAD_SIZE * NUM_HEADS;
@@ -4747,7 +4616,6 @@ KERNEL(sdpa_opt)
         uint output_offset = OUTPUT_GET_INDEX(b0_idx, b1_idx, target_seq_idx, sgid * SUBGROUP_SIZE);
         const uint output_pitch = HEAD_SIZE;
 #endif
-
         if (TARGET_SEQ_LEN_BLOCK_SIZE > seq_idx_end) {
             for (uint seq_idx = 0; seq_idx < seq_idx_end; seq_idx++) {
                 output_acc[seq_idx] /= slm_exp_sum_prev[seq_idx];
