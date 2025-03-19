@@ -1,5 +1,6 @@
 from . import cl
 import math
+import os.path as path
 from .utils import *
 import clops
 
@@ -56,7 +57,7 @@ class SDPA_opt:
         print(self.cl_kernels.info(self.kernel_name, LWS, self.SUBGROUP_SIZE))
 
         self.cl_kernels.enqueue(self.kernel_name, GWS, LWS,
-                            shape_info_input, query_input, key_input, value_input, attn_mask_input, scale_input, output, exp_sums, max_logits, tmp_out)
+                            query_input, key_input, value_input, output, exp_sums, max_logits, tmp_out)
 
         return output
 
@@ -66,6 +67,48 @@ if __name__ == "__main__":
     import math
     cl.profiling(True)
     np.set_printoptions(precision=3, suppress=True)
+    
+    def load_binary_to_tensor(file_path, dtype=torch.float16):
+        with open(file_path, "rb") as f:
+            raw_data = f.read()
+
+        # Convert the binary data to a torch tensor
+        # Use torch.frombuffer to interpret the binary data as a tensor
+        tensor = torch.frombuffer(raw_data, dtype=dtype)
+        return tensor
+    
+    def compare_tensors(tensor_a, tensor_b, top_k=10):
+        """
+        Compare two PyTorch tensors and print the top-K maximum absolute differences.
+        
+        Args:
+            tensor_a (torch.Tensor): First tensor
+            tensor_b (torch.Tensor): Second tensor
+            top_k (int): Number of top differences to display (default: 10)
+        """
+        if tensor_a.shape != tensor_b.shape:
+            raise ValueError("Tensors must have the same shape")
+
+        differences = torch.abs(tensor_a - tensor_b)
+        flat_differences = differences.flatten()
+        
+        # Get top K indices as a TENSOR (not Python ints)
+        top_values, flat_indices = torch.topk(flat_differences, k=top_k, largest=True)
+        
+        # Convert all indices at once using tensor operations
+        coords = torch.unravel_index(flat_indices, differences.shape)
+        original_indices = list(zip(*[c.tolist() for c in coords]))
+        
+        print(f"Top {top_k} Maximum Differences:")
+        print("{:<15} {:<20} {:<20} {:<15}".format(
+            "Index", "Tensor A Value", "Tensor B Value", "Absolute Gap"))
+        print("-" * 70)
+        
+        for idx, diff in zip(original_indices, top_values):
+            value_a = tensor_a[idx].item()
+            value_b = tensor_b[idx].item()
+            print("{:<15} {:<20.6f} {:<20.6f} {:<15.6f}".format(
+                str(idx), value_a, value_b, diff.item()))
 
     MAX_KV_LEN = 1024*9
     #qkv [B, L, (Hq + Hk + Hv) * S)], attn_mask [B, L] -> output [B, Hq, L, S]
@@ -113,7 +156,7 @@ if __name__ == "__main__":
             # // input2 value
             B, Hk, 1, 1, 1, 1, Lk, HEAD_SIZE, 0, 0,
             #  input3 attn_mask
-            B, 1, 1, 1, 1, 1, Lq, Lk,
+            # B, 1, 1, 1, 1, 1, Lq, Lk,
             #  input4 scale
             #  output
             B, Hq, 1, 1, 1, 1, Lq, HEAD_SIZE
@@ -135,64 +178,89 @@ if __name__ == "__main__":
         # scale = torch.ones([1], dtype=torch.float16)
         print(f'====================={scale=}, {scale.dtype=}')
         
-        if use_randn:
-            # with open('q.npy', 'rb') as f:
-            #     q = np.load(f)
-            # with open('k.npy', 'rb') as f:
-            #     k = np.load(f)
-            # with open('v.npy', 'rb') as f:
-            #     v = np.load(f)
-            # q = torch.from_numpy(q)
-            # k = torch.from_numpy(k)
-            # v = torch.from_numpy(v)
-            # q = torch.ones([B, L, Hq, HEAD_SIZE], dtype=torch.float16)*torch.randn([1], dtype=torch.float16)
-            # k = torch.ones([B, L, Hk, HEAD_SIZE], dtype=torch.float16)*torch.randn([1], dtype=torch.float16)
-            q = torch.randn([B, Lq, Hq, HEAD_SIZE], dtype=torch.float16)
-            k = torch.randn([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
-            v = torch.randn([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
-            # np.save("q.npy", q)
-            # np.save("k.npy", k)
-            # np.save("v.npy", v)
-        else:
-            # with open('q_samenumber.npy', 'rb') as f:
-            #     q = np.load(f)
-            # with open('k_samenumber.npy', 'rb') as f:
-            #     k = np.load(f)
-            # with open('v_samenumber.npy', 'rb') as f:
-            #     v = np.load(f)
-            # q = torch.from_numpy(q)
-            # k = torch.from_numpy(k)
-            # v = torch.from_numpy(v)
-            q = torch.ones([B, Lq, Hq, HEAD_SIZE], dtype=torch.float16)
-            k = torch.ones([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
-            v = torch.ones([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
-            # np.save("q_samenumber.npy", q)
-            # np.save("k_samenumber.npy", k)
-            # np.save("v_samenumber.npy", v)
-            # print(f'{Colors.CYAN} q k v shape = {q.shape=} {k.shape=} {v.shape=}.{Colors.END}')
+        # if use_randn:
+        #     # with open('q.npy', 'rb') as f:
+        #     #     q = np.load(f)
+        #     # with open('k.npy', 'rb') as f:
+        #     #     k = np.load(f)
+        #     # with open('v.npy', 'rb') as f:
+        #     #     v = np.load(f)
+        #     # q = torch.from_numpy(q)
+        #     # k = torch.from_numpy(k)
+        #     # v = torch.from_numpy(v)
+        #     # q = torch.ones([B, L, Hq, HEAD_SIZE], dtype=torch.float16)*torch.randn([1], dtype=torch.float16)
+        #     # k = torch.ones([B, L, Hk, HEAD_SIZE], dtype=torch.float16)*torch.randn([1], dtype=torch.float16)
+        #     q = torch.randn([B, Lq, Hq, HEAD_SIZE], dtype=torch.float16)
+        #     k = torch.randn([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
+        #     v = torch.randn([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
+        #     # np.save("q.npy", q)
+        #     # np.save("k.npy", k)
+        #     # np.save("v.npy", v)
+        # else:
+        #     # with open('q_samenumber.npy', 'rb') as f:
+        #     #     q = np.load(f)
+        #     # with open('k_samenumber.npy', 'rb') as f:
+        #     #     k = np.load(f)
+        #     # with open('v_samenumber.npy', 'rb') as f:
+        #     #     v = np.load(f)
+        #     # q = torch.from_numpy(q)
+        #     # k = torch.from_numpy(k)
+        #     # v = torch.from_numpy(v)
+        #     q = torch.ones([B, Lq, Hq, HEAD_SIZE], dtype=torch.float16)
+        #     k = torch.ones([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
+        #     v = torch.ones([B, Lk, Hk, HEAD_SIZE], dtype=torch.float16)
+        #     # np.save("q_samenumber.npy", q)
+        #     # np.save("k_samenumber.npy", k)
+        #     # np.save("v_samenumber.npy", v)
+        #     # print(f'{Colors.CYAN} q k v shape = {q.shape=} {k.shape=} {v.shape=}.{Colors.END}')
+        
+        # Load binary files of float16 tensor to QKV
+        def load_qkv(BIN_ROOT_DIR, LAYERID="34", TENSOR_DUMP_FOLDER="tensors_bin"):         
+            Q_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src0__f16__2_38_1357_64__bfyx.bin"
+            K_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src1__f16__2_38_1357_64__bfyx.bin"
+            V_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src2__f16__2_38_1357_64__bfyx.bin"
+            q = load_binary_to_tensor(path.join(BIN_ROOT_DIR, TENSOR_DUMP_FOLDER, Q_FILE_NAME), dtype=torch.float16)
+            k = load_binary_to_tensor(path.join(BIN_ROOT_DIR, TENSOR_DUMP_FOLDER, K_FILE_NAME), dtype=torch.float16)
+            v = load_binary_to_tensor(path.join(BIN_ROOT_DIR, TENSOR_DUMP_FOLDER, V_FILE_NAME), dtype=torch.float16)
+            
+            q = torch.reshape(q, (B, Lq, Hq, HEAD_SIZE))
+            k = torch.reshape(k, (B, Lk, Hk, HEAD_SIZE))
+            v = torch.reshape(v, (B, Lk, Hk, HEAD_SIZE))
+            
+            # print(q[0,0,0,:])
+            
+            return q, k, v
+        
+        q, k, v = load_qkv("/home/ceciliapeng/openvino.genai/try.BADcache/")
+        q2, k2, v2 = load_qkv("/home/ceciliapeng/openvino.genai/try.BADcache/")
+        
+        # print(path.join("tensors_text", "program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src0.txt"))
+        compare_tensors(q, q2)
+        compare_tensors(k, k2)
+        compare_tensors(v, v2)
 
-        if Lq == Lk:
-            qkv = torch.cat((q, k, v), 2)
-            qkv = torch.reshape(qkv, (B, Lq, (Hq + Hk + Hk) * HEAD_SIZE))        
-            ref0, durs = MHA_cl_impl(qkv.clone(), attention_mask.clone(), scale.clone(), Hq, Hk, HEAD_SIZE)
-            print(f'{ref0=}\n')
-            for i, ns in enumerate(durs):
-                print(f'{Colors.CYAN}{ref0.shape=}, {i}/{len(durs)} {ns*1e-6:.3f} ms {Colors.END}')
+        # if Lq == Lk:
+        #     qkv = torch.cat((q, k, v), 2)
+        #     qkv = torch.reshape(qkv, (B, Lq, (Hq + Hk + Hk) * HEAD_SIZE))        
+        #     ref0, durs = MHA_cl_impl(qkv.clone(), attention_mask.clone(), scale.clone(), Hq, Hk, HEAD_SIZE)
+        #     print(f'{ref0=}\n')
+        #     for i, ns in enumerate(durs):
+        #         print(f'{Colors.CYAN}{ref0.shape=}, {i}/{len(durs)} {ns*1e-6:.3f} ms {Colors.END}')
 
         ref, durs = sdpa_impl(q.clone(), k.clone(), v.clone(), attention_mask.clone(), scale.clone(), Hq, Hk, HEAD_SIZE, False)
-        print(f'{ref=}\n')
+        # print(f'{ref=}\n')
         for i, ns in enumerate(durs):
             print(f'{Colors.BLUE}{ref.shape=}, {i}/{len(durs)} {ns*1e-6:.3f} ms {Colors.END}')
 
-        opt, durs = sdpa_impl(q.clone(), k.clone(), v.clone(), attention_mask.clone(), scale.clone(), Hq, Hk, HEAD_SIZE, True)
-        print(f'{opt=}\n')
+        opt, durs = sdpa_impl(q2.clone(), k2.clone(), v2.clone(), attention_mask.clone(), scale.clone(), Hq, Hk, HEAD_SIZE, True)
+        # print(f'{opt=}\n')
         for i, ns in enumerate(durs):
             print(f'{Colors.BLUE}{opt.shape=}, {i}/{len(durs)} {ns*1e-6:.3f} ms {Colors.END}')
             
         # print(f'all zeros? {np.all(ref == 0)} {np.all(opt == 0)}')
-
+        compare_tensors(torch.from_numpy(ref).type(torch.float16), torch.from_numpy(opt).type(torch.float16))
         try:
-            if not np.allclose(ref, opt, atol=0.01, rtol=0.01, equal_nan=True):
+            if not np.allclose(ref, opt, atol=0.01, rtol=0.01, equal_nan=False):
                 pos = np.where(np.abs(ref - opt) > 0.01)
                 # print(f"{pos[2]=}")
                 # for d in set(pos[2]):
@@ -200,7 +268,7 @@ if __name__ == "__main__":
                 print(f"{pos=} {pos[2].shape=} {pos[3].shape=}")
                 if not pos[0].size > 0:
                     pos = np.where(np.isnan(opt))
-                    print(f"{pos=} {pos[2].shape=} {pos[3].shape=}")
+                    # print(f"{pos=} {pos[2].shape=} {pos[3].shape=}")
                 print(f'ref_val = {ref[pos]}\nopt_val={opt[pos]}\n')
                 raise Exception("failed.")
             print(f'{Colors.GREEN} PASS at shape = {opt.shape}.{Colors.END}')
@@ -209,9 +277,11 @@ if __name__ == "__main__":
 
     # "B, Hq, Hk, HEAD_SIZE, Lq, Lk"
     for _ in range(1):
-        test_acc(1, 28, 7, 128, 8410, 8410, True)   # tail
-        test_acc(1, 28, 14, 128, 4096, 4096, True)
-        test_acc(1, 28, 14, 64, 4096, 4096, True)
+        # test_acc(1, 28, 7, 128, 8410, 8410, True)   # tail
+        # test_acc(1, 28, 14, 128, 4096, 4096, True)
+        # test_acc(1, 28, 14, 64, 4096, 4096, True)
+        # 2x38x1357x64 SD3.5-Turbo
+        test_acc(2, 38, 38, 64, 1357, 1357, True)
         # test_acc(1, 24, 6, 128, 2134, 2134, True)   # tail
         # test_acc(1, 28, 7, 128, 64*128, 64*128, True)
         # test_acc(1, 24, 6, 128, 16*128, 16*128, False)
