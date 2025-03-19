@@ -3951,20 +3951,28 @@ KERNEL(sdpa_opt)
  __global OUTPUT_TYPE* tmp_out
 
 ) {
-#if TARGET_SEQ_LEN_BLOCK_SIZE != 16
-#    error sdpa_opt.cl: unsupported TARGET_SEQ_LEN_BLOCK_SIZE
-#endif
-#define batch_idx      ((uint)get_global_id(0))
-#define num_heads_dim  ((uint)get_global_id(0))
-#define b0_idx         (batch_idx / NUM_HEADS)
-#define b1_idx         (batch_idx % NUM_HEADS)
-#define target_seq_dim ((uint)get_global_id(1))
-#define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
-#define head_size_idx  ((uint)get_local_id(2) % HEAD_SIZE)
-#define sglid          (uint) get_sub_group_local_id()
-#define sgid           (uint) get_sub_group_id()
+    #if TARGET_SEQ_LEN_BLOCK_SIZE != 16
+    #    error sdpa_opt.cl: unsupported TARGET_SEQ_LEN_BLOCK_SIZE
+    #endif
+
+    // Define indexes variables using macro declarations to avoid register spills
+    #define batch_idx      ((uint)get_global_id(0))
+    #define num_heads_dim  ((uint)get_global_id(0))
+    #define b0_idx         (batch_idx / NUM_HEADS)
+    #define b1_idx         (batch_idx % NUM_HEADS)
+    #define target_seq_dim ((uint)get_global_id(1))
+    #define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
+    #define head_size_idx  ((uint)get_local_id(2) % HEAD_SIZE)
+    #define sglid          (uint) get_sub_group_local_id()
+    #define sgid           (uint) get_sub_group_id()
+
+    // SLM buffer for query inputs
     __local INPUT0_TYPE slm_query[HEAD_SIZE * TARGET_SEQ_LEN_BLOCK_SIZE];
+
+    // SLM buffer for intermediate QK results
     __local OUTPUT_TYPE slm_qk_vals[SEQ_LEN_PARTITION_SIZE * TARGET_SEQ_LEN_BLOCK_SIZE];
+
+    // SLM buffers for SoftMax calculation and qk_max/qk_sums results aggregation across all WGs
     __local SOFTMAX_ACCUMULATOR_TYPE slm_qk_max_vals[SUBGROUPS_PER_WG * TARGET_SEQ_LEN_BLOCK_SIZE];
     __local SOFTMAX_ACCUMULATOR_TYPE slm_exp_sum_vals[SUBGROUPS_PER_WG * TARGET_SEQ_LEN_BLOCK_SIZE];
 
@@ -4293,7 +4301,7 @@ KERNEL(sdpa_opt)
                     }
 
                     output_acc[seq_idx] = acc_output_res[seq_idx];
-                    
+
                     if (sgid == 0 && sglid == 0) {
                         slm_exp_sum_prev[seq_idx] = updated_total_exp_sum;
                         slm_max_val_prev[seq_idx] = total_max;
