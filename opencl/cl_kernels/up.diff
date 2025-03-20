@@ -1,0 +1,474 @@
+4048,4051c4048,4055
+< #define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
+< #define head_size_idx  ((uint)get_local_id(2) % HEAD_SIZE)
+< #define sglid          (uint) get_sub_group_local_id()
+< #define sgid           (uint) get_sub_group_id()
+---
+> #if IS_PAGED_ATTENTION
+> #    define target_seq_idx ((uint)block_start_pos - subsequence_begins[gws_seq_indexes_correspondence[target_seq_dim]])
+> #else
+> #    define target_seq_idx ((uint)get_global_id(1) * TARGET_SEQ_LEN_BLOCK_SIZE)
+> #endif
+> #define head_size_idx ((uint)get_local_id(2) % HEAD_SIZE)
+> #define sglid         (uint) get_sub_group_local_id()
+> #define sgid          (uint) get_sub_group_id()
+4053,4057c4057,4058
+<     __local OUTPUT_TYPE slm_qk_vals[SEQ_LEN_PARTITION_SIZE * TARGET_SEQ_LEN_BLOCK_SIZE];
+<     __local SOFTMAX_ACCUMULATOR_TYPE slm_qk_max_vals[SUBGROUPS_PER_WG * TARGET_SEQ_LEN_BLOCK_SIZE];
+<     __local SOFTMAX_ACCUMULATOR_TYPE slm_exp_sum_vals[SUBGROUPS_PER_WG * TARGET_SEQ_LEN_BLOCK_SIZE];
+<     __local SOFTMAX_ACCUMULATOR_TYPE slm_exp_sum_cur[TARGET_SEQ_LEN_BLOCK_SIZE];
+<     __local SOFTMAX_ACCUMULATOR_TYPE slm_max_val_cur[TARGET_SEQ_LEN_BLOCK_SIZE];
+---
+>     __local OUTPUT_TYPE slm_qk_vals[TARGET_SEQ_LEN_BLOCK_SIZE][SEQ_LEN_PARTITION_SIZE];
+>     __local SOFTMAX_ACCUMULATOR_TYPE slm_qk_max_vals[TARGET_SEQ_LEN_BLOCK_SIZE][SUBGROUPS_PER_WG];
+4059a4061,4068
+>     __local SOFTMAX_ACCUMULATOR_TYPE slm_update_factor[TARGET_SEQ_LEN_BLOCK_SIZE];
+> #if IS_PAGED_ATTENTION
+>     const uint block_start_pos = blocked_indexes_start[target_seq_dim];
+>     const uint block_end_pos = blocked_indexes_end[target_seq_dim];
+>     const uint seq_idx_end = block_end_pos - block_start_pos;
+> #else
+>     const uint seq_idx_end = min(TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
+> #endif
+4062,4063d4070
+<         const uint block_start_pos = blocked_indexes_start[target_seq_dim];
+<         const uint block_end_pos = blocked_indexes_end[target_seq_dim];
+4067d4073
+<         const uint cur_target_seq_len_size = block_end_pos - block_start_pos;
+4077d4082
+<         const uint cur_target_seq_len_size = min(TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
+4089c4094
+<         if (cur_target_seq_len_size != TARGET_SEQ_LEN_BLOCK_SIZE) {
+---
+>         if (seq_idx_end != TARGET_SEQ_LEN_BLOCK_SIZE) {
+4091c4096
+<                 for (uint seq_idx = 0; seq_idx < cur_target_seq_len_size; seq_idx++) {
+---
+>                 for (uint seq_idx = 0; seq_idx < seq_idx_end; seq_idx++) {
+4149d4153
+<         SOFTMAX_ACCUMULATOR_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+4150a4155,4157
+> #if IS_CAUSAL
+>         const uint partition_seq_len = min((uint)SEQ_LEN_PARTITION_SIZE, (uint)max(0, (int)(target_seq_idx + seq_idx_end) - (int)start_partition_idx));
+> #else
+4151a4159,4163
+> #endif
+>         MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_acc = INPUT0_VAL_ZERO;
+> #if IS_CAUSAL
+>         if (seq_len <= target_seq_idx) {
+> #endif
+4154c4166
+<         const uint heads_dim = num_heads_dim / BROADCAST_GROUP_SIZE;
+---
+>             const uint heads_dim = num_heads_dim / BROADCAST_GROUP_SIZE;
+4156c4168
+<         const uint heads_dim = num_heads_dim;
+---
+>             const uint heads_dim = num_heads_dim;
+4159,4160c4171,4172
+<         const uint key_pitch = (HEAD_SIZE * NUM_KV_HEADS + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM);
+<         uint key_offset = INPUT1_OFFSET + KEY_SEQ_OFFSET * key_pitch + heads_dim * HEAD_SIZE + seq_len * key_pitch;
+---
+>             const uint key_pitch = (HEAD_SIZE * NUM_KV_HEADS + INPUT1_PAD_BEFORE_FEATURE_NUM + INPUT1_PAD_AFTER_FEATURE_NUM);
+>             uint key_offset = INPUT1_OFFSET + KEY_SEQ_OFFSET * key_pitch + heads_dim * HEAD_SIZE + seq_len * key_pitch;
+4177,4184c4189,4191
+<         int seq_len_calc_size = min((int)(SOURCE_SEQ_LEN) - (int)seq_len, (int)SUBGROUP_SIZE);
+<         MAKE_VECTOR_TYPE(INPUT0_TYPE, TARGET_SEQ_LEN_BLOCK_SIZE) qk_acc;
+<         qk_acc = FUNC_CALL(load_attn_mask)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx,
+<                                            b1_idx,
+< #if IS_PAGED_ATTENTION
+<                                            blocked_indexes_start[target_seq_dim] - subsequence_begins[gws_seq_indexes_correspondence[target_seq_dim]] + sglid,
+< #else
+<                                            target_seq_idx + sglid,
+---
+>             int seq_len_calc_size = min((int)(SOURCE_SEQ_LEN) - (int)seq_len, (int)SUBGROUP_SIZE);
+> #if !IS_CAUSAL
+>             qk_acc = FUNC_CALL(load_attn_mask)(OPTIONAL_SHAPE_INFO_TENSOR b0_idx, b1_idx, target_seq_idx + sglid, seq_len ATTN_MASK_BUFFER ATTN_SCALE_BUFFER PA_BUFFERS);
+4186,4187c4193
+<                                            seq_len ATTN_MASK_BUFFER ATTN_SCALE_BUFFER PA_BUFFERS);
+<         if (seq_len_calc_size >= SUBGROUP_SIZE) {
+---
+>             if (seq_len_calc_size >= SUBGROUP_SIZE) {
+4189,4190c4195,4196
+<             const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + sglid, 0);
+<             KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+---
+>                 const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + sglid, 0);
+>                 KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+4192c4198
+<             KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+---
+>                 KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+4195c4201
+<             __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+---
+>                 __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+4198,4204c4204,4210
+<                 QUERY_VEC queries_vec;
+<                 uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+<                 unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+<                     queries_vec[q_row_idx] = slm_query[query_local_offset];
+<                     query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+<                 }
+<                 unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+---
+>                     QUERY_VEC queries_vec;
+>                     uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+>                     unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+>                         queries_vec[q_row_idx] = slm_query[query_local_offset];
+>                         query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+>                     }
+>                     unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+4206c4212
+<                     const INPUT1_TYPE key_packed = KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index);
+---
+>                         const INPUT1_TYPE key_packed = KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index);
+4211,4212c4217,4218
+<                     KEY_COMPRESSION_SCALE_TYPE key_vals =
+<                         (TO_KEY_COMPRESSION_SCALE_TYPE(key_packed) - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+---
+>                         KEY_COMPRESSION_SCALE_TYPE key_vals =
+>                             (TO_KEY_COMPRESSION_SCALE_TYPE(key_packed) - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+4218,4219c4224,4226
+<                     unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+<                         qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+---
+>                         unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+>                             qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+>                         }
+4222,4223c4229
+<             }
+<         } else if (seq_len_calc_size > 0) {
+---
+>             } else if (seq_len_calc_size > 0) {
+4225,4226c4231,4232
+<             const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + min(sglid, (uint)seq_len_calc_size - 1), 0);
+<             KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+---
+>                 const uint comp_offset = GET_COMPRESSION_INDEX(KEY_COMPRESSION_SCALE, b_idx, b1_idx / BROADCAST_GROUP_SIZE, seq_len + min(sglid, (uint)seq_len_calc_size - 1), 0);
+>                 KEY_COMPRESSION_SCALE_TYPE comp_scale = key_scale[comp_offset];
+4228c4234
+<             KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+---
+>                 KEY_COMPRESSION_SCALE_TYPE comp_zp = key_scale[comp_offset + 1];
+4231c4237
+<             __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+---
+>                 __attribute__((opencl_unroll_hint(1))) for (uint head_idx_index = 0; head_idx_index < HEAD_SIZE; head_idx_index += SUBGROUP_SIZE) {
+4243,4248c4249,4254
+<                 QUERY_VEC_TYPE queries_vec;
+<                 uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+<                 unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+<                     queries_vec[q_row_idx] = slm_query[query_local_offset];
+<                     query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+<                 }
+---
+>                     QUERY_VEC_TYPE queries_vec;
+>                     uint query_local_offset = (head_idx_index * TARGET_SEQ_LEN_BLOCK_SIZE) + sglid;
+>                     unroll_for(uint q_row_idx = 0; q_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; q_row_idx++) {
+>                         queries_vec[q_row_idx] = slm_query[query_local_offset];
+>                         query_local_offset += TARGET_SEQ_LEN_BLOCK_SIZE;
+>                     }
+4250,4251c4256,4257
+<                 KEY_UNPACKED_VEC_TYPE key_vec = 0;
+<                 unroll_for(uint key_row_idx = 0; key_row_idx < seq_len_calc_size; key_row_idx++) {
+---
+>                     KEY_UNPACKED_VEC_TYPE key_vec = 0;
+>                     unroll_for(uint key_row_idx = 0; key_row_idx < seq_len_calc_size; key_row_idx++) {
+4253c4259
+<                     key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+---
+>                         key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+4255c4261
+<                     key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+---
+>                         key_vec[key_row_idx] = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+4258c4264
+<                     key_vec[key_row_idx] = (key_vec[key_row_idx] - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+---
+>                         key_vec[key_row_idx] = (key_vec[key_row_idx] - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+4260c4266
+<                     key_vec[key_row_idx] *= sub_group_broadcast(comp_scale, key_row_idx);
+---
+>                         key_vec[key_row_idx] *= sub_group_broadcast(comp_scale, key_row_idx);
+4262c4268
+<                 }
+---
+>                     }
+4264c4270
+<                 unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+---
+>                     unroll_for(uint key_row_idx = 0; key_row_idx < TARGET_SEQ_LEN_BLOCK_SIZE; key_row_idx++) {
+4266,4267c4272,4273
+<                     KEY_UNPACKED_TYPE key_vals = 0;
+<                     if (key_row_idx < seq_len_calc_size) {
+---
+>                         KEY_UNPACKED_TYPE key_vals = 0;
+>                         if (key_row_idx < seq_len_calc_size) {
+4269c4275
+<                         key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+---
+>                             key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, sub_group_broadcast(key_offset, key_row_idx) + head_idx_index));
+4271c4277
+<                         key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+---
+>                             key_vals = TO_KEY_UNPACKED_TYPE(KEY_BLOCK_READ(key_input, key_offset + key_row_idx * key_pitch + head_idx_index));
+4273c4279
+<                     }
+---
+>                         }
+4275c4281
+<                     key_vals = (key_vals - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+---
+>                         key_vals = (key_vals - sub_group_broadcast(comp_zp, key_row_idx)) * sub_group_broadcast(comp_scale, key_row_idx);
+4277c4283
+<                     key_vals *= sub_group_broadcast(comp_scale, key_row_idx);
+---
+>                         key_vals *= sub_group_broadcast(comp_scale, key_row_idx);
+4282,4283c4288,4290
+<                     unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+<                         qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+---
+>                         unroll_for(uint i = 0; i < SUBGROUP_SIZE; i++) {
+>                             qk_acc[key_row_idx] = mad(sub_group_broadcast(key_vals, i), queries_vec[i], qk_acc[key_row_idx]);
+>                         }
+4287,4289c4294,4303
+<         }
+<         {
+<             unroll_for(uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+---
+>             {
+>                 SOFTMAX_ACCUMULATOR_TYPE qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+>                 unroll_for(uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+> #if IS_CAUSAL
+> #    if defined(IS_PAGED_ATTENTION) && SLIDING_WINDOW_SIZE != 0
+>                     if ((seq_len + i <= target_seq_idx + sglid) && (target_seq_idx + sglid < SLIDING_WINDOW_SIZE || seq_len + i >= target_seq_idx + sglid - SLIDING_WINDOW_SIZE)) {
+> #    else
+>                     if (seq_len + i <= target_seq_idx + sglid) {
+> #    endif
+> #endif
+4292c4306
+<                 const OUTPUT_TYPE scale_val = *scale;
+---
+>                         const OUTPUT_TYPE scale_val = *scale;
+4294c4308
+<                 const OUTPUT_TYPE scale_val = TO_OUTPUT_TYPE(STATIC_SCALE_VALUE);
+---
+>                         const OUTPUT_TYPE scale_val = TO_OUTPUT_TYPE(STATIC_SCALE_VALUE);
+4296c4310
+<                 qk_acc[i] *= scale_val;
+---
+>                         qk_acc[i] *= scale_val;
+4299,4300c4313,4320
+<                 const int alibi_val = (1 - SOURCE_SEQ_LEN) + seq_len + i;
+<                 qk_acc[i] += alibi_slopes[num_heads_dim] * alibi_val;
+---
+>                         const int alibi_val = (1 - SOURCE_SEQ_LEN) + seq_len + i;
+>                         qk_acc[i] += alibi_slopes[num_heads_dim] * alibi_val;
+> #endif
+>                         qk_acc[i] = INPUT0_MIN_FUNC(INPUT0_MAX_FUNC(qk_acc[i], INPUT0_VAL_MIN), INPUT0_VAL_MAX);
+> #if IS_CAUSAL
+>                     } else {
+>                         qk_acc[i] = INPUT0_VAL_MIN;
+>                     }
+4302,4303c4322,4325
+<                 qk_acc[i] = INPUT0_MIN_FUNC(INPUT0_MAX_FUNC(qk_acc[i], INPUT0_VAL_MIN), INPUT0_VAL_MAX);
+<                 qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_TYPE(qk_acc[i]));
+---
+>                     qk_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max, TO_SOFTMAX_ACCUMULATOR_TYPE(qk_acc[i]));
+>                     slm_qk_vals[sglid][sgid * TARGET_SEQ_LEN_BLOCK_SIZE + i] = qk_acc[i];
+>                 }
+>                 slm_qk_max_vals[sglid][sgid] = qk_max;
+4304a4327,4329
+> #if IS_CAUSAL
+>         } else {
+>             slm_qk_max_vals[sglid][sgid] = SOFTMAX_ACCUMULATOR_VAL_MIN;
+4306,4309c4331
+<         {
+<             slm_qk_max_vals[sgid * SUBGROUP_SIZE + sglid] = qk_max;
+<             qk_max = SOFTMAX_ACCUMULATOR_VAL_MIN;
+<         }
+---
+> #endif
+4312,4340c4334,4354
+<             SOFTMAX_ACCUMULATOR_TYPE qk_max_new = SOFTMAX_ACCUMULATOR_VAL_MIN;
+<             for (uint i = 0; i < SUBGROUPS_PER_WG; i++) {
+<                 SOFTMAX_ACCUMULATOR_TYPE qk_max_val = slm_qk_max_vals[i * SUBGROUP_SIZE + sglid];
+<                 qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(qk_max_new, qk_max_val);
+<             }
+<             if (sgid == 0) {
+<                 slm_max_val_cur[sglid] = qk_max_new;
+<             }
+<             SOFTMAX_ACCUMULATOR_TYPE exp_sum_new = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+<             for (uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+<                 qk_acc[i] = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(qk_acc[i]) - qk_max_new);
+<                 exp_sum_new += qk_acc[i];
+<             }
+<             { slm_exp_sum_vals[sgid * SUBGROUP_SIZE + sglid] = exp_sum_new; }
+<             exp_sum_new = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+<             barrier(CLK_LOCAL_MEM_FENCE);
+<             for (uint i = 0; i < SUBGROUPS_PER_WG; i++) {
+<                 SOFTMAX_ACCUMULATOR_TYPE exp_sum = slm_exp_sum_vals[i * SUBGROUP_SIZE + sglid];
+<                 exp_sum_new += exp_sum;
+<             }
+<             for (uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+<                 qk_acc[i] = qk_acc[i] / exp_sum_new;
+<             }
+<             if (sgid == 0) {
+<                 slm_exp_sum_cur[sglid] = exp_sum_new;
+<             }
+<             for (uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+<                 slm_qk_vals[sglid * SEQ_LEN_PARTITION_SIZE + sgid * TARGET_SEQ_LEN_BLOCK_SIZE + i] = qk_acc[i];
+<             }
+---
+>             uint aligned_width = ((SUBGROUPS_PER_WG + (SUBGROUP_SIZE - 1)) & ~(SUBGROUP_SIZE - 1));
+>             for (uint m = sgid; m < seq_idx_end; m += SUBGROUPS_PER_WG) {
+>                 SOFTMAX_ACCUMULATOR_TYPE qk_max_new, qk_max_cur = SOFTMAX_ACCUMULATOR_VAL_MIN;
+>                 for (uint k = sglid; k < aligned_width; k += SUBGROUP_SIZE) {
+>                     if (k < SUBGROUPS_PER_WG) {
+>                         qk_max_new = slm_qk_max_vals[m][k];
+>                     } else {
+>                         qk_max_new = SOFTMAX_ACCUMULATOR_VAL_MIN;
+>                     }
+>                     qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_reduce_max(qk_max_new), qk_max_cur);
+>                     qk_max_cur = qk_max_new;
+>                 }
+>                 SOFTMAX_ACCUMULATOR_TYPE max_val_prev = slm_max_val_prev[m];
+>                 qk_max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_reduce_max(qk_max_cur), max_val_prev);
+>                 SOFTMAX_ACCUMULATOR_TYPE exp_sum_new = SOFTMAX_ACCUMULATOR_VAL_ZERO;
+>                 for (uint k = sglid; k < partition_seq_len; k += SUBGROUP_SIZE) {
+>                     SOFTMAX_ACCUMULATOR_TYPE a = native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][k]) - qk_max_new);
+>                     slm_qk_vals[m][k] = TO_OUTPUT_TYPE(a);
+>                     exp_sum_new += a;
+>                 }
+>                 exp_sum_new = sub_group_reduce_add(exp_sum_new);
+4342,4359c4356,4373
+<             const uint subsequence_idx = gws_seq_indexes_correspondence[target_seq_dim];
+<             const uint subsequence_end_pos = subsequence_begins[subsequence_idx + 1];
+<             const uint block_start_pos = blocked_indexes_start[target_seq_dim];
+<             const uint block_end_pos = blocked_indexes_end[target_seq_dim];
+<             if (subsequence_end_pos == block_end_pos) {
+<                 const uint last_row_idx = block_end_pos - block_start_pos - 1;
+<                 if (sglid == last_row_idx) {
+<                     const uint partition_idx = start_partition_idx / SEQ_LEN_PARTITION_SIZE;
+<                     if (sgid == 0) {
+<                         const uint max_partitions_num = aligned_max_context_len / SEQ_LEN_PARTITION_SIZE;
+<                         const uint exp_sums_output_offset = subsequence_idx * NUM_HEADS * max_partitions_num + num_heads_dim * max_partitions_num + partition_idx;
+<                         exp_sums[exp_sums_output_offset] = exp_sum_new;
+<                         max_logits[exp_sums_output_offset] = qk_max_new;
+<                     }
+<                     const uint output_offset = subsequence_idx * NUM_HEADS * aligned_max_context_len + num_heads_dim * aligned_max_context_len +
+<                                                partition_idx * SEQ_LEN_PARTITION_SIZE + sgid * TARGET_SEQ_LEN_BLOCK_SIZE;
+<                     for (uint i = 0; i < TARGET_SEQ_LEN_BLOCK_SIZE; i++) {
+<                         softmax_results[output_offset + i] = qk_acc[i];
+---
+>                 const uint subsequence_idx = gws_seq_indexes_correspondence[target_seq_dim];
+>                 const uint subsequence_end_pos = subsequence_begins[subsequence_idx + 1];
+>                 if (subsequence_end_pos == block_end_pos) {
+>                     const uint last_row_idx = block_end_pos - block_start_pos - 1;
+>                     if (m == last_row_idx) {
+>                         const uint partition_idx = start_partition_idx / SEQ_LEN_PARTITION_SIZE;
+>                         SOFTMAX_ACCUMULATOR_TYPE correction_factor = native_exp(qk_max_new - qk_max_cur);
+>                         if (sglid == 0) {
+>                             const uint max_partitions_num = aligned_max_context_len / SEQ_LEN_PARTITION_SIZE;
+>                             const uint exp_sums_output_offset = subsequence_idx * NUM_HEADS * max_partitions_num + num_heads_dim * max_partitions_num + partition_idx;
+>                             exp_sums[exp_sums_output_offset] = exp_sum_new * correction_factor;
+>                             max_logits[exp_sums_output_offset] = qk_max_cur;
+>                         }
+>                         const uint output_offset =
+>                             subsequence_idx * NUM_HEADS * aligned_max_context_len + num_heads_dim * aligned_max_context_len + partition_idx * SEQ_LEN_PARTITION_SIZE;
+>                         for (uint i = sglid; i < partition_seq_len; i += SUBGROUP_SIZE) {
+>                             softmax_results[output_offset + i] = TO_SOFTMAX_ACCUMULATOR_TYPE(slm_qk_vals[m][i]) / exp_sum_new;
+>                         }
+4362d4375
+<             }
+4363a4377,4386
+>                 if (sglid == 0) {
+>                     SOFTMAX_ACCUMULATOR_TYPE pre_exp_sum = slm_exp_sum_prev[m];
+>                     SOFTMAX_ACCUMULATOR_TYPE correction_factor = native_exp(max_val_prev - qk_max_new);
+>                     SOFTMAX_ACCUMULATOR_TYPE pre_exp_sum_fixed = pre_exp_sum * correction_factor;
+>                     exp_sum_new += pre_exp_sum_fixed;
+>                     slm_update_factor[m] = correction_factor;
+>                     slm_max_val_prev[m] = qk_max_new;
+>                     slm_exp_sum_prev[m] = exp_sum_new;
+>                 }
+>             }
+4407c4430
+<                         qk_val[seq_idx] = slm_qk_vals[seq_idx * SEQ_LEN_PARTITION_SIZE + seq_len + sglid];
+---
+>                         qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len + sglid];
+4479c4502
+<                         qk_val[seq_idx] = slm_qk_vals[seq_idx * SEQ_LEN_PARTITION_SIZE + seq_len * SUBGROUP_SIZE + sglid];
+---
+>                         qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len * SUBGROUP_SIZE + sglid];
+4504d4526
+<                     uint qk_offset = min(seq_len_leftovers_start + sglid, seq_len_end - 1);
+4507,4508c4529
+<                         qk_val[seq_idx] = slm_qk_vals[qk_offset];
+<                         qk_offset += SEQ_LEN_PARTITION_SIZE;
+---
+>                         qk_val[seq_idx] = slm_qk_vals[seq_idx][seq_len_leftovers_start + sglid];
+4566a4588
+>             barrier(CLK_LOCAL_MEM_FENCE);
+4568,4579d4589
+<                 SOFTMAX_ACCUMULATOR_TYPE exp_sum_prev = slm_exp_sum_prev[sglid];
+<                 SOFTMAX_ACCUMULATOR_TYPE exp_sum_cur = slm_exp_sum_cur[sglid];
+<                 SOFTMAX_ACCUMULATOR_TYPE max_val_prev = slm_max_val_prev[sglid];
+<                 SOFTMAX_ACCUMULATOR_TYPE max_val_cur = slm_max_val_cur[sglid];
+<                 barrier(CLK_LOCAL_MEM_FENCE);
+< #if IS_PAGED_ATTENTION
+<                 const uint block_start_pos_new = blocked_indexes_start[target_seq_dim];
+<                 const uint block_end_pos_new = blocked_indexes_end[target_seq_dim];
+<                 const uint seq_idx_end = block_end_pos_new - block_start_pos_new;
+< #else
+<                 const uint seq_idx_end = min(TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
+< #endif
+4581,4584d4590
+<                     SOFTMAX_ACCUMULATOR_TYPE total_max = SOFTMAX_ACCUMULATOR_MAX_FUNC(sub_group_broadcast(max_val_prev, seq_idx), sub_group_broadcast(max_val_cur, seq_idx));
+<                     SOFTMAX_ACCUMULATOR_TYPE updated_exp_sum_prev = sub_group_broadcast(exp_sum_prev, seq_idx) * native_exp(sub_group_broadcast(max_val_prev, seq_idx) - total_max);
+<                     SOFTMAX_ACCUMULATOR_TYPE updated_exp_sum_cur = sub_group_broadcast(exp_sum_cur, seq_idx) * native_exp(sub_group_broadcast(max_val_cur, seq_idx) - total_max);
+<                     SOFTMAX_ACCUMULATOR_TYPE updated_total_exp_sum = updated_exp_sum_prev + updated_exp_sum_cur;
+4586,4588c4592
+<                         OUTPUT_TYPE updated_prev_res = TO_SOFTMAX_ACCUMULATOR_TYPE(output_acc[seq_idx]) * updated_exp_sum_prev / updated_total_exp_sum;
+<                         ;
+<                         acc_output_res[seq_idx] *= updated_exp_sum_cur / updated_total_exp_sum;
+---
+>                         OUTPUT_TYPE updated_prev_res = TO_SOFTMAX_ACCUMULATOR_TYPE(output_acc[seq_idx]) * slm_update_factor[seq_idx];
+4592,4595d4595
+<                     if (sgid == 0 && sglid == 0) {
+<                         slm_exp_sum_prev[seq_idx] = updated_total_exp_sum;
+<                         slm_max_val_prev[seq_idx] = total_max;
+<                     }
+4602c4602
+<             slm_qk_vals[seq_idx * SEQ_LEN_PARTITION_SIZE + (uint)get_local_id(2)] = output_acc[seq_idx];
+---
+>             slm_qk_vals[seq_idx][(uint)get_local_id(2)] = output_acc[seq_idx];
+4609c4609
+<                 output_acc[seq_idx] += slm_qk_vals[seq_idx * SEQ_LEN_PARTITION_SIZE + (i * HEAD_SIZE) + head_size_idx];
+---
+>                 output_acc[seq_idx] += slm_qk_vals[seq_idx][(i * HEAD_SIZE) + head_size_idx];
+4613,4615c4613
+<         const uint block_start_pos_new = blocked_indexes_start[target_seq_dim];
+<         const uint block_end_pos_new = blocked_indexes_end[target_seq_dim];
+<         uint output_offset = block_start_pos_new * HEAD_SIZE * NUM_HEADS + num_heads_dim * HEAD_SIZE + sgid * SUBGROUP_SIZE;
+---
+>         uint output_offset = block_start_pos * HEAD_SIZE * NUM_HEADS + num_heads_dim * HEAD_SIZE + sgid * SUBGROUP_SIZE;
+4621,4627c4619
+< #if IS_PAGED_ATTENTION
+<         if (block_start_pos_new + TARGET_SEQ_LEN_BLOCK_SIZE != block_end_pos_new) {
+<             const uint seq_idx_end = block_end_pos_new - block_start_pos_new;
+< #else
+<         if (get_global_id(1) == get_global_size(1) - 1) {
+<             const uint seq_idx_end = min((uint)TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
+< #endif
+---
+>         if (TARGET_SEQ_LEN_BLOCK_SIZE > seq_idx_end) {
+4628a4621
+>                 output_acc[seq_idx] /= slm_exp_sum_prev[seq_idx];
+4633a4627
+>                 output_acc[seq_idx] /= slm_exp_sum_prev[seq_idx];
+4639c4633
+< }
+---
+> }
+\ No newline at end of file

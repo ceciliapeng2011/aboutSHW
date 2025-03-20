@@ -29,8 +29,9 @@ class SDPA_opt:
             # Read the entire file content into a string
             cl_kernel_sources = file.read()
         # print(cl_kernel_sources[:100])
-        options = f'-DHEAD_SIZE={HEAD_SIZE} -DNUM_HEADS={Hq} -DNUM_KV_HEADS={Hk} \
-                    -DSG_SCALE_FACTOR={self.SG_SCALE_FACTOR} -DSEQ_LEN_PARTITION_SIZE={SEQ_LEN_PARTITION_SIZE} -DBROADCAST_GROUP_SIZE={BROADCAST_GROUP_SIZE} -cl-mad-enable'
+        # options = f'-DHEAD_SIZE={HEAD_SIZE} -DNUM_HEADS={Hq} -DNUM_KV_HEADS={Hk} \
+        #             -DSG_SCALE_FACTOR={self.SG_SCALE_FACTOR} -DSEQ_LEN_PARTITION_SIZE={SEQ_LEN_PARTITION_SIZE} -DBROADCAST_GROUP_SIZE={BROADCAST_GROUP_SIZE} -cl-mad-enable'
+        options = f'-cl-mad-enable'
         self.cl_kernels = kernel_cache(cl_kernel_sources, options)
 
     def __call__(self, shape_info_input, query_input, key_input, value_input, attn_mask_input, scale_input):
@@ -215,7 +216,7 @@ if __name__ == "__main__":
         #     # print(f'{Colors.CYAN} q k v shape = {q.shape=} {k.shape=} {v.shape=}.{Colors.END}')
         
         # Load binary files of float16 tensor to QKV
-        def load_qkv(BIN_ROOT_DIR, LAYERID="34", TENSOR_DUMP_FOLDER="tensors_bin"):         
+        def load_qkv(BIN_ROOT_DIR, LAYERID="35", TENSOR_DUMP_FOLDER="tensors_bin"):         
             Q_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src0__f16__2_38_1357_64__bfyx.bin"
             K_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src1__f16__2_38_1357_64__bfyx.bin"
             V_FILE_NAME="program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src2__f16__2_38_1357_64__bfyx.bin"
@@ -231,8 +232,8 @@ if __name__ == "__main__":
             
             return q, k, v
         
-        q, k, v = load_qkv("/home/ceciliapeng/openvino.genai/try.BADcache/")
-        q2, k2, v2 = load_qkv("/home/ceciliapeng/openvino.genai/try.BADcache/")
+        q, k, v = load_qkv("/home/ceciliapeng/openvino.genai/try.Goodcache/")
+        q2, k2, v2 = load_qkv("/home/ceciliapeng/openvino.genai/try.Goodcache/")
         
         # print(path.join("tensors_text", "program1_network1_0_sdpa___module.transformer_blocks."+LAYERID+".attn_aten__scaled_dot_product_attention_ScaledDotProductAttention_src0.txt"))
         compare_tensors(q, q2)
