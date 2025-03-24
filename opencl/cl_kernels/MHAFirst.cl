@@ -410,6 +410,13 @@ __kernel void MHAFirst(__global half * param_qkv,         // [B, L1, (HQ + HK + 
 
         // protect slm_qk_vals as it is read in w*v stage and write in next round q*k stage.
         barrier(CLK_LOCAL_MEM_FENCE);
+        // debug
+        if (query_len == 13 && b == 0 & h == 0 && id_sg_local == 0 && id_sg == 0) // the last block
+        {
+            printf("REF0[%d %d] kv_block=%d, m=%f, l=%f, O=%f, Q*K=%f\n", id_sg, id_sg_local,
+            i, prev_max_attn_score_share[query_len-1], prev_exp_sum_share[query_len-1],
+            prev_output_share[query_len-1][0], qk_dot_share[query_len-1][0]);
+        }
     }
 }
 

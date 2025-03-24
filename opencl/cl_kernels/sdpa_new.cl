@@ -3751,10 +3751,10 @@ CONST_ARRAY_DECL(OUTPUT_SIZES) = OUTPUT_SIZES_DATA;
 #define SOFTMAX_ACCUMULATOR_IS_FP          1
 #define SUBGROUP_SIZE                      16
 #define HEAD_SIZE                          64
-#define SEQ_LEN_PARTITION_SIZE             128
+#define SEQ_LEN_PARTITION_SIZE             (SG_SCALE_FACTOR*HEAD_SIZE)
 #define TARGET_SEQ_LEN_BLOCK_SIZE          16
 #define SDPA_STAGE_0                       1
-#define SG_SCALE_FACTOR                    2
+// #define SG_SCALE_FACTOR                    2
 #define STATIC_SCALE_VALUE_INV             as_float(0x41000000) /*8.000000e+00*/
 #define STATIC_SCALE_VALUE                 as_float(0x3e000000) /*1.250000e-01*/
 
@@ -4308,6 +4308,15 @@ KERNEL(sdpa_opt)
                     }
                 }
             }
+        }
+
+        // debug
+        const uint seq_idx_end = min(TARGET_SEQ_LEN - target_seq_idx, (uint)TARGET_SEQ_LEN_BLOCK_SIZE);
+        if (seq_idx_end == 13 && b0_idx == 0 & b1_idx == 0 && sglid == 0 && sgid == 0) // the last block
+        {
+            printf("REF[%d %d] start_partition_idx=%d, m=%f, l=%f, O=%f, Q*K=%f\n", sgid, sglid,
+            start_partition_idx/SEQ_LEN_PARTITION_SIZE, slm_max_val_prev[seq_idx_end-1], slm_exp_sum_prev[seq_idx_end-1],
+            output_acc[seq_idx_end-1], slm_qk_vals[(seq_idx_end-1)*SEQ_LEN_PARTITION_SIZE]);
         }
     }  // FlashAttention loop end
 
