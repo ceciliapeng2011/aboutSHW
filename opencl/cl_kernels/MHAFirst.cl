@@ -151,7 +151,7 @@ __kernel void MHAFirst(__global half * param_qkv,         // [B, L1, (HQ + HK + 
     // store prev iteration state
     __local half prev_output_share[SGS][S];
     __local half prev_max_attn_score_share[SGS];
-    __local half prev_exp_sum_share[SGS];
+    __local float prev_exp_sum_share[SGS];
 
     __local half max_qk_dot_share[SGS][S / SGS];
     __local half qk_dot_share[SGS][kv_block];
@@ -345,6 +345,10 @@ __kernel void MHAFirst(__global half * param_qkv,         // [B, L1, (HQ + HK + 
             float pre_exp_sum = prev_exp_sum_share[m];
             float pre_exp_sum_fixed = pre_exp_sum * native_exp(prev_max_attn_score - max_qk_dot);
             exp_sum += pre_exp_sum_fixed;
+            // if (query_len == 13 && b == 0 & h == 0 && id_sg_local == 0 && m == (query_len-1)) {
+            //     printf("pre_exp_sum=%f, %f, %f, exp_sum_new=%f\n", pre_exp_sum, native_exp(prev_max_attn_score - max_qk_dot), 
+            //     pre_exp_sum_fixed, exp_sum);
+            // }
             float scale_fixed = pre_exp_sum_fixed / exp_sum;
             float scale = 1.0f / exp_sum;
             for (uint k = id_sg_local; k < key_len_in_kv_block; k += SGS) {
