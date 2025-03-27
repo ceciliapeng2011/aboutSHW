@@ -8,7 +8,7 @@ class SDPA_opt:
     def __init__(self, Hq, Hk, HEAD_SIZE, is_optimized):
         self.is_optimized = is_optimized
         
-        self.SG_SCALE_FACTOR=2
+        self.SG_SCALE_FACTOR=1
         self.SUBGROUP_SIZE=16
         SEQ_LEN_PARTITION_SIZE=(HEAD_SIZE*self.SG_SCALE_FACTOR)
         self.TARGET_SEQ_LEN_BLOCK_SIZE=16
@@ -31,7 +31,7 @@ class SDPA_opt:
         # print(cl_kernel_sources[:100])
         # options = f'-DHEAD_SIZE={HEAD_SIZE} -DNUM_HEADS={Hq} -DNUM_KV_HEADS={Hk} \
         #             -DSG_SCALE_FACTOR={self.SG_SCALE_FACTOR} -DSEQ_LEN_PARTITION_SIZE={SEQ_LEN_PARTITION_SIZE} -DBROADCAST_GROUP_SIZE={BROADCAST_GROUP_SIZE} -cl-mad-enable'
-        options = f'-cl-mad-enable'
+        options = f'-cl-mad-enable -DSG_SCALE_FACTOR={self.SG_SCALE_FACTOR}'
         self.cl_kernels = kernel_cache(cl_kernel_sources, options)
 
     def __call__(self, shape_info_input, query_input, key_input, value_input, attn_mask_input, scale_input):

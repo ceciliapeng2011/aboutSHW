@@ -4317,6 +4317,12 @@ KERNEL(sdpa_opt)
             printf("REF[%d %d] start_partition_idx=%d, m=%f, l=%f, O=%f, Q*K=%f\n", sgid, sglid,
             start_partition_idx/SEQ_LEN_PARTITION_SIZE, slm_max_val_prev[seq_idx_end-1], slm_exp_sum_prev[seq_idx_end-1],
             output_acc[seq_idx_end-1], slm_qk_vals[(seq_idx_end-1)*SEQ_LEN_PARTITION_SIZE]);
+            for (uint j = 0; j < TARGET_SEQ_LEN_BLOCK_SIZE; j++) {
+                for (uint i = 0; i < SEQ_LEN_PARTITION_SIZE; i++)
+                    printf("%f,", slm_qk_vals[j * SEQ_LEN_PARTITION_SIZE + i]);
+                printf("\n");
+            }
+            printf("\n\n");
         }
     }  // FlashAttention loop end
 
