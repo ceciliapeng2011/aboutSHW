@@ -105,13 +105,22 @@ struct onednn_matmul {
         postops.append_eltwise(algorithm::eltwise_swish, alpha, beta);
         return *this;
     }
-    onednn_matmul& post_op_bin_mul(bool per_oc = true) {
+    onednn_matmul& post_op_bin_mul(bool per_oc = true, bool broad_cast = false) {
         memory::dim batch_size = m_M;
         if (batch_size == DNNL_RUNTIME_DIM_VAL)
             batch_size = 1024*1024; // big enough fake static batch
 
-        memory::desc bin_mul_md = memory::desc(memory::dims({batch_size, per_oc ? m_N : 1}), m_a_type, memory::format_tag::ab);
+        memory::desc bin_mul_md = memory::desc(memory::dims({broad_cast ? 1 : batch_size, per_oc ? m_N : 1}), m_a_type, memory::format_tag::ab);
         postops.append_binary(algorithm::binary_mul, bin_mul_md);
+        return *this;
+    }
+    onednn_matmul& post_op_bin_add(bool per_oc = true) {
+        memory::dim batch_size = m_M;
+        if (batch_size == DNNL_RUNTIME_DIM_VAL)
+            batch_size = 1024*1024; // big enough fake static batch
+
+        memory::desc bin_add_md = memory::desc(memory::dims({batch_size, per_oc ? m_N : 1}), m_a_type, memory::format_tag::ab);
+        postops.append_binary(algorithm::binary_add, bin_add_md);
         return *this;
     }
 
@@ -149,6 +158,7 @@ struct onednn_matmul {
     enum class type {
         none,
         with_bin_mul,
+        with_bin_add,
         with_bin_mul_per_row,
         with_bin_mul_per_row_sum,
         with_silu,
@@ -156,10 +166,14 @@ struct onednn_matmul {
     };
     int bin_post_id = -1;
     bool bin_per_row = false;
-    onednn_matmul(memory::data_type act_dtype, memory::data_type weight_dtype, int batch, int ic, int oc, int ic_group_size, type t) : onednn_matmul(act_dtype, weight_dtype, batch, ic, oc, ic_group_size) {
+    onednn_matmul(memory::data_type act_dtype, memory::data_type weight_dtype, int batch, int ic, int oc, int ic_group_size, type t, bool broadcast = false) : onednn_matmul(act_dtype, weight_dtype, batch, ic, oc, ic_group_size) {
         if (t == type::with_bin_mul) {
             bin_post_id = 0;
-            post_op_bin_mul(true);
+            post_op_bin_mul(true, broadcast);
+        }
+        if (t == type::with_bin_add) {
+            bin_post_id = 0;
+            post_op_bin_add(true);
         }
         if (t == type::with_bin_mul_per_row) {
             bin_post_id = 0;
@@ -203,8 +217,9 @@ struct onednn_linear {
               memory::data_type dtype,
               tensor& data, // external weight
               tensor& scale,
-              tensor& zp) {
-        auto mm = make_cacheable<onednn_matmul>(act_dtype, weight_dtype, batch, ic, oc, ic_group_size, t);
+              tensor& zp,
+              bool broadcast = false) {
+        auto mm = make_cacheable<onednn_matmul>(act_dtype, weight_dtype, batch, ic, oc, ic_group_size, t, broadcast);
         onednn_linear linear;
         linear.mm = mm;
         linear.bin_post_id = mm->bin_post_id;
@@ -215,29 +230,31 @@ struct onednn_linear {
         linear.m_a_type = mm->m_a_type;
         linear.m_engine = mm->m_engine;
         linear.m_stream = mm->m_stream;
-        // assume raw weights are nn.Linear
-        memory::desc raw_wei_md = memory::desc(memory::dims({mm->m_K, mm->m_N}), dtype, memory::format_tag::ba);
 
-        if (raw_wei_md != mm->m_wei_md) {
-            ASSERT(0);
-            /*
-            linear.weight = memory(mm->m_wei_md, mm->m_engine);
-            std::cout << ">>>>>>>>>>>>>>>>>> weight layout changed : reorder is called (seems to be not working)" << std::endl;
-            auto src_wei_mem = dnnl::ocl_interop::make_memory(
-                                        raw_wei_md,
-                                        mm->m_engine,
-                                        ocl_interop::memory_kind::usm,
-                                        static_cast<void*>(data));
-            reorder cvt(src_wei_mem, linear.weight);
-            cvt.execute(linear.m_stream, src_wei_mem, linear.weight);
-            linear.m_stream.wait();
-            */
-        } else {
-            linear.weight = dnnl::ocl_interop::make_memory(
-                                        raw_wei_md,
-                                        linear.m_engine,
-                                        ocl_interop::memory_kind::usm,
-                                        static_cast<void*>(data));
+        if (data) {
+            // assume raw weights are nn.Linear
+            memory::desc raw_wei_md = memory::desc(memory::dims({mm->m_K, mm->m_N}), dtype, memory::format_tag::ba);
+            if (raw_wei_md != mm->m_wei_md) {
+                ASSERT(0);
+                /*
+                linear.weight = memory(mm->m_wei_md, mm->m_engine);
+                std::cout << ">>>>>>>>>>>>>>>>>> weight layout changed : reorder is called (seems to be not working)" << std::endl;
+                auto src_wei_mem = dnnl::ocl_interop::make_memory(
+                                            raw_wei_md,
+                                            mm->m_engine,
+                                            ocl_interop::memory_kind::usm,
+                                            static_cast<void*>(data));
+                reorder cvt(src_wei_mem, linear.weight);
+                cvt.execute(linear.m_stream, src_wei_mem, linear.weight);
+                linear.m_stream.wait();
+                */
+            } else {
+                linear.weight = dnnl::ocl_interop::make_memory(
+                                            raw_wei_md,
+                                            linear.m_engine,
+                                            ocl_interop::memory_kind::usm,
+                                            static_cast<void*>(data));
+            }
         }
 
         if (scale) {
@@ -257,7 +274,7 @@ struct onednn_linear {
         return linear;
     }
 
-    void forward(const tensor& a, tensor& c, tensor& bin_input) {
+    void forward(const tensor& a, tensor& c, tensor& bin_input, const tensor& w = tensor()) {
         memory::dim M = a.get_shape()[0];
 
         ASSERT(m_batch == 0 || m_batch == M, "m_batch=", m_batch, " M=", M);
@@ -271,7 +288,10 @@ struct onednn_linear {
             rt_bin_md = memory::desc(memory::dims({M, m_N}), m_a_type, memory::format_tag::ab);
         }
         auto src_mem = dnnl::ocl_interop::make_memory(rt_src_md, m_engine, ocl_interop::memory_kind::usm, (void *)(a));
-        //auto weights_mem = dnnl::ocl_interop::make_memory(m_weights_md, m_engine, ocl_interop::memory_kind::usm, (void *)(w));
+        if (w) {
+            memory::desc wei_md = memory::desc(memory::dims({m_K, m_N}), mm->m_w_type, memory::format_tag::ba);
+            weight = dnnl::ocl_interop::make_memory(wei_md, m_engine, ocl_interop::memory_kind::usm, (void *)(w));
+        }
         auto dst_mem = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(c));
         //auto bias_mem = memory(bias_md, m_engine);
 
@@ -361,6 +381,7 @@ void init_ops_onednn(py::module_& m) {
     py::enum_<onednn_matmul::type>(m, "onednn_matmul_type", py::arithmetic())
         .value("none", onednn_matmul::type::none)
         .value("with_bin_mul", onednn_matmul::type::with_bin_mul)
+        .value("with_bin_add", onednn_matmul::type::with_bin_add)
         .value("with_bin_mul_per_row", onednn_matmul::type::with_bin_mul_per_row)
         .value("with_bin_mul_per_row_sum", onednn_matmul::type::with_bin_mul_per_row_sum)
         .value("with_silu", onednn_matmul::type::with_silu)

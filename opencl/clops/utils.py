@@ -46,6 +46,8 @@ def compare(ref, opt, atol=0.01, rtol=0.01):
         print(f'ref_val = {ref[pos]}')
         print(f'opt_val = {opt[pos]}')
         raise Exception("failed.")
+    else:
+        print(f'PASS')
 
 class Colors:
     """ ANSI color codes """
