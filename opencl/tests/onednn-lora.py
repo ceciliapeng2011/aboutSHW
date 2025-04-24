@@ -5,12 +5,11 @@ import torch
 # from torch import nn
 
 from clops import cl
-from clops.lora import blocking_1nd, LORA_1ST
 from clops import compare
 
 enable_debug = True
 class onednnLoRA:
-    def __init__(self, loraA, loraB, alpha, OC, IC, rank):
+    def __init__(self, loraA, loraB, alpha, OC, IC, rank, from_linear = True):
         self.w_dtype = cl.onednn_dtype.f16
         self.OC = OC
         self.IC = IC
@@ -21,39 +20,43 @@ class onednnLoRA:
         self.loraA = loraA
         self.loraB = loraB
         self.alpha = alpha
+        
+        self.from_linear = from_linear
 
-    def update_batch(self, batch):
-        if self.M != batch:
+    def update_batch(self, n_tokens):
+        if self.M != n_tokens:
             empty_cl_tensor = cl.tensor()
             if enable_debug: print("======== create linear_A =========")
-            self.linear_A = cl.onednn_linear(cl.onednn_dtype.f16, self.w_dtype, batch, self.IC, self.rank,   # M, K, N
+            self.linear_A = cl.onednn_linear(cl.onednn_dtype.f16, self.w_dtype, n_tokens, self.IC, self.rank,   # M, K, N
                                         self.K_group_size, cl.onednn_matmul_type.with_bin_mul,
                                         cl.onednn_dtype.f16, 
-                                        empty_cl_tensor, empty_cl_tensor, empty_cl_tensor, True)
+                                        empty_cl_tensor, empty_cl_tensor, empty_cl_tensor, True, self.from_linear)
             if enable_debug: print("======== create linear_B =========")
-            self.linear_B = cl.onednn_linear(cl.onednn_dtype.f16, self.w_dtype, batch, self.rank, self.OC,
+            self.linear_B = cl.onednn_linear(cl.onednn_dtype.f16, self.w_dtype, n_tokens, self.rank, self.OC,
                                         self.K_group_size, cl.onednn_matmul_type.with_bin_add,
                                         cl.onednn_dtype.f16, 
-                                        empty_cl_tensor, empty_cl_tensor, empty_cl_tensor, False)
-            self.M = batch
+                                        empty_cl_tensor, empty_cl_tensor, empty_cl_tensor, False, self.from_linear)
+            self.M = n_tokens
 
-    def forward(self, input, mainInput):
-        M = input.shape[0]
+    def forward(self, lora_input, main_input):
+        M = lora_input.shape[0]
         self.update_batch(M)
         temp_resA = cl.tensor(np.zeros([M, self.rank], dtype=np.float16))
         dst = cl.tensor(np.zeros([M, self.OC], dtype=np.float16))
 
-        self.linear_A.forward(cl.tensor(input), temp_resA, cl.tensor(self.alpha), cl.tensor(self.loraA))
-        self.linear_B.forward(temp_resA, dst, cl.tensor(mainInput), cl.tensor(self.loraB))
+        self.linear_A.forward(cl.tensor(lora_input), temp_resA, cl.tensor(self.alpha), cl.tensor(self.loraA))
+        self.linear_B.forward(temp_resA, dst, cl.tensor(main_input), cl.tensor(self.loraB))
         return dst
 
-def calc_ref(main_input, input, loraA, loraB, alpha):
-    tloraA = loraA.transpose().copy()
-    tloraB = loraB.transpose().copy()
-    dst_ref = input @ tloraA
+def calc_ref(main_input, lora_input, loraA, loraB, alpha, transpose_w = True):
+    if transpose_w:
+        loraA = loraA.transpose().copy()
+        loraB = loraB.transpose().copy()
+    print(f'{lora_input.shape=}, {loraA.shape=}')
+    dst_ref = lora_input @ loraA
     dst_ref *= alpha
-    dst_ref = dst_ref @ tloraB
-    print(f'{dst_ref.shape=}, {tloraB.shape=}')
+    print(f'{dst_ref.shape=}, {loraB.shape=}')
+    dst_ref = dst_ref @ loraB
     dst_ref += main_input
     print("ref is calculated!")
     return dst_ref
@@ -68,70 +71,109 @@ def test_lora0():
     loraA = np.random.randint(-1,2,[rank, IC]).astype(np.float16)
     loraB = np.random.randint(-1,2,[OC, rank]).astype(np.float16)
 
-    lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank)
+    lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank, True)
 
     for _ in range(3):
-        # input = np.random.randint(-1,2,[n_tokens, IC]).astype(np.float16)
-        input = torch.randn([n_tokens, IC], dtype=torch.float16).numpy()
+        # lora_input = np.random.randint(-1,2,[n_tokens, IC]).astype(np.float16)
+        lora_input = torch.randn([n_tokens, IC], dtype=torch.float16).numpy()
         main_input = np.random.randint(-1,2,[n_tokens, OC]).astype(np.float16)
 
-        dst_cur = lora.forward(input, main_input)
+        dst_cur = lora.forward(lora_input, main_input)
         dst_cur = dst_cur.numpy()
         print("cur is calculated!")
         
-        dst_ref = calc_ref(main_input, input, loraA, loraB, alpha)
+        dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, True)
         compare(dst_ref, dst_cur)
         
 test_lora0()
 
 
+def test_lora1():
+    np.random.seed(0)
+    OC, IC, rank = (512, 1536, 16)
+    n_tokens = 8
+
+    # generate inputs
+    vRANGE = 1
+    loraA = np.random.randint(-vRANGE, vRANGE+1, [IC, rank]).astype(np.float16)
+    # loraA = np.ones([IC, rank]).astype(np.float16)
+    alpha = np.random.rand(rank).astype(np.float16)
+    loraB = np.random.randint(-vRANGE, vRANGE+1, [rank, OC]).astype(np.float16)
+    # loraB = np.ones([rank, OC]).astype(np.float16)
+    
+    lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, IC]).astype(np.float16)
+    main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, OC]).astype(np.float16)
+    lora_input = np.ones([n_tokens, IC]).astype(np.float16)
+
+    lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank, False)
+
+    for _ in range(1):
+        dst_cur = lora.forward(lora_input, main_input)
+        dst_cur = dst_cur.numpy()
+        print("cur is calculated!")
+
+        dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
+        compare(dst_ref, dst_cur)
+        
+test_lora1()
+
+
 
 ################################################################################################################
-# cl.profiling(True)
+from clops.lora import blocking_1nd, LORA_1ST
 
-# batch = 8
-# input_state = 1024
-# output_state_idx = 256//16
-# rank = 16
+cl.profiling(True)
 
-# output_state = output_state_idx*16
-# def oclLoRA(batch, rank, input_state, output_state, check_acc = False):
-#     if check_acc:
-#         REPEAT = 1
-#     else:
-#         REPEAT = 100        
+def oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc = True):
+    if check_acc:
+        REPEAT = 1
+    else:
+        REPEAT = 100        
         
-#     A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = blocking_1nd(batch, rank, input_state, output_state_idx*16)
+    A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = blocking_1nd(n_tokens, rank, IC, OC)
 
-#     Aoutput = np.zeros([batch, rank]).astype(np.float16)
+    Aoutput = np.zeros([n_tokens, rank]).astype(np.float16)
     
-#     stateA_list= [cl.tensor(stateA) for _ in range(REPEAT)]
-#     alpha_list = [cl.tensor(alpha) for _ in range(REPEAT)]
-#     stateB_list = [cl.tensor(stateB)for _ in range(REPEAT)]
-#     loraInput_list = [cl.tensor(loraInput)for _ in range(REPEAT)]
-#     mainInput_list = [cl.tensor(mainInput)for _ in range(REPEAT)]
-#     # Must set the output to be zeros to avoid not all the data is updated in GEMMA. 
-#     A_output_list = [cl.tensor(Aoutput)for _ in range(REPEAT)]
-#     res_list = [cl.tensor([batch, output_state], np.dtype(np.float16))for _ in range(REPEAT)]
+    stateA_list= [cl.tensor(loraA) for _ in range(REPEAT)]
+    alpha_list = [cl.tensor(alpha) for _ in range(REPEAT)]
+    stateB_list = [cl.tensor(loraB)for _ in range(REPEAT)]
+    loraInput_list = [cl.tensor(lora_input)for _ in range(REPEAT)]
+    mainInput_list = [cl.tensor(main_input)for _ in range(REPEAT)]
+    # Must set the output to be zeros to avoid not all the data is updated in GEMMA. 
+    A_output_list = [cl.tensor(Aoutput)for _ in range(REPEAT)]
+    res_list = [cl.tensor([n_tokens, OC], np.dtype(np.float16))for _ in range(REPEAT)]
 
-#     opt = LORA_1ST( batch, rank, input_state, output_state,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
+    opt = LORA_1ST( n_tokens, rank, IC, OC,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
     
-#     opt(mainInput_list[0], loraInput_list[0], stateA_list[0], alpha_list[0], stateB_list[0], A_output_list[0], res_list[0])
-#     cl.finish()
+    opt(mainInput_list[0], loraInput_list[0], stateA_list[0], alpha_list[0], stateB_list[0], A_output_list[0], res_list[0])
+    cl.finish()
     
-#     return res_list[0].numpy()
+    return res_list[0].numpy()
 
-# def test_lora2():   
-#     # generate inputs
-#     vRANGE = 1
-#     # np.random.seed(0)
-#     stateA = np.random.randint(-vRANGE, vRANGE+1, [input_state, rank]).astype(np.float16)
-#     alpha = np.random.rand(rank).astype(np.float16)
-#     stateB = np.random.randint(-vRANGE, vRANGE+1, [rank, output_state]).astype(np.float16)
-#     loraInput = np.random.randint(-vRANGE, vRANGE+1, [batch, input_state]).astype(np.float16)
-#     mainInput = np.random.randint(-vRANGE, vRANGE+1, [batch, output_state]).astype(np.float16)
+def test_lora2(n_tokens, rank, IC, OC):   
+    # generate inputs
+    vRANGE = 1
+    # np.random.seed(0)
+    loraA = np.random.randint(-vRANGE, vRANGE+1, [IC, rank]).astype(np.float16)
+    alpha = np.random.rand(rank).astype(np.float16)
+    loraB = np.random.randint(-vRANGE, vRANGE+1, [rank, OC]).astype(np.float16)
+    lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, IC]).astype(np.float16)
+    main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, OC]).astype(np.float16)
     
-#     ref = lora(batch, rank, input_state, output_state, check_acc=True)
+    ocl_res = oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc=True)
+    print("ocl_res is calculated!")
     
-#     compare(ref, res_list[0].numpy())
-#     print(f'BATCH:{batch} INPUT_STATE:{input_state}, RANK:{rank}, OUPUT_STATE:{output_state} ACC PASS!')
+    lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank, False)
+    dst_cur = lora.forward(lora_input, main_input)
+    dst_cur = dst_cur.numpy()
+    print("cur is calculated!")
+    
+    dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
+    compare(dst_ref, dst_cur)
+
+    compare(ocl_res, dst_cur)
+    print(f'BATCH:{n_tokens} INPUT_STATE:{IC}, RANK:{rank}, OUPUT_STATE:{OC} ACC PASS!')
+
+# test_lora2(8, 16, 1536, 512)
+test_lora2(8, 16, 7*16, 256)
+# test_lora2(8, 64, 8960, 1536)

@@ -129,7 +129,7 @@ struct onednn_matmul {
         return *this;
     }
 
-    void create() {
+    void create(bool from_linear) {
         if (postops.len() > 0) {
             attr.set_post_ops(postops);
         }
@@ -139,7 +139,12 @@ struct onednn_matmul {
         //memory::desc wei_md = memory::desc(memory::dims({m_K, m_N}), m_w_type, memory::format_tag::any);
 
         // use fixed weight-layout to prevent shape-dependent weight-layout changes
-        memory::desc wei_md = memory::desc(memory::dims({m_K, m_N}), m_w_type, memory::format_tag::ba);
+        memory::desc wei_md;
+        std::cout << "============== create():from_linear=" << from_linear << std::endl;
+        if (from_linear)
+            wei_md = memory::desc(memory::dims({m_K, m_N}), m_w_type, memory::format_tag::ba);
+        else
+            wei_md = memory::desc(memory::dims({m_K, m_N}), m_w_type, memory::format_tag::ab);
 
         m_engine = onednn_context::engine();
         m_stream = onednn_context::stream();
@@ -166,7 +171,8 @@ struct onednn_matmul {
     };
     int bin_post_id = -1;
     bool bin_per_row = false;
-    onednn_matmul(memory::data_type act_dtype, memory::data_type weight_dtype, int batch, int ic, int oc, int ic_group_size, type t, bool broadcast = false) : onednn_matmul(act_dtype, weight_dtype, batch, ic, oc, ic_group_size) {
+    onednn_matmul(memory::data_type act_dtype, memory::data_type weight_dtype, int batch, int ic, int oc, int ic_group_size, type t, bool broadcast = false, bool from_linear = true) : 
+        onednn_matmul(act_dtype, weight_dtype, batch, ic, oc, ic_group_size) {
         if (t == type::with_bin_mul) {
             bin_post_id = 0;
             post_op_bin_mul(true, broadcast);
@@ -194,7 +200,7 @@ struct onednn_matmul {
             post_op_bin_mul(true);
         }
 
-        create();
+        create(from_linear);
     }
 };
 
@@ -211,6 +217,7 @@ struct onednn_linear {
     int bin_post_id;
     dnnl::engine m_engine;
     dnnl::stream m_stream;
+    bool m_from_linear;
 
     static onednn_linear create(
               memory::data_type act_dtype, memory::data_type weight_dtype, int batch, int ic, int oc, int ic_group_size, onednn_matmul::type t,
@@ -218,8 +225,9 @@ struct onednn_linear {
               tensor& data, // external weight
               tensor& scale,
               tensor& zp,
-              bool broadcast = false) {
-        auto mm = make_cacheable<onednn_matmul>(act_dtype, weight_dtype, batch, ic, oc, ic_group_size, t, broadcast);
+              bool broadcast = false,
+              bool from_linear = true) {
+        auto mm = make_cacheable<onednn_matmul>(act_dtype, weight_dtype, batch, ic, oc, ic_group_size, t, broadcast, from_linear);
         onednn_linear linear;
         linear.mm = mm;
         linear.bin_post_id = mm->bin_post_id;
@@ -230,6 +238,7 @@ struct onednn_linear {
         linear.m_a_type = mm->m_a_type;
         linear.m_engine = mm->m_engine;
         linear.m_stream = mm->m_stream;
+        linear.m_from_linear = from_linear;
 
         if (data) {
             // assume raw weights are nn.Linear
@@ -289,7 +298,13 @@ struct onednn_linear {
         }
         auto src_mem = dnnl::ocl_interop::make_memory(rt_src_md, m_engine, ocl_interop::memory_kind::usm, (void *)(a));
         if (w) {
-            memory::desc wei_md = memory::desc(memory::dims({m_K, m_N}), mm->m_w_type, memory::format_tag::ba);
+            memory::desc wei_md;
+            std::cout << "============== m_from_linear=" << m_from_linear << std::endl;
+            if (m_from_linear) {
+                wei_md = memory::desc(memory::dims({m_K, m_N}), mm->m_w_type, memory::format_tag::ba);
+            } else {
+                wei_md = memory::desc(memory::dims({m_K, m_N}), mm->m_w_type, memory::format_tag::ab);
+            }
             weight = dnnl::ocl_interop::make_memory(wei_md, m_engine, ocl_interop::memory_kind::usm, (void *)(w));
         }
         auto dst_mem = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(c));
