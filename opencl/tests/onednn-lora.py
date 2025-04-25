@@ -8,6 +8,38 @@ from clops import cl
 from clops import compare
 
 enable_debug = True
+
+def test_mm(M, K, N, K_group_size, w_dtype):
+    np.random.seed(0)
+    A = np.random.randint(-1,2,[M, K]).astype(np.float16)
+    tA = cl.tensor(A)
+    tC = cl.tensor(np.zeros([M, N], dtype=np.float16))
+    tP1 = cl.tensor()
+
+    if w_dtype == cl.onednn_dtype.f16:
+        B = np.random.randint(-1,2,[K, N]).astype(np.float16)
+        C = A @ B
+        print("ref is calculated!")
+
+        tB = cl.tensor(B.transpose().copy())
+        linear = cl.onednn_linear(cl.onednn_dtype.f16, w_dtype, M, K, N, -1, cl.onednn_matmul_type.none,
+                                  cl.onednn_dtype.f16, tB, cl.tensor(), cl.tensor(), False, True)
+
+    linear.forward(tA, tC, tP1, cl.tensor())
+
+    cl.finish()
+
+    C1 = tC.numpy()
+
+    if not np.allclose(C, C1):
+        print(C)
+        print(C1)
+    else:
+        print("================ PASSED ==================" , M, K, N, w_dtype)
+
+# test_mm(M = 1, K = 768, N = 2048, K_group_size = 0, w_dtype = cl.onednn_dtype.f16)
+# sys.exit()
+
 class onednnLoRA:
     def __init__(self, loraA, loraB, alpha, OC, IC, rank, from_linear = True):
         self.w_dtype = cl.onednn_dtype.f16
@@ -85,7 +117,7 @@ def test_lora0():
         dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, True)
         compare(dst_ref, dst_cur)
         
-test_lora0()
+# test_lora0()
 
 
 def test_lora1():
@@ -115,7 +147,7 @@ def test_lora1():
         dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
         compare(dst_ref, dst_cur)
         
-test_lora1()
+# test_lora1()
 
 
 
@@ -146,34 +178,47 @@ def oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC,
     opt = LORA_1ST( n_tokens, rank, IC, OC,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
     
     opt(mainInput_list[0], loraInput_list[0], stateA_list[0], alpha_list[0], stateB_list[0], A_output_list[0], res_list[0])
-    cl.finish()
+    duration = cl.finish()
     
-    return res_list[0].numpy()
+    return res_list[0].numpy(), duration
 
-def test_lora2(n_tokens, rank, IC, OC):   
+def test_lora2(n_tokens, rank, IC, OC, check_acc = False):   
     # generate inputs
     vRANGE = 1
     # np.random.seed(0)
     loraA = np.random.randint(-vRANGE, vRANGE+1, [IC, rank]).astype(np.float16)
     alpha = np.random.rand(rank).astype(np.float16)
     loraB = np.random.randint(-vRANGE, vRANGE+1, [rank, OC]).astype(np.float16)
-    lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, IC]).astype(np.float16)
-    main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, OC]).astype(np.float16)
-    
-    ocl_res = oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc=True)
-    print("ocl_res is calculated!")
     
     lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank, False)
-    dst_cur = lora.forward(lora_input, main_input)
-    dst_cur = dst_cur.numpy()
-    print("cur is calculated!")
-    
-    dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
-    compare(dst_ref, dst_cur)
 
-    compare(ocl_res, dst_cur)
-    print(f'BATCH:{n_tokens} INPUT_STATE:{IC}, RANK:{rank}, OUPUT_STATE:{OC} ACC PASS!')
+    num_iters = 1 if check_acc else 10
+    for r in range(num_iters):
+        # cl.finish()
+        lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, IC]).astype(np.float16)
+        main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, OC]).astype(np.float16)
+
+        ocl_res, durs = oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc=True)
+        for ns in durs:
+            print(f'ocl_lora is calculated!, {ns*1e-6:.3f} ms')
+
+        # cl.finish()
+        # t0 = time.time()
+        dst_cur = lora.forward(lora_input, main_input)
+        # latency_ns = cl.finish()
+        dst_cur = dst_cur.numpy()
+        # t1 = time.time()
+        # for t in latency_ns:
+        #     print(f"\t onednn_lora is calculated! {t*1e-3:.3f} us")
+        # print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
+
+        if check_acc:
+            dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
+            compare(dst_ref, dst_cur)
+
+            compare(ocl_res, dst_cur)
+            print(f'BATCH:{n_tokens} INPUT_STATE:{IC}, RANK:{rank}, OUPUT_STATE:{OC} ACC PASS!')
 
 # test_lora2(8, 16, 1536, 512)
-test_lora2(8, 16, 7*16, 256)
-# test_lora2(8, 64, 8960, 1536)
+# test_lora2(8, 16, 7*16, 256, True)
+test_lora2(3019, 64, 8960, 1536)

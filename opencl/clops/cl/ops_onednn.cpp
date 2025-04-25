@@ -140,7 +140,7 @@ struct onednn_matmul {
 
         // use fixed weight-layout to prevent shape-dependent weight-layout changes
         memory::desc wei_md;
-        std::cout << "============== create():from_linear=" << from_linear << std::endl;
+        // std::cout << "============== create():from_linear=" << from_linear << std::endl;
         if (from_linear)
             wei_md = memory::desc(memory::dims({m_K, m_N}), m_w_type, memory::format_tag::ba);
         else
@@ -299,7 +299,7 @@ struct onednn_linear {
         auto src_mem = dnnl::ocl_interop::make_memory(rt_src_md, m_engine, ocl_interop::memory_kind::usm, (void *)(a));
         if (w) {
             memory::desc wei_md;
-            std::cout << "============== m_from_linear=" << m_from_linear << std::endl;
+            // std::cout << "============== m_from_linear=" << m_from_linear << std::endl;
             if (m_from_linear) {
                 wei_md = memory::desc(memory::dims({m_K, m_N}), mm->m_w_type, memory::format_tag::ba);
             } else {
