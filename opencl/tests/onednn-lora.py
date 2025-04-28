@@ -80,18 +80,19 @@ class onednnLoRA:
         self.linear_B.forward(temp_resA, dst, cl.tensor(main_input), cl.tensor(self.loraB))
         return dst
 
-def calc_ref(main_input, lora_input, loraA, loraB, alpha, transpose_w = True):
-    if transpose_w:
-        loraA = loraA.transpose().copy()
-        loraB = loraB.transpose().copy()
-    print(f'{lora_input.shape=}, {loraA.shape=}')
-    dst_ref = lora_input @ loraA
-    dst_ref *= alpha
-    print(f'{dst_ref.shape=}, {loraB.shape=}')
-    dst_ref = dst_ref @ loraB
-    dst_ref += main_input
-    print("ref is calculated!")
-    return dst_ref
+    @staticmethod
+    def calc_ref(main_input, lora_input, loraA, loraB, alpha, transpose_w = True):
+        if transpose_w:
+            loraA = loraA.transpose().copy()
+            loraB = loraB.transpose().copy()
+        print(f'{lora_input.shape=}, {loraA.shape=}')
+        dst_ref = lora_input @ loraA
+        dst_ref *= alpha
+        print(f'{dst_ref.shape=}, {loraB.shape=}')
+        dst_ref = dst_ref @ loraB
+        dst_ref += main_input
+        print("ref is calculated!")
+        return dst_ref
 
 def test_lora0():
     np.random.seed(0)
@@ -114,7 +115,7 @@ def test_lora0():
         dst_cur = dst_cur.numpy()
         print("cur is calculated!")
         
-        dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, True)
+        dst_ref = onednnLoRA.calc_ref(main_input, lora_input, loraA, loraB, alpha, True)
         compare(dst_ref, dst_cur)
         
 # test_lora0()
@@ -144,7 +145,7 @@ def test_lora1():
         dst_cur = dst_cur.numpy()
         print("cur is calculated!")
 
-        dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
+        dst_ref = onednnLoRA.calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
         compare(dst_ref, dst_cur)
         
 # test_lora1()
@@ -213,7 +214,7 @@ def test_lora2(n_tokens, rank, IC, OC, check_acc = False):
         # print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
 
         if check_acc:
-            dst_ref = calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
+            dst_ref = onednnLoRA.calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
             compare(dst_ref, dst_cur)
 
             compare(ocl_res, dst_cur)
@@ -221,4 +222,101 @@ def test_lora2(n_tokens, rank, IC, OC, check_acc = False):
 
 # test_lora2(8, 16, 1536, 512)
 # test_lora2(8, 16, 7*16, 256, True)
-test_lora2(3019, 64, 8960, 1536)
+# test_lora2(3019, 64, 8960, 1536)
+
+################################################################################################################
+class onednnLoRAFusedQKV:
+    def __init__(self, loraA : list, loraB : list, alpha : list, head_q, head_kv, rank, from_linear = False):
+        self.w_dtype = cl.onednn_dtype.f16
+        self.head_q = head_q
+        self.head_kv = head_kv
+        self.rank = rank
+        self.M = -1
+
+        self.loraA = loraA
+        self.loraB = loraB
+        self.alpha = alpha
+        
+        self.from_linear = from_linear
+
+    def update_batch(self, n_tokens):
+        if self.M != n_tokens:
+            if enable_debug: print("======== create onednn_lorafused =========")
+            self.linear_A = cl.onednn_lorafused(cl.onednn_dtype.f16, cl.onednn_dtype.f16, n_tokens, self.rank, self.head_q, self.head_kv)
+            self.M = n_tokens
+
+    def forward(self, lora_input, main_input):
+        M = lora_input.shape[0]
+        self.update_batch(M)
+        dst = cl.tensor(np.zeros(main_input.shape, dtype=np.float16))
+
+        self.linear_A.forward(cl.tensor(main_input), cl.tensor(lora_input), dst, [cl.tensor(t) for t in self.loraA], [cl.tensor(t) for t in self.alpha], [cl.tensor(t) for t in self.loraB])
+        return dst
+    
+    @staticmethod
+    def calc_ref(main_input, lora_input, loraA : list, loraB : list, alpha : list, transpose_w = True):
+        if transpose_w:
+            loraA = [t.transpose().copy() for t in loraA]
+            loraB = [t.transpose().copy() for t in loraB]
+        print(f'{loraA[0].shape=}, {loraB[0].shape=}')
+        # concat A and alpha
+        loraA = np.hstack(loraA)
+        alpha = np.hstack(alpha)
+        
+        print(f'{lora_input.shape=}, {loraA.shape=}')
+
+        # gemm A
+        intermediate = lora_input @ loraA
+        # intermediate *= alpha
+        
+        # gemm B x3
+        intermediate = np.hsplit(intermediate, 3)        
+        dst_ref = [intermediate[k] @ loraB[k] for k in range(3)]
+        dst_ref = np.hstack(dst_ref)
+        # dst_ref += main_input
+        print("ref is calculated!")
+        return dst_ref
+
+def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, check_acc = False):   
+    # generate inputs
+    vRANGE = 1
+    # np.random.seed(0)
+    loraA = [np.random.randint(-vRANGE, vRANGE+1, [head_q, rank]).astype(np.float16),
+             np.random.randint(-vRANGE, vRANGE+1, [head_q, rank]).astype(np.float16),
+             np.random.randint(-vRANGE, vRANGE+1, [head_q, rank]).astype(np.float16)]
+    loraA = [np.ones([head_q, rank]).astype(np.float16), np.ones([head_q, rank]).astype(np.float16), np.ones([head_q, rank]).astype(np.float16)]
+    alpha = [np.random.rand(rank).astype(np.float16),
+             np.random.rand(rank).astype(np.float16),
+             np.random.rand(rank).astype(np.float16)]
+    loraB = [np.random.randint(-vRANGE, vRANGE+1, [rank, head_q]).astype(np.float16),
+             np.random.randint(-vRANGE, vRANGE+1, [rank, head_kv]).astype(np.float16),
+             np.random.randint(-vRANGE, vRANGE+1, [rank, head_kv]).astype(np.float16)]
+    loraB = [np.ones([rank, head_q]).astype(np.float16), np.ones([rank, head_kv]).astype(np.float16), np.ones([rank, head_kv]).astype(np.float16)]
+    
+    lora = onednnLoRAFusedQKV(loraA, loraB, alpha, head_q, head_kv, rank)
+
+    num_iters = 1 if check_acc else 10
+    for r in range(num_iters):
+        # cl.finish()
+        lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, head_q]).astype(np.float16)
+        lora_input = np.ones([n_tokens, head_q]).astype(np.float16)
+        main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, head_q+head_kv*2]).astype(np.float16)
+
+        # cl.finish()
+        # t0 = time.time()
+        dst_cur = lora.forward(lora_input, main_input)
+        # latency_ns = cl.finish()
+        dst_cur = dst_cur.numpy()
+        # t1 = time.time()
+        # for t in latency_ns:
+        #     print(f"\t onednn_lora is calculated! {t*1e-3:.3f} us")
+        # print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
+
+        if check_acc:
+            dst_ref = onednnLoRAFusedQKV.calc_ref(main_input.copy(), lora_input.copy(), loraA.copy(), loraB.copy(), alpha.copy(), False)
+            compare(dst_ref, dst_cur)
+            # if not np.allclose(dst_ref, dst_cur, atol=0.01, rtol=0.01):
+            #     print(f"FAIL {dst_ref.shape=}")
+
+test_lora_fusedqkv(2, 16, 4, 2, True)
+# test_lora_fusedqkv(3019, 64, 1536, 256, True)

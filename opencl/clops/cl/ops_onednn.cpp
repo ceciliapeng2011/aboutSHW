@@ -381,12 +381,235 @@ py::array tensor::to_numpy_f16(const memory& mem) {
 #endif
 
 
+using tag = memory::format_tag;
+using dt = memory::data_type;
+struct onednn_lorafused {
+    constexpr static int m_num_lora = 3;
+
+    concat::primitive_desc m_concat_pd[2];
+    concat m_concat_prims[2];
+
+    matmul::primitive_desc m_matmul_pd[1+m_num_lora];
+    matmul m_matmul_prims[1+m_num_lora];;
+
+    memory::data_type m_w_type;
+    memory::data_type m_a_type; // activation dtype
+
+    dnnl::engine m_engine;
+    dnnl::stream m_stream;
+
+    primitive_attr m_attr;
+    post_ops m_postops;
+
+    bool m_from_linear = false;
+
+    onednn_lorafused(memory::data_type act_dtype, memory::data_type weight_dtype, int n_tokens, int rank, int head_q, int head_kv) {
+        m_engine = onednn_context::engine();
+        m_stream = onednn_context::stream();
+
+        m_a_type = act_dtype;
+        m_w_type = weight_dtype;
+
+        // concat_prims
+        {
+            memory::dims src_dims = {rank, head_kv};
+            std::vector<memory::desc> src_mds;
+
+            for (int n = 0; n < m_num_lora; ++n) {
+                auto md = memory::desc(src_dims, weight_dtype, tag::ab);
+                src_mds.push_back(md);
+            }
+            m_concat_pd[0] = concat::primitive_desc(m_engine, 0/*axis*/, src_mds);
+            m_concat_prims[0] = concat(m_concat_pd[0]);
+        }
+
+        {
+            memory::dims src_dims = {1, rank};
+            std::vector<memory::desc> src_mds;
+
+            for (int n = 0; n < m_num_lora; ++n) {
+                auto md = memory::desc(src_dims, weight_dtype, tag::ab);
+                src_mds.push_back(md);
+            }
+            m_concat_pd[1] = concat::primitive_desc(m_engine, 0/*axis*/, src_mds);
+            m_concat_prims[1] = concat(m_concat_pd[1]);
+        }
+
+        // matmul_prims
+        {
+            // const memory::dim n_tokens = 3019, rank = 64, head_kv = 256, head_q = 1536;
+            const memory::dim M = n_tokens, K = head_q, N = rank*3;
+
+            memory::dims src_dims[4] = {{M, K}, {M, rank}, {M, rank}, {M, rank}};
+            memory::dims weights_dims[4] = {{K, N}, {rank, head_q}, {rank, head_kv}, {rank, head_kv}};
+            memory::dims dst_dims[4] = {{M, N}, {M, head_q}, {M, head_kv}, {M, head_kv}};
+            memory::dims alpha_dims = {1, N};
+            memory::dims lora_dst_dims = {M, (head_q + head_kv + head_kv)};
+
+            memory::desc weights_mds[4], src_mds[4], dst_mds[4];
+            for (int k = 0; k < 4; k++) {
+                weights_mds[k] = memory::desc(weights_dims[k], weight_dtype, tag::ab);
+            }
+        
+            src_mds[0] = memory::desc(src_dims[0], act_dtype, tag::ab);
+            auto intern_md = memory::desc(dst_dims[0], act_dtype, tag::ab);
+            for (int k = 1; k < 4; k++)
+                src_mds[k] = intern_md.submemory_desc(src_dims[k], {0, rank * (k-1)});
+
+            auto lora_dst_md = memory::desc(lora_dst_dims, act_dtype, tag::ab);
+            dst_mds[1] = lora_dst_md.submemory_desc(dst_dims[1], {0, 0});
+            dst_mds[2] = lora_dst_md.submemory_desc(dst_dims[2], {0, head_q});
+            dst_mds[3] = lora_dst_md.submemory_desc(dst_dims[3], {0, (head_q+head_kv)});
+
+            post_ops matmul_ops;
+            // const float alpha = 0.f;
+            // const float beta = 0.f;
+            // matmul_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
+            memory::desc bin_mul_md = memory::desc(memory::dims({1, N}), act_dtype, memory::format_tag::ab);
+            matmul_ops.append_binary(algorithm::binary_mul, bin_mul_md);
+            primitive_attr matmul_attr;
+            // matmul_attr.set_post_ops(matmul_ops);
+
+            m_matmul_pd[0] = matmul::primitive_desc(m_engine, src_mds[0], weights_mds[0], intern_md, matmul_attr);
+            for (int k = 1; k < 4; k++)
+                m_matmul_pd[k] = matmul::primitive_desc(m_engine, src_mds[k], weights_mds[k], dst_mds[k]);
+
+            for (int k = 0; k < m_num_lora+1; k++)
+                m_matmul_prims[k] = matmul(m_matmul_pd[k]);
+        }
+    }
+
+    void forward(const tensor& main_input, const tensor& lora_input, tensor& lora_output,
+                const std::vector<tensor>& state_A, const std::vector<tensor>& state_alpha, const std::vector<tensor>& state_B) {
+        memory::dim M = lora_input.get_shape()[0];
+        memory::dim head_q = state_B.front().get_shape()[1];
+        memory::dim head_kv = state_B.back().get_shape()[1];
+
+        std::cout << "====> M=" << M << ", head_q=" << head_q << ", head_kv=" << head_kv << std::endl;
+
+        // Primitive execution: concat_prims
+        ASSERT(m_num_lora == state_A.size() && m_num_lora == state_alpha.size() && m_num_lora == state_B.size(), "num_lora=", m_num_lora, " state_A.size()=", state_A.size());
+        std::vector<memory> dst_mem_concats;
+        for (int k = 0; k < 2; k++) {            
+            std::vector<memory> src_mems;    
+            auto states = k == 0 ? state_A: state_alpha;
+            for (int n = 0; n < m_num_lora; ++n) {
+                std::cout << "====> " << __LINE__ << "k_n=" << k << "_" << n << std::endl;
+                auto mem = dnnl::ocl_interop::make_memory(m_concat_pd[k].src_desc(n), m_engine, ocl_interop::memory_kind::usm, (void *)(states[n]));
+                src_mems.push_back(mem);
+            }
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            auto dst_desc = m_concat_pd[k].dst_desc();
+            auto dst_mem = memory(dst_desc, m_engine);   // TODO: intermediate memory
+            dst_mem_concats.push_back(dst_mem);
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            std::unordered_map<int, memory> concat_args;
+            for (int n = 0; n < m_num_lora; ++n) {
+                std::cout << "====> " << __LINE__ << std::endl;
+                concat_args.insert({DNNL_ARG_MULTIPLE_SRC + n, src_mems[n]});
+            }
+            concat_args.insert({DNNL_ARG_DST, dst_mem});
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            m_concat_prims[k].execute(m_stream, concat_args);
+
+            std::cout << "====> " << __LINE__ << std::endl;
+        }
+
+        std::cout << "====> " << __LINE__ << std::endl;
+
+        // Primitive execution: matmul_prims
+        {
+            memory weights_mems[4], src_mem, dst_mem, intern_mem;
+
+            // dst_mem and src_mem of mm0
+            src_mem = dnnl::ocl_interop::make_memory(m_matmul_pd[0].src_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(lora_input));
+            intern_mem = memory(m_matmul_pd[0].dst_desc(), m_engine);  // TODO: intermediate memory
+
+            weights_mems[0] = dst_mem_concats[0];
+            for (int k = 1; k < 4; k++) {
+                weights_mems[k] = dnnl::ocl_interop::make_memory(m_matmul_pd[k].weights_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(state_B[k-1]));
+            }
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            auto alpha_mem = dst_mem_concats[1];
+
+            // dst_mem of fuse lora op
+            memory::dims lora_dst_dims = {M, (head_q + head_kv + head_kv)};
+            auto rt_dst_md = memory::desc(lora_dst_dims, m_a_type, tag::ab);
+            dst_mem = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(lora_output));
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            // Primitive arguments.
+            std::unordered_map<int, memory> mm_args[4];
+            mm_args[0].insert({DNNL_ARG_SRC, src_mem});
+            mm_args[0].insert({DNNL_ARG_WEIGHTS, weights_mems[0]});
+            int bin_post_id = 0;
+            // mm_args[0].insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_post_id) | DNNL_ARG_SRC_1, alpha_mem});
+            mm_args[0].insert({DNNL_ARG_DST, intern_mem});
+
+            std::cout << "====> " << __LINE__ << std::endl;
+
+            for (int k = 1; k < 4; k++) {
+                mm_args[k].insert({DNNL_ARG_SRC, intern_mem});
+                mm_args[k].insert({DNNL_ARG_WEIGHTS, weights_mems[k]});
+                mm_args[k].insert({DNNL_ARG_DST, dst_mem});
+
+                std::cout << "====> " << __LINE__ << std::endl;
+            }
+
+            for (int k = 0; k < 4; k++)
+                m_matmul_prims[k].execute(m_stream, mm_args[k]);
+        }
+
+        // Wait for the computation to finalize.
+        m_stream.wait();
+    }
+};
+
+// class VectorHolder {
+//     std::vector<double> data;
+// public:
+//     // VectorHolder(const std::vector<double>& d) : data(d) {}
+
+//     static VectorHolder create(const std::vector<double>& d) {
+//         return make_cacheable<VectorHolder>(d);
+//     }
+    
+//     const std::vector<double>& get_data() const { return data; }
+//     void set_data(const std::vector<double>& d) { data = d; }
+    
+//     void append(double value) { data.push_back(value); }
+// };
+
+// PYBIND11_MODULE(example, m) {
+//     py::class_<VectorHolder>(m, "VectorHolder")
+//         // .def(py::init<const std::vector<double>&>())
+//         .def(py::init(&VectorHolder::create));
+//         .def("get_data", &VectorHolder::get_data)
+//         .def("set_data", &VectorHolder::set_data)
+//         .def("append", &VectorHolder::append);
+// }
 
 void init_ops_onednn(py::module_& m) {
     py::class_<onednn_linear>(m, "onednn_linear")
         .def(py::init())
         .def(py::init(&onednn_linear::create))
         .def("forward", &onednn_linear::forward);
+
+    py::class_<onednn_lorafused>(m, "onednn_lorafused")
+        // .def(py::init())
+        // .def(py::init<>(&onednn_matmul::create))
+        // .def(py::init(&onednn_lorafused::create))
+        .def(py::init<memory::data_type, memory::data_type, int, int, int, int>())
+        .def("forward", &onednn_lorafused::forward);
 
     py::class_<memory>(m, "onednn_memory")
         .def(py::init())
