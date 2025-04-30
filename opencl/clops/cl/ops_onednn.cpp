@@ -380,6 +380,25 @@ py::array tensor::to_numpy_f16(const memory& mem) {
 }
 #endif
 
+// Read from memory, write to handle
+inline void read_from_dnnl_memory(void *handle, dnnl::memory &mem) {
+    dnnl::engine eng = mem.get_engine();
+    size_t size = mem.get_desc().get_size();
+    if (!handle) throw std::runtime_error("handle is nullptr.");
+
+#ifdef DNNL_WITH_SYCL
+#endif
+// #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    if (eng.get_kind() == dnnl::engine::kind::gpu) {
+        void *mapped_ptr = mem.map_data();
+        if (mapped_ptr) std::memcpy(handle, mapped_ptr, size);
+        mem.unmap_data(mapped_ptr);
+        return;
+    }
+// #endif
+    assert(!"not expected");
+}
+
 
 using tag = memory::format_tag;
 using dt = memory::data_type;
@@ -412,14 +431,14 @@ struct onednn_lorafused {
 
         // concat_prims
         {
-            memory::dims src_dims = {rank, head_kv};
+            memory::dims src_dims = {head_q, rank};
             std::vector<memory::desc> src_mds;
 
             for (int n = 0; n < m_num_lora; ++n) {
                 auto md = memory::desc(src_dims, weight_dtype, tag::ab);
                 src_mds.push_back(md);
             }
-            m_concat_pd[0] = concat::primitive_desc(m_engine, 0/*axis*/, src_mds);
+            m_concat_pd[0] = concat::primitive_desc(m_engine, 1/*axis*/, src_mds);
             m_concat_prims[0] = concat(m_concat_pd[0]);
         }
 
@@ -431,7 +450,7 @@ struct onednn_lorafused {
                 auto md = memory::desc(src_dims, weight_dtype, tag::ab);
                 src_mds.push_back(md);
             }
-            m_concat_pd[1] = concat::primitive_desc(m_engine, 0/*axis*/, src_mds);
+            m_concat_pd[1] = concat::primitive_desc(m_engine, 1/*axis*/, src_mds);
             m_concat_prims[1] = concat(m_concat_pd[1]);
         }
 
@@ -461,18 +480,23 @@ struct onednn_lorafused {
             dst_mds[2] = lora_dst_md.submemory_desc(dst_dims[2], {0, head_q});
             dst_mds[3] = lora_dst_md.submemory_desc(dst_dims[3], {0, (head_q+head_kv)});
 
-            post_ops matmul_ops;
-            // const float alpha = 0.f;
-            // const float beta = 0.f;
-            // matmul_ops.append_eltwise(algorithm::eltwise_relu, alpha, beta);
-            memory::desc bin_mul_md = memory::desc(memory::dims({1, N}), act_dtype, memory::format_tag::ab);
-            matmul_ops.append_binary(algorithm::binary_mul, bin_mul_md);
-            primitive_attr matmul_attr;
-            // matmul_attr.set_post_ops(matmul_ops);
+            primitive_attr matmul_attr[4]; 
+            {
+                post_ops matmul_ops;
+                memory::desc bin_mul_md = memory::desc(memory::dims({1, N}), act_dtype, memory::format_tag::ab);
+                matmul_ops.append_binary(algorithm::binary_mul, bin_mul_md);
+                matmul_attr[0].set_post_ops(matmul_ops);
+            }            
+            for (int k = 1; k < 4; k++) {
+                post_ops matmul_ops;
+                memory::desc bin_add_md = dst_mds[k];
+                matmul_ops.append_binary(algorithm::binary_add, bin_add_md);
+                matmul_attr[k].set_post_ops(matmul_ops);
+            }
 
-            m_matmul_pd[0] = matmul::primitive_desc(m_engine, src_mds[0], weights_mds[0], intern_md, matmul_attr);
+            m_matmul_pd[0] = matmul::primitive_desc(m_engine, src_mds[0], weights_mds[0], intern_md, matmul_attr[0]);
             for (int k = 1; k < 4; k++)
-                m_matmul_pd[k] = matmul::primitive_desc(m_engine, src_mds[k], weights_mds[k], dst_mds[k]);
+                m_matmul_pd[k] = matmul::primitive_desc(m_engine, src_mds[k], weights_mds[k], dst_mds[k], matmul_attr[k]);
 
             for (int k = 0; k < m_num_lora+1; k++)
                 m_matmul_prims[k] = matmul(m_matmul_pd[k]);
@@ -480,10 +504,19 @@ struct onednn_lorafused {
     }
 
     void forward(const tensor& main_input, const tensor& lora_input, tensor& lora_output,
-                const std::vector<tensor>& state_A, const std::vector<tensor>& state_alpha, const std::vector<tensor>& state_B) {
+                tensor& interm_A_output,
+                // const std::vector<tensor>& state_A, const std::vector<tensor>& state_alpha, const std::vector<tensor>& state_B) {
+                const tensor& state_A_0, const tensor& state_A_1, const tensor& state_A_2,
+                const tensor& state_alpha_0, const tensor& state_alpha_1, const tensor& state_alpha_2,
+                const tensor& state_B_0, const tensor& state_B_1, const tensor& state_B_2) {
+        const std::vector<tensor> state_A{state_A_0, state_A_1, state_A_2};
+        const std::vector<tensor> state_alpha{state_alpha_0, state_alpha_1, state_alpha_2};
+        const std::vector<tensor> state_B{state_B_0, state_B_1, state_B_2};
+
         memory::dim M = lora_input.get_shape()[0];
         memory::dim head_q = state_B.front().get_shape()[1];
         memory::dim head_kv = state_B.back().get_shape()[1];
+        memory::dim rank = state_B.front().get_shape()[0];
 
         std::cout << "====> M=" << M << ", head_q=" << head_q << ", head_kv=" << head_kv << std::endl;
 
@@ -493,80 +526,179 @@ struct onednn_lorafused {
         for (int k = 0; k < 2; k++) {            
             std::vector<memory> src_mems;    
             auto states = k == 0 ? state_A: state_alpha;
+
             for (int n = 0; n < m_num_lora; ++n) {
-                std::cout << "====> " << __LINE__ << "k_n=" << k << "_" << n << std::endl;
+                // std::cout << "====> " << __LINE__ << "k_n=" << k << "_" << n << std::endl;
                 auto mem = dnnl::ocl_interop::make_memory(m_concat_pd[k].src_desc(n), m_engine, ocl_interop::memory_kind::usm, (void *)(states[n]));
                 src_mems.push_back(mem);
-            }
 
-            std::cout << "====> " << __LINE__ << std::endl;
+                // {
+                //     auto dst_desc = m_concat_pd[k].src_desc(n);
+                //     std::vector<float> final_dst(dst_desc.get_size()/sizeof(memory::data_type_size(dst_desc.get_data_type())));
+                //     read_from_dnnl_memory(final_dst.data(), mem);                    
+                //     float *state_ptr = (float *)states[n].data();
+                //     for (int i = 0; i < final_dst.size(); i++) {
+                //         std::cout << "*******src=> [" << i << "]" << final_dst[i] << std::endl;
+                //         // std::cout << "*******src=> states[n]=" << state_ptr[i] << std::endl;
+                //     }
+                // }
+            }
 
             auto dst_desc = m_concat_pd[k].dst_desc();
             auto dst_mem = memory(dst_desc, m_engine);   // TODO: intermediate memory
             dst_mem_concats.push_back(dst_mem);
 
-            std::cout << "====> " << __LINE__ << std::endl;
-
             std::unordered_map<int, memory> concat_args;
-            for (int n = 0; n < m_num_lora; ++n) {
-                std::cout << "====> " << __LINE__ << std::endl;
+            for (int n = 0; n < m_num_lora; ++n) {    
                 concat_args.insert({DNNL_ARG_MULTIPLE_SRC + n, src_mems[n]});
             }
             concat_args.insert({DNNL_ARG_DST, dst_mem});
 
-            std::cout << "====> " << __LINE__ << std::endl;
-
             m_concat_prims[k].execute(m_stream, concat_args);
-
-            std::cout << "====> " << __LINE__ << std::endl;
+            // {
+            //     m_stream.wait();
+            //     // memory::dims final_dst_dims = {IH, IW*num_src};
+            //     // std::vector<float> final_dst(product(final_dst_dims));
+            //     auto size = dst_desc.get_size();
+            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
+            //     std::vector<float> final_dst(size/4);
+            //     read_from_dnnl_memory(final_dst.data(), dst_mem);
+            //     std::cout << "*******concat_dst=>" << k << "_" << size << "_" << data_size << std::endl;
+            //     for (int i = 0; i < final_dst.size(); i++) {
+            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
+            //     }
+            //     std::cout << std::endl;
+            // }
         }
-
-        std::cout << "====> " << __LINE__ << std::endl;
 
         // Primitive execution: matmul_prims
         {
-            memory weights_mems[4], src_mem, dst_mem, intern_mem;
+            memory weights_mems[4], src_mems[4], dst_mems[4], bin_mems[4];
 
             // dst_mem and src_mem of mm0
-            src_mem = dnnl::ocl_interop::make_memory(m_matmul_pd[0].src_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(lora_input));
-            intern_mem = memory(m_matmul_pd[0].dst_desc(), m_engine);  // TODO: intermediate memory
+            src_mems[0] = dnnl::ocl_interop::make_memory(m_matmul_pd[0].src_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(lora_input));
+            dst_mems[0] = dnnl::ocl_interop::make_memory(m_matmul_pd[0].dst_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(interm_A_output));
 
             weights_mems[0] = dst_mem_concats[0];
             for (int k = 1; k < 4; k++) {
                 weights_mems[k] = dnnl::ocl_interop::make_memory(m_matmul_pd[k].weights_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(state_B[k-1]));
             }
 
-            std::cout << "====> " << __LINE__ << std::endl;
-
             auto alpha_mem = dst_mem_concats[1];
 
             // dst_mem of fuse lora op
             memory::dims lora_dst_dims = {M, (head_q + head_kv + head_kv)};
             auto rt_dst_md = memory::desc(lora_dst_dims, m_a_type, tag::ab);
-            dst_mem = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(lora_output));
-
-            std::cout << "====> " << __LINE__ << std::endl;
-
-            // Primitive arguments.
-            std::unordered_map<int, memory> mm_args[4];
-            mm_args[0].insert({DNNL_ARG_SRC, src_mem});
-            mm_args[0].insert({DNNL_ARG_WEIGHTS, weights_mems[0]});
-            int bin_post_id = 0;
-            // mm_args[0].insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_post_id) | DNNL_ARG_SRC_1, alpha_mem});
-            mm_args[0].insert({DNNL_ARG_DST, intern_mem});
-
-            std::cout << "====> " << __LINE__ << std::endl;
+            dst_mems[1] = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(lora_output));
+            int8_t* offset = (int8_t*)lora_output + head_q * lora_output.get_dtype().itemsize();
+            dst_mems[2] = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(offset));
+            offset = (int8_t*)lora_output + (head_q+head_kv)  * lora_output.get_dtype().itemsize();
+            dst_mems[3] = dnnl::ocl_interop::make_memory(rt_dst_md, m_engine, ocl_interop::memory_kind::usm, (void *)(offset));
 
             for (int k = 1; k < 4; k++) {
-                mm_args[k].insert({DNNL_ARG_SRC, intern_mem});
-                mm_args[k].insert({DNNL_ARG_WEIGHTS, weights_mems[k]});
-                mm_args[k].insert({DNNL_ARG_DST, dst_mem});
-
-                std::cout << "====> " << __LINE__ << std::endl;
+                offset = (int8_t*)interm_A_output + (k-1)*rank*interm_A_output.get_dtype().itemsize();    
+                src_mems[k] = dnnl::ocl_interop::make_memory(m_matmul_pd[0].dst_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(offset));
             }
 
-            for (int k = 0; k < 4; k++)
+            int8_t *bin_input = (int8_t*)main_input;
+            bin_mems[1] = dnnl::ocl_interop::make_memory(m_matmul_pd[1].dst_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(bin_input));
+            bin_input += head_q * main_input.get_dtype().itemsize();
+            bin_mems[2] = dnnl::ocl_interop::make_memory(m_matmul_pd[2].dst_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(bin_input));
+            bin_input += head_kv * main_input.get_dtype().itemsize();
+            bin_mems[3] = dnnl::ocl_interop::make_memory(m_matmul_pd[3].dst_desc(), m_engine, ocl_interop::memory_kind::usm, (void *)(bin_input));
+        
+            // Primitive arguments.
+            std::unordered_map<int, memory> mm_args[4];
+            mm_args[0].insert({DNNL_ARG_SRC, src_mems[0]});
+            mm_args[0].insert({DNNL_ARG_WEIGHTS, weights_mems[0]});
+            int bin_post_id = 0;
+            mm_args[0].insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_post_id) | DNNL_ARG_SRC_1, alpha_mem});
+            mm_args[0].insert({DNNL_ARG_DST, dst_mems[0]});
+
+            for (int k = 1; k < 4; k++) {
+                mm_args[k].insert({DNNL_ARG_SRC, src_mems[k]});
+                mm_args[k].insert({DNNL_ARG_WEIGHTS, weights_mems[k]});
+                int bin_post_id = 0;
+                mm_args[k].insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_post_id) | DNNL_ARG_SRC_1, bin_mems[k]});
+                mm_args[k].insert({DNNL_ARG_DST, dst_mems[k]});    
+            }
+
+            // {
+            //     auto k = 0;
+            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
+            //     m_stream.wait();
+            //     // memory::dims final_dst_dims = {IH, IW*num_src};
+            //     // std::vector<float> final_dst(product(final_dst_dims));
+            //     auto dst_desc = m_matmul_pd[k].dst_desc();
+            //     auto size = dst_desc.get_size();
+            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
+            //     std::vector<float> final_dst(size/4);
+            //     read_from_dnnl_memory(final_dst.data(), dst_mems[0]);
+            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
+            //     for (int i = 0; i < final_dst.size(); i++) {
+            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
+            //     }
+            //     std::cout << std::endl;
+            // }
+
+            // {
+            //     auto k = 3;
+            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
+            //     m_stream.wait();
+            //     // memory::dims final_dst_dims = {IH, IW*num_src};
+            //     // std::vector<float> final_dst(product(final_dst_dims));
+            //     auto dst_desc = m_matmul_pd[k].dst_desc();
+            //     auto size = dst_desc.get_size();
+            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
+            //     std::vector<float> final_dst(size/4);
+            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
+            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
+            //     for (int i = 0; i < final_dst.size(); i++) {
+            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
+            //     }
+            //     std::cout << std::endl;
+            // }
+
+            // {
+            //     auto k = 2;
+            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
+            //     m_stream.wait();
+            //     // memory::dims final_dst_dims = {IH, IW*num_src};
+            //     // std::vector<float> final_dst(product(final_dst_dims));
+            //     auto dst_desc = m_matmul_pd[k].dst_desc();
+            //     auto size = dst_desc.get_size();
+            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
+            //     std::vector<float> final_dst(size/4);
+            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
+            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
+            //     for (int i = 0; i < final_dst.size(); i++) {
+            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
+            //     }
+            //     std::cout << std::endl;
+            // }
+
+            // {
+            //     auto k = 1;
+            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
+            //     m_stream.wait();
+            //     // memory::dims final_dst_dims = {IH, IW*num_src};
+            //     // std::vector<float> final_dst(product(final_dst_dims));
+            //     auto dst_desc = m_matmul_pd[k].dst_desc();
+            //     auto size = dst_desc.get_size();
+            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
+            //     std::vector<float> final_dst(size/4);
+            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
+            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
+            //     for (int i = 0; i < final_dst.size(); i++) {
+            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
+            //     }
+            //     std::cout << std::endl;
+            // }
+
+            for (int k = 0; k < 4; k++) {
+                std::cout << "========> k = " << k << std::endl;
                 m_matmul_prims[k].execute(m_stream, mm_args[k]);
+            }
         }
 
         // Wait for the computation to finalize.
