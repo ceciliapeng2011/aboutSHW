@@ -503,16 +503,8 @@ struct onednn_lorafused {
         }
     }
 
-    void forward(const tensor& main_input, const tensor& lora_input, tensor& lora_output,
-                tensor& interm_A_output,
-                // const std::vector<tensor>& state_A, const std::vector<tensor>& state_alpha, const std::vector<tensor>& state_B) {
-                const tensor& state_A_0, const tensor& state_A_1, const tensor& state_A_2,
-                const tensor& state_alpha_0, const tensor& state_alpha_1, const tensor& state_alpha_2,
-                const tensor& state_B_0, const tensor& state_B_1, const tensor& state_B_2) {
-        const std::vector<tensor> state_A{state_A_0, state_A_1, state_A_2};
-        const std::vector<tensor> state_alpha{state_alpha_0, state_alpha_1, state_alpha_2};
-        const std::vector<tensor> state_B{state_B_0, state_B_1, state_B_2};
-
+    void forward(const tensor& main_input, const tensor& lora_input, tensor& lora_output, tensor& interm_A_output,
+                const std::vector<tensor>& state_A, const std::vector<tensor>& state_alpha, const std::vector<tensor>& state_B) {
         memory::dim M = lora_input.get_shape()[0];
         memory::dim head_q = state_B.front().get_shape()[1];
         memory::dim head_kv = state_B.back().get_shape()[1];
@@ -528,24 +520,12 @@ struct onednn_lorafused {
             auto states = k == 0 ? state_A: state_alpha;
 
             for (int n = 0; n < m_num_lora; ++n) {
-                // std::cout << "====> " << __LINE__ << "k_n=" << k << "_" << n << std::endl;
                 auto mem = dnnl::ocl_interop::make_memory(m_concat_pd[k].src_desc(n), m_engine, ocl_interop::memory_kind::usm, (void *)(states[n]));
                 src_mems.push_back(mem);
-
-                // {
-                //     auto dst_desc = m_concat_pd[k].src_desc(n);
-                //     std::vector<float> final_dst(dst_desc.get_size()/sizeof(memory::data_type_size(dst_desc.get_data_type())));
-                //     read_from_dnnl_memory(final_dst.data(), mem);                    
-                //     float *state_ptr = (float *)states[n].data();
-                //     for (int i = 0; i < final_dst.size(); i++) {
-                //         std::cout << "*******src=> [" << i << "]" << final_dst[i] << std::endl;
-                //         // std::cout << "*******src=> states[n]=" << state_ptr[i] << std::endl;
-                //     }
-                // }
             }
 
             auto dst_desc = m_concat_pd[k].dst_desc();
-            auto dst_mem = memory(dst_desc, m_engine);   // TODO: intermediate memory
+            auto dst_mem = memory(dst_desc, m_engine);
             dst_mem_concats.push_back(dst_mem);
 
             std::unordered_map<int, memory> concat_args;
@@ -555,20 +535,6 @@ struct onednn_lorafused {
             concat_args.insert({DNNL_ARG_DST, dst_mem});
 
             m_concat_prims[k].execute(m_stream, concat_args);
-            // {
-            //     m_stream.wait();
-            //     // memory::dims final_dst_dims = {IH, IW*num_src};
-            //     // std::vector<float> final_dst(product(final_dst_dims));
-            //     auto size = dst_desc.get_size();
-            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
-            //     std::vector<float> final_dst(size/4);
-            //     read_from_dnnl_memory(final_dst.data(), dst_mem);
-            //     std::cout << "*******concat_dst=>" << k << "_" << size << "_" << data_size << std::endl;
-            //     for (int i = 0; i < final_dst.size(); i++) {
-            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
-            //     }
-            //     std::cout << std::endl;
-            // }
         }
 
         // Primitive execution: matmul_prims
@@ -623,80 +589,7 @@ struct onednn_lorafused {
                 mm_args[k].insert({DNNL_ARG_DST, dst_mems[k]});    
             }
 
-            // {
-            //     auto k = 0;
-            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
-            //     m_stream.wait();
-            //     // memory::dims final_dst_dims = {IH, IW*num_src};
-            //     // std::vector<float> final_dst(product(final_dst_dims));
-            //     auto dst_desc = m_matmul_pd[k].dst_desc();
-            //     auto size = dst_desc.get_size();
-            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
-            //     std::vector<float> final_dst(size/4);
-            //     read_from_dnnl_memory(final_dst.data(), dst_mems[0]);
-            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
-            //     for (int i = 0; i < final_dst.size(); i++) {
-            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
-            //     }
-            //     std::cout << std::endl;
-            // }
-
-            // {
-            //     auto k = 3;
-            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
-            //     m_stream.wait();
-            //     // memory::dims final_dst_dims = {IH, IW*num_src};
-            //     // std::vector<float> final_dst(product(final_dst_dims));
-            //     auto dst_desc = m_matmul_pd[k].dst_desc();
-            //     auto size = dst_desc.get_size();
-            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
-            //     std::vector<float> final_dst(size/4);
-            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
-            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
-            //     for (int i = 0; i < final_dst.size(); i++) {
-            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
-            //     }
-            //     std::cout << std::endl;
-            // }
-
-            // {
-            //     auto k = 2;
-            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
-            //     m_stream.wait();
-            //     // memory::dims final_dst_dims = {IH, IW*num_src};
-            //     // std::vector<float> final_dst(product(final_dst_dims));
-            //     auto dst_desc = m_matmul_pd[k].dst_desc();
-            //     auto size = dst_desc.get_size();
-            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
-            //     std::vector<float> final_dst(size/4);
-            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
-            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
-            //     for (int i = 0; i < final_dst.size(); i++) {
-            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
-            //     }
-            //     std::cout << std::endl;
-            // }
-
-            // {
-            //     auto k = 1;
-            //     m_matmul_prims[k].execute(m_stream, mm_args[k]);
-            //     m_stream.wait();
-            //     // memory::dims final_dst_dims = {IH, IW*num_src};
-            //     // std::vector<float> final_dst(product(final_dst_dims));
-            //     auto dst_desc = m_matmul_pd[k].dst_desc();
-            //     auto size = dst_desc.get_size();
-            //     auto data_size = sizeof(memory::data_type_size(dst_desc.get_data_type()));
-            //     std::vector<float> final_dst(size/4);
-            //     read_from_dnnl_memory(final_dst.data(), dst_mems[k]);
-            //     std::cout << "*******matmul_dst=>" << k << "_" << size << "_" << data_size << std::endl;
-            //     for (int i = 0; i < final_dst.size(); i++) {
-            //         std::cout << "[" << i << "] " << final_dst[i] << ", ";
-            //     }
-            //     std::cout << std::endl;
-            // }
-
             for (int k = 0; k < 4; k++) {
-                std::cout << "========> k = " << k << std::endl;
                 m_matmul_prims[k].execute(m_stream, mm_args[k]);
             }
         }
@@ -706,30 +599,6 @@ struct onednn_lorafused {
     }
 };
 
-// class VectorHolder {
-//     std::vector<double> data;
-// public:
-//     // VectorHolder(const std::vector<double>& d) : data(d) {}
-
-//     static VectorHolder create(const std::vector<double>& d) {
-//         return make_cacheable<VectorHolder>(d);
-//     }
-    
-//     const std::vector<double>& get_data() const { return data; }
-//     void set_data(const std::vector<double>& d) { data = d; }
-    
-//     void append(double value) { data.push_back(value); }
-// };
-
-// PYBIND11_MODULE(example, m) {
-//     py::class_<VectorHolder>(m, "VectorHolder")
-//         // .def(py::init<const std::vector<double>&>())
-//         .def(py::init(&VectorHolder::create));
-//         .def("get_data", &VectorHolder::get_data)
-//         .def("set_data", &VectorHolder::set_data)
-//         .def("append", &VectorHolder::append);
-// }
-
 void init_ops_onednn(py::module_& m) {
     py::class_<onednn_linear>(m, "onednn_linear")
         .def(py::init())
@@ -737,9 +606,6 @@ void init_ops_onednn(py::module_& m) {
         .def("forward", &onednn_linear::forward);
 
     py::class_<onednn_lorafused>(m, "onednn_lorafused")
-        // .def(py::init())
-        // .def(py::init<>(&onednn_matmul::create))
-        // .def(py::init(&onednn_lorafused::create))
         .def(py::init<memory::data_type, memory::data_type, int, int, int, int>())
         .def("forward", &onednn_lorafused::forward);
 

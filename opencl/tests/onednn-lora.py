@@ -253,11 +253,7 @@ class onednnLoRAFusedQKV:
         dst = cl.tensor(np.zeros(main_input.shape, dtype=np.float16 if self.act_dtype == cl.onednn_dtype.f16 else np.float32))
         interm_A_output = cl.tensor(np.zeros([self.M, self.rank*3], dtype=np.float16 if self.act_dtype == cl.onednn_dtype.f16 else np.float32))
 
-        # self.linear_A.forward(cl.tensor(main_input), cl.tensor(lora_input), dst, [cl.tensor(t) for t in self.loraA], [cl.tensor(t) for t in self.alpha], [cl.tensor(t) for t in self.loraB])
-        self.linear_A.forward(cl.tensor(main_input), cl.tensor(lora_input), dst, interm_A_output,
-                              cl.tensor(self.loraA[0]), cl.tensor(self.loraA[1]), cl.tensor(self.loraA[2]),
-                              cl.tensor(self.alpha[0]), cl.tensor(self.alpha[1]), cl.tensor(self.alpha[2]),
-                              cl.tensor(self.loraB[0]), cl.tensor(self.loraB[1]), cl.tensor(self.loraB[2]))
+        self.linear_A.forward(cl.tensor(main_input), cl.tensor(lora_input), dst, interm_A_output, [cl.tensor(t) for t in self.loraA], [cl.tensor(t) for t in self.alpha], [cl.tensor(t) for t in self.loraB])
         return dst
     
     @staticmethod
