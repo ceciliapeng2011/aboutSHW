@@ -225,6 +225,32 @@ def test_lora2(n_tokens, rank, IC, OC, check_acc = False):
 # test_lora2(3019, 64, 8960, 1536)
 
 ################################################################################################################
+from test_qkv_lora_fusiong import qkv_blocking_1st, QKV_LORA_1ST
+
+cl.profiling(True)
+
+def oclLoRA_QKVFused(main_input, lora_input, loraA : list, loraB : list, alpha : list, batch, rank, input_state, kv_state):
+    qkv_state = input_state + kv_state*2
+
+    A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = qkv_blocking_1st(batch, rank, input_state, input_state)
+
+    Aoutput = np.zeros([batch, rank*3]).astype(np.float16)
+    result = cl.tensor([batch, qkv_state], np.dtype(np.float16))
+    
+    opt = QKV_LORA_1ST( batch, rank, input_state, kv_state,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
+    
+    cl.finish()
+    t0 = time.time()
+    opt(cl.tensor(main_input), cl.tensor(lora_input),
+        cl.tensor(loraA[0]), cl.tensor(loraA[1]), cl.tensor(loraA[2]), None, 
+        cl.tensor(alpha[0]), cl.tensor(alpha[1]), cl.tensor(alpha[2]), None,
+        cl.tensor(loraB[0]), cl.tensor(loraB[1]), cl.tensor(loraB[2]),
+        cl.tensor(Aoutput), result)   
+    duration = cl.finish()
+    t1 = time.time()
+    
+    return result.numpy(), duration, (t1 - t0)*1e3
+
 class onednnLoRAFusedQKV:
     def __init__(self, loraA : list, loraB : list, alpha : list, head_q, head_kv, rank, from_linear = False):
         self.head_q = head_q
@@ -309,23 +335,27 @@ def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, rt_dtype = np.float16, c
         # lora_input = np.ones([n_tokens, head_q]).astype(rt_dtype)
         main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, head_q+head_kv*2]).astype(rt_dtype)
 
-        # cl.finish()
-        # t0 = time.time()
+        cl.finish()
+        t0 = time.time()
         dst_cur = lora.forward(lora_input, main_input)
         # latency_ns = cl.finish()
         dst_cur = dst_cur.numpy()
-        # t1 = time.time()
+        t1 = time.time()
         # for t in latency_ns:
         #     print(f"\t onednn_lora is calculated! {t*1e-3:.3f} us")
-        # print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
+        print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
+        
+        # ocl_res, durs, elapse = oclLoRA_QKVFused(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, head_q, head_kv)
+        # print(f" oclLoRA_QKVFused is calculated![{r}] :  {elapse: .3f} ms")
+        # for ns in durs:
+        #     print(f'cl kernel durations, {ns*1e-6:.3f} ms')
 
         if check_acc:
             dst_ref = onednnLoRAFusedQKV.calc_ref(main_input.copy(), lora_input.copy(), loraA.copy(), loraB.copy(), alpha.copy(), False)
             compare(dst_ref, dst_cur)
-            # if not np.allclose(dst_ref, dst_cur, atol=0.01, rtol=0.01):
-            #     print(f"FAIL {dst_ref.shape=}")
-            # else:
-            #     print(f"PASS {dst_ref.shape=}")
+
+            compare(ocl_res, dst_cur, atol=1.0, rtol=0.01)
+            print(f'BATCH:{n_tokens} Q_STATE:{head_q}, RANK:{rank}, KV_STATE:{head_kv} ACC PASS!')
 
 # test_lora_fusedqkv(2, 16, 4, 2, check_acc=True)
-test_lora_fusedqkv(3019, 64, 1536, 256, check_acc=False)
+test_lora_fusedqkv(3192, 64, 1536, 256, check_acc=False)

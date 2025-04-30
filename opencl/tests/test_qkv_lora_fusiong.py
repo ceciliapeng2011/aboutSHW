@@ -24,7 +24,7 @@ qkv_lora_ref_kernel =  r'''
         C[n_idx] = sum;
     }
 
-        __kernel void gemmA(__global half * A, __global half *B,  __global half *CC, int N, int K, int k_blk, int M) {
+    __kernel void gemmA(__global half * A, __global half *B,  __global half *CC, int N, int K, int k_blk, int M) {
         // Seems kblocks accumulation would introduce error. So ref kernel accumulation should behave same with target.
         int m_idx = get_global_id(0);
         int n_idx = get_global_id(1);
@@ -762,7 +762,7 @@ if 0:
         test_qkv_lora_1st(batch, 64, 1536, 256, A_regM = A_regM, A_regN = A_regN, A_sgM=A_sgM, A_sgN = A_sgN,
                             B_regM=B_regM, B_regN=B_regN, B_sgM=B_sgM, B_sgN=B_sgN)
 #1st acc test.,
-if 1:
+if 0:
     for batch in range(2054, 2069):
         for input_state in (1024, 1536, 2048, 2560, 3072, 3840, 4096, 7*16, 11*16, 13*16, 15*16, 12*16,17*16):
             for rank in (16, 32, 64, 128, 256):
