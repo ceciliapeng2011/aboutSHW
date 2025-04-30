@@ -24,8 +24,8 @@ cmake_search_dir=":".join([pybind11.get_cmake_dir()])
 # on windows, custom compiler requires Ninja instead of VC++
 generator="-GNinja" if os.name == 'nt' else ""
 
-btype = "RelWithDebInfo"
-#btype = "Debug"
+# btype = "RelWithDebInfo"
+btype = "Debug"
 
 cmake_need_config = not os.path.isfile(os.path.join(build_path, "CMakeCache.txt")) or int(os.environ.get("DO_CMAKE", "0"))
 

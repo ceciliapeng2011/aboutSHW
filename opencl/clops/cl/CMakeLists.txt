@@ -31,28 +31,36 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=core-avx2")
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl -lOpenCL")
 
 ############# onednn ##################
-if(DEFINED ENV{OV_DNNL_PATH})
-    add_library(onednn_gpu STATIC IMPORTED) # or STATIC instead of SHARED
-    set_target_properties(onednn_gpu PROPERTIES
-        IMPORTED_LOCATION "$ENV{OV_DNNL_PATH}lib/libopenvino_onednn_gpu.a"
-        INTERFACE_INCLUDE_DIRECTORIES "$ENV{OV_DNNL_PATH}include/"
-    )
-    target_link_libraries(csrc PRIVATE onednn_gpu)
-else()
-    find_package(DNNL REQUIRED)
-    target_link_libraries(csrc PRIVATE DNNL::dnnl)
-endif()
+# if(DEFINED ENV{OV_DNNL_PATH})
+#     add_library(onednn_gpu STATIC IMPORTED) # or STATIC instead of SHARED
+#     set_target_properties(onednn_gpu PROPERTIES
+#         IMPORTED_LOCATION "$ENV{OV_DNNL_PATH}lib/libopenvino_onednn_gpu.a"
+#         INTERFACE_INCLUDE_DIRECTORIES "$ENV{OV_DNNL_PATH}include/"
+#     )
+#     target_link_libraries(csrc PRIVATE onednn_gpu)
+# else()
+#     find_package(DNNL REQUIRED)
+#     target_link_libraries(csrc PRIVATE DNNL::dnnl)
+# endif()
+
+ ############# onednn ##################
+ add_library(onednn_gpu STATIC IMPORTED) # or STATIC instead of SHARED
+ set_target_properties(onednn_gpu PROPERTIES
+  IMPORTED_LOCATION "/home/ceciliapeng/openvino_2/build_Debug/src/plugins/intel_gpu/thirdparty/onednn_gpu_install/lib/libopenvino_onednn_gpu.a"
+  INTERFACE_INCLUDE_DIRECTORIES "/home/ceciliapeng/openvino_2/build_Debug/src/plugins/intel_gpu/thirdparty/onednn_gpu_install/include/"
+ )
+ target_link_libraries(csrc PRIVATE onednn_gpu)
 
 # EXAMPLE_VERSION_INFO is defined by setup.py and passed into the C++ code as a
 # define (VERSION_INFO) here.
 
 target_include_directories(csrc PRIVATE ../../include)
 # explictly include sycl headers, make intelligence work
-target_include_directories(csrc PRIVATE ${SYCL_INCLUDE_DIR})
-target_include_directories(csrc PRIVATE sycl)
-target_include_directories(csrc PRIVATE sycl/xetla)
+# target_include_directories(csrc PRIVATE ${SYCL_INCLUDE_DIR})
+# target_include_directories(csrc PRIVATE sycl)
+# target_include_directories(csrc PRIVATE sycl/xetla)
 
-target_link_libraries(csrc PRIVATE OpenCL IntelSYCL::SYCL_CXX)
+# target_link_libraries(csrc PRIVATE OpenCL IntelSYCL::SYCL_CXX)
 # target_link_directories(csrc PRIVATE ${SYCL_LIBRARY_DIR})
 
 set_target_properties(csrc
@@ -66,5 +74,5 @@ target_compile_definitions(csrc
                            PRIVATE PACKAGE_NAME=csrc)
 
 # try to install oneapi dependencies: not working
-install(TARGETS csrc LIBRARY DESTINATION lib)
-install(IMPORTED_RUNTIME_ARTIFACTS DNNL::dnnl DESTINATION lib)
+# install(TARGETS csrc LIBRARY DESTINATION lib)
+# install(IMPORTED_RUNTIME_ARTIFACTS DNNL::dnnl DESTINATION lib)

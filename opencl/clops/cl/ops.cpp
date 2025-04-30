@@ -9,7 +9,7 @@ https://github.com/triSYCL/sycl/blob/sycl/unified/master/sycl/doc/extensions/exp
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/sycl.hpp>
 
-#include "sycl/rms_kernel.hpp"
+// #include "sycl/rms_kernel.hpp"
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel;
@@ -56,21 +56,21 @@ tensor test_dpas(tensor& a, tensor& b) {
     return c;
 }
 
-void rms(tensor& a, tensor& b, tensor& c, float eps) {
-    half* pA = a;
-    half* pB = b;
-    auto& shape = a.get_shape();
-    half *pC = c;
-    int size = a.numel;
-    int channel = shape.back();
-    auto e = cldnn::sycl::details::rms_kernel(sycl_queue, pA, pB, pC, size / channel, channel, eps);
-    all_events.emplace_back(e);
-}
+// void rms(tensor& a, tensor& b, tensor& c, float eps) {
+//     half* pA = a;
+//     half* pB = b;
+//     auto& shape = a.get_shape();
+//     half *pC = c;
+//     int size = a.numel;
+//     int channel = shape.back();
+//     auto e = cldnn::sycl::details::rms_kernel(sycl_queue, pA, pB, pC, size / channel, channel, eps);
+//     all_events.emplace_back(e);
+// }
 
 void init_ops(py::module_& m) {
     m.def("test_esimd", &test_esimd);
     m.def("test_dpas", &test_dpas);
-    m.def("rms", &rms);
+    // m.def("rms", &rms);
 }
 #else
 void init_ops(py::module_& m) {
