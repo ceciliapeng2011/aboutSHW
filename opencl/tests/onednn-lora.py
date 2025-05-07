@@ -7,7 +7,7 @@ import torch
 from clops import cl
 from clops import compare
 
-enable_debug = True
+enable_debug = False
 
 def test_mm(M, K, N, K_group_size, w_dtype):
     np.random.seed(0)
@@ -76,9 +76,12 @@ class onednnLoRA:
         temp_resA = cl.tensor(np.zeros([M, self.rank], dtype=np.float16))
         dst = cl.tensor(np.zeros([M, self.OC], dtype=np.float16))
 
+        t0 = time.time()
         self.linear_A.forward(cl.tensor(lora_input), temp_resA, cl.tensor(self.alpha), cl.tensor(self.loraA))
         self.linear_B.forward(temp_resA, dst, cl.tensor(main_input), cl.tensor(self.loraB))
-        return dst
+        t1 = time.time()
+
+        return dst, (t1 - t0)*1e3
 
     @staticmethod
     def calc_ref(main_input, lora_input, loraA, loraB, alpha, transpose_w = True):
@@ -111,7 +114,7 @@ def test_lora0():
         lora_input = torch.randn([n_tokens, IC], dtype=torch.float16).numpy()
         main_input = np.random.randint(-1,2,[n_tokens, OC]).astype(np.float16)
 
-        dst_cur = lora.forward(lora_input, main_input)
+        dst_cur, _ = lora.forward(lora_input, main_input)
         dst_cur = dst_cur.numpy()
         print("cur is calculated!")
         
@@ -141,7 +144,7 @@ def test_lora1():
     lora = onednnLoRA(loraA, loraB, alpha, OC, IC, rank, False)
 
     for _ in range(1):
-        dst_cur = lora.forward(lora_input, main_input)
+        dst_cur, _ = lora.forward(lora_input, main_input)
         dst_cur = dst_cur.numpy()
         print("cur is calculated!")
 
@@ -153,7 +156,7 @@ def test_lora1():
 
 
 ################################################################################################################
-from clops.lora import blocking_1nd, LORA_1ST
+from clops.lora import blocking_1nd, LORA_1ST, blocking_2nd, LORA_2ND
 
 cl.profiling(True)
 
@@ -163,8 +166,6 @@ def oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC,
     else:
         REPEAT = 100        
         
-    A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = blocking_1nd(n_tokens, rank, IC, OC)
-
     Aoutput = np.zeros([n_tokens, rank]).astype(np.float16)
     
     stateA_list= [cl.tensor(loraA) for _ in range(REPEAT)]
@@ -175,13 +176,21 @@ def oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC,
     # Must set the output to be zeros to avoid not all the data is updated in GEMMA. 
     A_output_list = [cl.tensor(Aoutput)for _ in range(REPEAT)]
     res_list = [cl.tensor([n_tokens, OC], np.dtype(np.float16))for _ in range(REPEAT)]
-
-    opt = LORA_1ST( n_tokens, rank, IC, OC,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
     
+    if n_tokens == 1:
+        gemma_sg_BK, gemma_sgK, gemmb_sgN = blocking_2nd(rank, IC, OC)
+        opt = LORA_2ND(rank, IC, OC, gemma_sg_BK, gemma_sgK, gemmb_sgN,False)
+    else:
+        A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = blocking_1nd(n_tokens, rank, IC, OC)
+        opt = LORA_1ST( n_tokens, rank, IC, OC,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
+    
+    cl.finish()
+    t0 = time.time()
     opt(mainInput_list[0], loraInput_list[0], stateA_list[0], alpha_list[0], stateB_list[0], A_output_list[0], res_list[0])
     duration = cl.finish()
+    t1 = time.time()
     
-    return res_list[0].numpy(), duration
+    return res_list[0].numpy(), duration, (t1 - t0)*1e3
 
 def test_lora2(n_tokens, rank, IC, OC, check_acc = False):   
     # generate inputs
@@ -199,19 +208,14 @@ def test_lora2(n_tokens, rank, IC, OC, check_acc = False):
         lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, IC]).astype(np.float16)
         main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, OC]).astype(np.float16)
 
-        ocl_res, durs = oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc=True)
+        ocl_res, durs, elapse = oclLoRA(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, IC, OC, check_acc=True)
+        print(f" ocl_lora is calculated![{r}] :  {elapse: .3f} ms")
         for ns in durs:
-            print(f'ocl_lora is calculated!, {ns*1e-6:.3f} ms')
-
-        # cl.finish()
-        # t0 = time.time()
-        dst_cur = lora.forward(lora_input, main_input)
-        # latency_ns = cl.finish()
+            print(f'cl kernel durations, {ns*1e-6:.3f} ms')
+       
+        dst_cur, elapse = lora.forward(lora_input, main_input)
         dst_cur = dst_cur.numpy()
-        # t1 = time.time()
-        # for t in latency_ns:
-        #     print(f"\t onednn_lora is calculated! {t*1e-3:.3f} us")
-        # print(f" onednn_lora is calculated![{r}] :  {(t1 - t0)*1e3 : .3f} ms")
+        print(f" onednn_lora is calculated![{r}] :  {elapse : .3f} ms")
 
         if check_acc:
             dst_ref = onednnLoRA.calc_ref(main_input, lora_input, loraA, loraB, alpha, False)
@@ -220,24 +224,44 @@ def test_lora2(n_tokens, rank, IC, OC, check_acc = False):
             compare(ocl_res, dst_cur)
             print(f'BATCH:{n_tokens} INPUT_STATE:{IC}, RANK:{rank}, OUPUT_STATE:{OC} ACC PASS!')
 
-# test_lora2(8, 16, 1536, 512)
+# test_lora2(1, 64, 1536, 512)
 # test_lora2(8, 16, 7*16, 256, True)
 # test_lora2(3019, 64, 8960, 1536)
 
+def test_qwen(n_tokens):
+    # test perf based on qwen parameters
+    # MLP up, gate
+    test_lora2(n_tokens, 64, 1536, 8960)
+
+    # MLP down
+    test_lora2(n_tokens, 64, 8960, 1536)
+
+    # Q, O
+    test_lora2(n_tokens, 64, 1536, 1536)
+
+    # KV
+    test_lora2(n_tokens, 64, 256, 256)
+# test_qwen(1)  # 2nd token
+# test_qwen(3019)  # 1st token
+# test_qwen(1024)  # 1st token
+
 ################################################################################################################
-from test_qkv_lora_fusiong import qkv_blocking_1st, QKV_LORA_1ST
+from test_qkv_lora_fusiong import qkv_blocking_1st, QKV_LORA_1ST, qkv_blocking_2nd, QKV_LORA_2ND
 
 cl.profiling(True)
 
 def oclLoRA_QKVFused(main_input, lora_input, loraA : list, loraB : list, alpha : list, batch, rank, input_state, kv_state):
     qkv_state = input_state + kv_state*2
 
-    A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = qkv_blocking_1st(batch, rank, input_state, input_state)
-
     Aoutput = cl.tensor(np.zeros([batch, rank*3]).astype(np.float16))
     result = cl.tensor([batch, qkv_state], np.dtype(np.float16))
     
-    opt = QKV_LORA_1ST( batch, rank, input_state, kv_state,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
+    if batch == 1:
+        gemma_sg_BK, gemma_sgK, gemmb_sgN = qkv_blocking_2nd(rank, input_state, input_state+2*kv_state)
+        opt = QKV_LORA_2ND(rank, input_state, kv_state, gemma_sg_BK, gemma_sgK, gemmb_sgN,False)
+    else:
+        A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN = qkv_blocking_1st(batch, rank, input_state, input_state)
+        opt = QKV_LORA_1ST( batch, rank, input_state, kv_state,  A_regM, A_regN, A_sgM, A_sgN, B_regM, B_regN, B_sgM, B_sgN, False)
 
     loraA = [cl.tensor(t) for t in loraA]
     loraB = [cl.tensor(t) for t in loraB]
@@ -277,7 +301,7 @@ class onednnLoRAFusedQKV:
     def update_batch(self, n_tokens):
         if self.M != n_tokens:
             if enable_debug: print("======== create onednn_lorafused =========")
-            self.linear_A = cl.onednn_lorafused(self.act_dtype, self.w_dtype, n_tokens, self.rank, self.head_q, self.head_kv)
+            self.lora_op = cl.onednn_lorafused(self.act_dtype, self.w_dtype, n_tokens, self.rank, self.head_q, self.head_kv)
             self.M = n_tokens
 
     def forward(self, lora_input, main_input):
@@ -290,7 +314,7 @@ class onednnLoRAFusedQKV:
         lora_input = cl.tensor(lora_input)
 
         t0 = time.time()
-        self.linear_A.forward(main_input, lora_input, dst, interm_A_output, self.loraA, self.loraB, self.alpha)
+        self.lora_op.forward(main_input, lora_input, dst, interm_A_output, self.loraA, self.loraB, self.alpha)
         t1 = time.time()
 
         return dst, (t1 - t0)*1e3
@@ -322,7 +346,7 @@ class onednnLoRAFusedQKV:
         print("ref is calculated!")
         return dst_ref
 
-def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, rt_dtype = np.float16, check_acc = True):   
+def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, rt_dtype = np.float16, check_acc = False):   
     # generate inputs
     vRANGE = 1
     # np.random.seed(0)
@@ -347,15 +371,15 @@ def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, rt_dtype = np.float16, c
         lora_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, head_q]).astype(rt_dtype)
         # lora_input = np.ones([n_tokens, head_q]).astype(rt_dtype)
         main_input = np.random.randint(-vRANGE, vRANGE+1, [n_tokens, head_q+head_kv*2]).astype(rt_dtype)
-
-        dst_cur, elapse = lora.forward(lora_input, main_input)
-        dst_cur = dst_cur.numpy()
-        print(f" onednnLoRA_QKVFused is calculated![{r}] :  {elapse : .3f} ms")
-        
+      
         ocl_res, durs, elapse = oclLoRA_QKVFused(main_input, lora_input, loraA, loraB, alpha, n_tokens, rank, head_q, head_kv)
         print(f" oclLoRA_QKVFused is calculated![{r}] :  {elapse: .3f} ms")
         for ns in durs:
             print(f'cl kernel durations, {ns*1e-6:.3f} ms')
+
+        dst_cur, elapse = lora.forward(lora_input, main_input)
+        dst_cur = dst_cur.numpy()
+        print(f" onednnLoRA_QKVFused is calculated![{r}] :  {elapse : .3f} ms")
 
         if check_acc:
             dst_ref = onednnLoRAFusedQKV.calc_ref(main_input.copy(), lora_input.copy(), loraA.copy(), loraB.copy(), alpha.copy(), False)
@@ -364,7 +388,8 @@ def test_lora_fusedqkv(n_tokens, rank, head_q, head_kv, rt_dtype = np.float16, c
             compare(ocl_res, dst_cur, atol=1.0, rtol=0.01)
             print(f'BATCH:{n_tokens} Q_STATE:{head_q}, RANK:{rank}, KV_STATE:{head_kv} ACC PASS!')
 
-# test_lora_fusedqkv(2, 16, 4, 2, check_acc=True)
-# test_lora_fusedqkv(1024, 64, 1536, 256, check_acc=False)
-test_lora_fusedqkv(3192, 64, 1536, 256, check_acc=False)
+# test_lora_fusedqkv(1, 64, 1536, 256, check_acc=False)
+# test_lora_fusedqkv(32, 64, 1536, 256, check_acc=False)
+test_lora_fusedqkv(1024, 64, 1536, 256, check_acc=False)
+# test_lora_fusedqkv(3192, 64, 1536, 256, check_acc=False)
 # test_lora_fusedqkv(8*1024, 64, 1536, 256, check_acc=False)
