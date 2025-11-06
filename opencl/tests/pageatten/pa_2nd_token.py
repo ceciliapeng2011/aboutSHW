@@ -25,7 +25,6 @@ args = parser.parse_args()
 print(args)
 
 enable_vprint = False
-# enable_vprint = True
 
 def vprint(*all_args):
     global enable_vprint
@@ -43,7 +42,7 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 0
+enable_kvcache_compression = 1
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -93,7 +92,7 @@ if run_real_data_test:
 k_partition_block_num = kv_len//8192
 if k_partition_block_num < 1:
     k_partition_block_num = 1
-k_partition_block_num = 1  # TODO: is this right ?
+k_partition_block_num = 1
 kv_partition_size = kv_block_size * k_partition_block_num
 
 print("kv_step:", kv_step)
@@ -1237,12 +1236,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     vector<float, Q_SLICE_NUM> cur_sum = 0.0f;
     vector<float, Q_SLICE_NUM> cur_lse = 0.0f;
     #if XE_ARCH==1
-    matrix<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K> Pmat = 0;
+    matrix<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_N> Pmat = 0;
     #else
         #if Q_RepeatCount != 1
-            matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_K> Pmat = 0;
+            matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
         #else
-            matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_K> Pmat = 0;
+            matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
         #endif
     #endif
     #pragma unroll
@@ -1272,11 +1271,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         for(int r = 1; r < rSv.n_elems(); r++)
             row_max = cm_max<float>(row_max, rSv[r]);
 
-        // compute P = exp(rS_slice - row_max)
+        // compute Pmat = exp(rS_slice - row_max)
         #if XE_ARCH==1
         Pmat[qi].format<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() = cm_exp((rS_slice.format<float, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() - row_max)*log2e);
         #else
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_K>() = cm_exp((rS_slice - row_max)*log2e);
+        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = cm_exp((rS_slice - row_max)*log2e);
         #endif
 
         vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
