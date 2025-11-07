@@ -42,7 +42,7 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 0
+enable_kvcache_compression = 1
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -174,7 +174,7 @@ def get_org(Q, K, V, attention_mask):
 
 print("k = ", k.shape, k.dtype)
 ref = F.scaled_dot_product_attention(q, k[:,:,:kv_len,:], v[:,:,:kv_len,:], attention_mask, dropout_p=0.0, enable_gqa = enable_gqa)
-org = get_org(q,k[:,:,:kv_len,:], v[:,:,:kv_len,:],attention_mask)
+org = get_org(q, k[:,:,:kv_len,:], v[:,:,:kv_len,:], attention_mask)
 
 def check_close(input, other, atol=1e-3, rtol=1e-3):
     print(f"[check_close] {input.shape}{input.dtype} vs {other.shape}{other.dtype}")
@@ -630,52 +630,52 @@ print("v:", v.shape, v.dtype)
 #     assert(new_kv_len % kv_block_size == 0)
 
 def quan_per_token(kv):
-        blk_num, kv_heads, blksz, *_ = kv.shape
-        kv_max = kv.amax(dim=-1, keepdim = True)
-        kv_min = kv.amin(dim=-1, keepdim = True)
-        qrange = kv_max - kv_min
+    blk_num, kv_heads, blksz, *_ = kv.shape
+    kv_max = kv.amax(dim=-1, keepdim = True)
+    kv_min = kv.amin(dim=-1, keepdim = True)
+    qrange = kv_max - kv_min
 
-        INTMAX = 255.0
-        INTMIN = 0.0
-        INTRAGNE = INTMAX - INTMIN
-        kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
-        kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
+    INTMAX = 255.0
+    INTMIN = 0.0
+    INTRAGNE = INTMAX - INTMIN
+    kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
+    kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
 
-        kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        # print("################################################################################")
-        # print(f'KV\n:{kv.reshape(16, 32)}')
-        # print(f'kv_INT8\n:{kv_INT8.reshape(16, 32)}')
-        # print(f'kv_scale\n:{kv_scale.reshape( 16, 1)}')
-        # print(f'kv_zp\n:{kv_zp.reshape( 16, 1)}')
-        # print("################################################################################")
+    kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    # print("################################################################################")
+    # print(f'KV\n:{kv.reshape(16, 32)}')
+    # print(f'kv_INT8\n:{kv_INT8.reshape(16, 32)}')
+    # print(f'kv_scale\n:{kv_scale.reshape( 16, 1)}')
+    # print(f'kv_zp\n:{kv_zp.reshape( 16, 1)}')
+    # print("################################################################################")
 
-        # print("quant_scale =", (1.0/kv_scale).reshape(blk_num,kv_heads,-1))
-        # print("quant_zp    =", kv_zp.reshape(blk_num,kv_heads,-1))
+    # print("quant_scale =", (1.0/kv_scale).reshape(blk_num,kv_heads,-1))
+    # print("quant_zp    =", kv_zp.reshape(blk_num,kv_heads,-1))
 
-        dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        # print("dq_scale: ", dq_scale)
-        # print("kz_zp: ", kv_zp)
-        return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
+    dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    # print("dq_scale: ", dq_scale)
+    # print("kz_zp: ", kv_zp)
+    return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
 
 def dequant_per_token(kv, head_size, blk_size):
-        blk_num, kv_head_num, _ = kv.shape
-        kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-        kv_scale = kv[:,:,head_size * blk_size:head_size * blk_size + blk_size * 2].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-        kv_zp = kv[:,:,head_size * blk_size + blk_size * 2:head_size * blk_size + blk_size * 4].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-        
-        # print("dequant_kv_u8 = ", kv_u8)
-        # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
-        # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
-        
-        kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
-        
-        for m in range(blk_num):
-            for n in range(kv_head_num):
-                for i in range(blk_size):
-                    kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
+    blk_num, kv_head_num, _ = kv.shape
+    kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
+    kv_scale = kv[:,:,head_size * blk_size: (head_size * blk_size + blk_size * 2)].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
+    kv_zp = kv[:,:, (head_size * blk_size + blk_size * 2):(head_size * blk_size + blk_size * 4)].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
 
-        return kv_dequant
+    # print("dequant_kv_u8 = ", kv_u8)
+    # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
+    # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
+
+    kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
+
+    for m in range(blk_num):
+        for n in range(kv_head_num):
+            for i in range(blk_size):
+                kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
+
+    return kv_dequant
 
 if enable_clean_unused_kvcache:
     print("before blocking k:", k.shape, k.dtype)
@@ -683,42 +683,41 @@ if enable_clean_unused_kvcache:
     k.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
     v.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
 
-print("after blocking k:", k.shape, k.dtype)
-print("after blocking v:", v.shape, v.dtype)
 # change from [batch, kv_len, num_kv_heads, head_size] to [total_blk_num, num_kv_heads, kv_block_size, head_size]
 k = k.reshape(total_blk_num, kv_block_size, num_kv_heads, head_size).transpose(1,2).contiguous()
 v = v.reshape(total_blk_num, kv_block_size, num_kv_heads, head_size).transpose(1,2).contiguous()
+print("after blocking k:", k.shape, k.dtype)
+print("after blocking v:", v.shape, v.dtype)
 
-print()
-print(f"block k shape: {k.shape}, dtype={k.dtype}")
 vprint("k[0,0,0,:] = ", k[0,0,0,:])
 vprint("v[0,0,0,:] = ", v[0,0,0,:])
 print()
 
 if enable_kvcache_compression:
     # print("quant = ", k.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size))
-    #k_origin = k.clone()
+    # k_origin = k.clone()
     print("k = ", k.shape)
     k = quan_per_token(k)
     v = quan_per_token(v)
-    # print(f"quant k shape: {k.shape}, dtype={k.dtype}")
-    # print(f"quant v shape: {v.shape}, dtype={v.dtype}")
-    
-    enable_dequant_check = 0
+    print(f"quant k shape: {k.shape}, dtype={k.dtype}")
+    print(f"quant v shape: {v.shape}, dtype={v.dtype}")
+
+    enable_dequant_check = 1
     if enable_dequant_check:
         k_dequan = dequant_per_token(k, head_size, kv_block_size)
         v_dequan = dequant_per_token(v, head_size, kv_block_size)
         # print("de-quant = ", k_dequan.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size))
         # print("diff = ", (k_dequan - k_origin).abs())
-        print("k_dequan = ",k_dequan.shape)
+        # print("k_dequan = ", k_dequan.shape)
 
         q_input = q.transpose(1,2).contiguous()
-        k_input = k_dequan.transpose(1,2).reshape(batch, kv_len, num_kv_heads, head_size).transpose(1,2).contiguous()
-        v_input = v_dequan.transpose(1,2).reshape(batch, kv_len, num_kv_heads, head_size).transpose(1,2).contiguous()
+        k_input = k_dequan.transpose(1,2).reshape(batch, new_kv_len, num_kv_heads, head_size).transpose(1,2).contiguous()
+        v_input = v_dequan.transpose(1,2).reshape(batch, new_kv_len, num_kv_heads, head_size).transpose(1,2).contiguous()
 
-        print("q = ",q_input.shape)
-        print("k_input = ",k_input.shape)
-        org = get_org(q_input,k_input,v_input,attention_mask)
+        # print("q = ", q_input.shape)
+        # print("k_input = ", k_input.shape)
+        org = get_org(q_input, k_input[:, :, :kv_len, :], v_input[:, :, :kv_len, :], attention_mask[:, :, :, :kv_len])
+        check_close(ref, org, atol=1e-3, rtol=1e-2)
 
 
 # print("quanted k[0,0,16*32:16*32+2*16]:", k[0,0,16*32:16*32+2*16])
