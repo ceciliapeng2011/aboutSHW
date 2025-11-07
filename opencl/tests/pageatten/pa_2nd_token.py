@@ -1274,11 +1274,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         // compute Pmat = exp(rS_slice - row_max)
         #if XE_ARCH==1
         Pmat[qi].format<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() = cm_exp((rS_slice.format<float, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() - row_max)*log2e);
+        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
         #else
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = cm_exp((rS_slice - row_max)*log2e);
+        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
+        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
         #endif
 
-        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
         cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
 
@@ -1844,7 +1845,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
             kv_pos_end = leftover_size % KV_PARTITION_SIZE;
             if(kv_pos_end == 0) kv_pos_end = KV_PARTITION_SIZE;
         }
-        
+
         #if KV_CACHE_COMPRESSION
         // load scale/zp
         vector<half, KV_PARTITION_SIZE> scale_vec;
@@ -1997,7 +1998,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
         auto batch = cm_global_id(0);
         auto head = cm_global_id(1);
         auto offset = cm_group_id(2) * REDUCE_SPLIT_SIZE;
-        const int total_partition_num = (kv_partition_num * KV_HEADS_NUM);
+        const int total_partition_num = (kv_partition_num * HEADS_NUM);
 
         // load lse
         float total_lse = 0.0;
@@ -2043,16 +2044,16 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
             float lse_value = cm_exp<float>((lse_vec[k] - lse_max)*log2e);
             out_mat_f32 += cm_mul<float>(data_mat, (float)(lse_value/total_lse));
         }
-        
+
         //if(cm_global_id(1) == 28 && cm_global_id(2) == 0) {
         //    printf("out_mat_f32:\n");
         //    show(out_mat_f32);
         //}
-        
+
         out_mat = cm_mul<half>(out_mat_f32, (float)1.0f);
         // write output
         uint output_offset = batch * HEADS_NUM * HEAD_SIZE + head * HEAD_SIZE + offset;
-        cm_svm_block_write<half, REDUCE_SPLIT_SIZE>((svmptr_t)(output + output_offset),out_mat.format<half>());
+        cm_svm_block_write<half, REDUCE_SPLIT_SIZE>((svmptr_t)(output + output_offset), out_mat.format<half>());
     }
 '''
 
