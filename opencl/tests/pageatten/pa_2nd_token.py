@@ -42,7 +42,7 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 1
+enable_kvcache_compression = 0
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -1013,7 +1013,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //# const uint subsequence_begin = subsequence_begins[subsequence_idx];
     //# const uint subsequence_end = subsequence_begins[subsequence_idx + 1];
     const uint kv_len = past_lens[seq_idx] + 1;
-    // TODO: 这里的代码需要KV_PARTITION_SIZE是KV_BLOCK_SIZE的整数倍
+    // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
     const uint start_block_idx = block_indices_begins[seq_idx] + kv_partition_idx * (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
 
     //if(cm_global_id(0)==0 && cm_global_id(1)==0 && cm_global_id(2)==0)
@@ -1168,7 +1168,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     cm_load<lsc::Transpose>(Kt.format<uint>(), b2dK.set_block_y(kv_pos));
                     #if CLEAN_UNUSED_KVCACHE & 0
                     // Not need clean K cache: 1) col write will lead huge perf drop; 2) softmax will clear unused scores
-                    if (kv_pos_end < kv_pos + KV_STEP) {
+                    if(kv_pos_end < kv_pos + KV_STEP) {
                         auto KmatRef = Kt.format<half, REG_K/2, REG_N*2>();
                         uint valid_cols = kv_pos_end - kv_pos;
                         uint valid_cols_vnni = valid_cols * 2;
@@ -1250,7 +1250,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         rS_slice = cm_mul<float>(rS_slice, (float)SCALE_FACTOR);  // convert scale_factor into (float), or it will be promoted to double
 
         // printf("leftover_size = %d, leftover_aligned_size = %d, XE_ARCH = %d, KV_PARTITION_STEP_NUM * REG_N = %d\n", leftover_size, leftover_aligned_size, XE_ARCH, KV_PARTITION_STEP_NUM * REG_N);
-        if (leftover_size > 0) {
+        if(leftover_size > 0) {
             auto Svec = rS_slice.format<float>();
             for(int i = leftover_size; i < KV_PARTITION_STEP_NUM * REG_N; i++){
                 Svec[i] = -3e38f;
@@ -1791,7 +1791,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
         #endif
 
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
-        cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x))) // TODO: WHY THIS VALUE?
+        cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
 
         // compute row sum of P
         auto rPv = Pmat[qi].format<half, 1, KV_PARTITION_STEP_NUM * REG_N>();
@@ -2096,12 +2096,12 @@ print("first call ...")
 
 if kv_partition_size * 2 == kv_block_size:
     cm_kernels.enqueue("cm_sdpa_2nd_half_block", GWS, LWS, t_q, t_k, t_v,
-                   t_past_lens, t_block_indices, t_block_indices_begins,
-                   t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
+                       t_past_lens, t_block_indices, t_block_indices_begins,
+                       t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
 else:
     cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, t_q, t_k, t_v,
-                   t_past_lens, t_block_indices, t_block_indices_begins,
-                   t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
+                       t_past_lens, t_block_indices, t_block_indices_begins,
+                       t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
 
 # np.save("bmg_out", t_out.numpy())
 
@@ -2154,20 +2154,20 @@ for i in range(loop_cnt):
     j  = i % len(all_layers)
     if kv_partition_size * 2 == kv_block_size:
         cm_kernels.enqueue("cm_sdpa_2nd_half_block", GWS, LWS,
-                       all_layers[j][0],
-                       all_layers[j][1],
-                       all_layers[j][2],
-                       t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
-                       all_layers[j][3],
-                       t_lse, t_gws_subseq_mapping, q_len)
+                           all_layers[j][0],
+                           all_layers[j][1],
+                           all_layers[j][2],
+                           t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
+                           all_layers[j][3],
+                           t_lse, t_gws_subseq_mapping, q_len)
     else:
         cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS,
-                       all_layers[j][0],
-                       all_layers[j][1],
-                       all_layers[j][2],
-                       t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
-                       all_layers[j][3],
-                       t_lse, t_gws_subseq_mapping, q_len)
+                           all_layers[j][0],
+                           all_layers[j][1],
+                           all_layers[j][2],
+                           t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
+                           all_layers[j][3],
+                           t_lse, t_gws_subseq_mapping, q_len)
 
     cm_kernels.enqueue("cm_sdpa_2nd_reduce", GWS_2, LWS_2, all_layers[j][3],all_layers[j][4], t_lse, kv_partition_num)
 
