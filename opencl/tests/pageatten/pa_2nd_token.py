@@ -92,8 +92,9 @@ if run_real_data_test:
 k_partition_block_num = kv_len//8192
 if k_partition_block_num < 1:
     k_partition_block_num = 1
-k_partition_block_num = 1
-kv_partition_size = kv_block_size * k_partition_block_num
+k_partition_block_num = 1  # test cm_sdpa_2nd
+# k_partition_block_num = 0.5  # test cm_sdpa_2nd_half_block, now output is wrong for enable_kvcache_compression
+kv_partition_size = int(kv_block_size * k_partition_block_num)
 
 print("kv_step:", kv_step)
 print("k_partition_block_num:", k_partition_block_num)
@@ -306,10 +307,12 @@ def get_flash1(query, key, value, attention_mask):
     return out
 
 # Split KV online-softmax
-def get_flash2(query, key, value, attention_mask):
+def get_flash2(query, key, value, attention_mask, real_kv_len=0):
     global enable_vprint
     B,H,q_len,hs = query.shape
     _,Hkv,kv_len,_ = key.shape
+    if real_kv_len == 0:
+        real_kv_len = kv_len
     out = torch.zeros([B,H,q_len,hs], dtype=value.dtype)
     scale_factor = hs**(-0.5)
     for b in range(B):
@@ -343,6 +346,8 @@ def get_flash2(query, key, value, attention_mask):
                 cur_sum = 0.0
                 for j in range(i, i1, kv_step):
                     j1 = min(j + kv_step, kv_len)
+                    if j > kv_len:
+                        break
 
                     if (j == args.verbose): enable_vprint = True
                     # compute in local SRAM
@@ -413,7 +418,10 @@ def get_flash2(query, key, value, attention_mask):
                     if (j == args.verbose): assert 0
 
                 lse[i//kv_partition_size] = cur_lse
-                cur_O[i//kv_partition_size,:,:] = cur_O[i//kv_partition_size,:,:] / cur_sum
+                if i > real_kv_len:
+                    cur_O[i//kv_partition_size,:,:] = 0
+                else:
+                    cur_O[i//kv_partition_size,:,:] = cur_O[i//kv_partition_size,:,:] / cur_sum
                 vprint("cur_sum=", cur_sum.shape)
                 vprint("cur_O=",  cur_O[i//kv_partition_size,:,:])
 
@@ -427,9 +435,9 @@ def get_flash2(query, key, value, attention_mask):
             sum_lse = lse.sum(0)
             # print("cur_O=", cur_O.shape) # 
             # print("cur_O_f32=", cur_O_f32.shape) #
-            vprint("lse = ", lse)
-            vprint("sum_lse = ", sum_lse)
             for i in range(0, kv_len//kv_partition_size, 1):
+                if i * kv_partition_size > real_kv_len:
+                    break
                 cur_O_f32 += cur_O[i,:,:] * lse[i] / sum_lse
             cur_O_f16 = cur_O_f32.to(torch.float16)
             out[b, h, :, :] = cur_O_f16
@@ -588,7 +596,7 @@ org1 = get_flash1(q,k,v,attention_mask)
 check_close(ref, org1, atol=1e-3, rtol=1e-2)
 print("org of get_flash1 passed !")
 
-org2 = get_flash2(q,k,v,attention_mask)
+org2 = get_flash2(q,k,v,attention_mask, real_kv_len=kv_len)
 check_close(ref, org2, atol=1e-3, rtol=1e-2)
 print("org of get_flash2 passed !")
 
@@ -1347,8 +1355,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K, ki++) {
             // uint kv_offset_y = kv_pos;
             #if KV_CACHE_COMPRESSION
-            vector<half, REG_N> temp_scale = scale_vec.select<REG_N,1>(kv_pos);
-            vector<half, REG_N> temp_zp = zp_vec.select<REG_N,1>(kv_pos);
+            vector<half, REG_K> temp_scale = scale_vec.select<REG_K, 1>(kv_pos);
+            vector<half, REG_K> temp_zp = zp_vec.select<REG_K, 1>(kv_pos);
             #endif
             #pragma unroll
             for(int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri ++ ) {
@@ -1379,7 +1387,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
                     if(kv_pos_end - kv_pos < KV_STEP) {
                         #pragma unroll
-                        for(int r = kv_pos_end; r<KV_STEP; r++)  {
+                        for(int r = kv_pos_end; r < KV_STEP; r++)  {
                             VmatNormal[r] = 0;
                         }
                     }
@@ -1491,7 +1499,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     //#   key [block_num, head_num, block_size, head_size] + [block_num, head_num, block_size, 4] (scale/zp)
     //# value [block_num, head_num, block_size, head_size] + [block_num, head_num, block_size, 4] (scale/zp)
 
-    //# KV_PARTITION_SIZE should be multiple of kv_block_size(KV_BLOCK_SIZE)
+    //# KV_PARTITION_SIZE here equals to half kv_block_size(KV_BLOCK_SIZE)
     //# kv_len dimision will be split into multiple partitions, each WG process a partition
     //# total_partitions_num = kv_len // KV_PARTITION_SIZE
     //# GWS=[seq_num, num_heads, total_partitions_num]
@@ -1514,7 +1522,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     //# const uint subsequence_begin = subsequence_begins[subsequence_idx];
     //# const uint subsequence_end = subsequence_begins[subsequence_idx + 1];
     const uint kv_len = past_lens[seq_idx] + 1;
-    const uint start_block_idx = block_indices_begins[seq_idx] + kv_partition_idx * KV_PARTITION_SIZE / KV_BLOCK_SIZE;
+    const uint start_block_idx = block_indices_begins[seq_idx] + (kv_partition_idx * KV_PARTITION_SIZE) / KV_BLOCK_SIZE;
 
     //if(cm_global_id(0)==0 && cm_global_id(1)==0 && cm_global_id(2)==0)
     //{
@@ -1542,9 +1550,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     //    printf("Qmat loaded, kv_head_num_idx=%d\n", kv_head_num_idx);
     //    show(Qmat);
     //}
-    
-    constexpr uint per_kv_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE / sizeof(KV_ELEMENT_TYPE)); // 4 bytes: scale/zp
-    //uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
+
+    constexpr uint per_kv_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
 
     uint leftover_size = 0;
     if(kv_partition_idx == kv_partition_num - 2) {
@@ -1555,9 +1562,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     if(kv_partition_idx == kv_partition_num - 1) {
         leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx);
     }
-    //if(block_num > total_blocks_num - start_block_idx) {
-    //    block_num = total_blocks_num - start_block_idx;
-    //}
 
     //# rS = Q @ Kt
     //#  KV_PARTITION_STEP_NUM * [REG_M, REG_K] * [REG_K, REG_N] = KV_PARTITION_STEP_NUM * [REG_M, REG_N]
@@ -1566,9 +1570,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     #else
         matrix<float, Q_SLICE_NUM, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
     #endif
-    // # Each SG can process half blocks
-    // #pragma unroll
-    // for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++)
+    // Each SG can process half block
     {
         uint ki = 0;
         uint blk_indices = block_indices[start_block_idx];
@@ -1619,11 +1621,10 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
         //    printf("kv_partition_idx = %d, leftover_size = %d, kv_pos_end = %d, token_idx = %d\n", kv_partition_idx, leftover_size, kv_pos_end, kv_pos_end + KV_PARTITION_SIZE * kv_partition_idx + block_idx*KV_BLOCK_SIZE);
         //}
 
-
         for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
             // auto rSvec = rS[ki].format<float>();
             // uint kv_offset_y = kv_pos;
-            
+
             #if KV_CACHE_COMPRESSION
                 vector<half, REG_N * 2> temp_scale, temp_zp;
                 temp_scale.select<REG_N,2>(0) = scale_vec.select<REG_N,1>(kv_pos);
@@ -1786,7 +1787,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
         vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max) * log2e);
         #else
         vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max) * log2e);
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_K>() = rS_exp_temp;
+        Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
         #endif
 
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
@@ -1809,8 +1810,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     #else
     matrix <float, Q_SLICE_NUM, HEAD_SIZE/REG_N * REG_M*REG_N> Omat = 0;
     #endif
-    //#pragma unroll
-    //for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++)
     {
         uint ki = 0;
         uint blk_indices = block_indices[start_block_idx];
@@ -1846,25 +1845,25 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
         }
 
         #if KV_CACHE_COMPRESSION
-        // load scale/zp
-        vector<half, KV_PARTITION_SIZE> scale_vec;
-        vector<half, KV_PARTITION_SIZE> zp_vec;
-        cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset), scale_vec);
-        cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
-        if(kv_pos_end < KV_PARTITION_SIZE) {
-            // fill leftover with last valid scale/zp
-            for(int i = kv_pos_end; i < KV_PARTITION_SIZE; i++) {
-                scale_vec[i] = 0.0;
-                zp_vec[i] = 0.0;
+            // load scale/zp
+            vector<half, KV_PARTITION_SIZE> scale_vec;
+            vector<half, KV_PARTITION_SIZE> zp_vec;
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset), scale_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+            if(kv_pos_end < KV_PARTITION_SIZE) {
+                // fill leftover with last valid scale/zp
+                for(int i = kv_pos_end; i < KV_PARTITION_SIZE; i++) {
+                    scale_vec[i] = 0.0;
+                    zp_vec[i] = 0.0;
+                }
             }
-        }
         #endif
         #pragma unroll
         for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K, ki++) {
             // uint kv_offset_y = kv_pos;
             #if KV_CACHE_COMPRESSION
-            vector<half, REG_N> temp_scale = scale_vec.select<REG_N,1>(kv_pos);
-            vector<half, REG_N> temp_zp = zp_vec.select<REG_N,1>(kv_pos);
+            vector<half, REG_K> temp_scale = scale_vec.select<REG_K,1>(kv_pos);
+            vector<half, REG_K> temp_zp = zp_vec.select<REG_K,1>(kv_pos);
             #endif
             #pragma unroll
             for(int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri ++ ) {
@@ -1895,7 +1894,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
 
                     if(kv_pos_end - kv_pos < KV_STEP) {
                         #pragma unroll
-                        for(int r = kv_pos_end; r<KV_STEP; r++)  {
+                        for(int r = kv_pos_end; r < KV_STEP; r++)  {
                             VmatNormal[r] = 0;
                         }
                     }
@@ -1970,7 +1969,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     #pragma unroll
     for (int qi = 0; qi < Q_SLICE_NUM; qi++) {
         matrix<float, REG_M, REG_N> cur_O_f32;
-        uint o_offset = seq_idx * kv_partition_num * KV_HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
+        uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
         float div_cur_sum = 1.0/cur_sum[qi];
         auto Omat_slice = Omat[qi].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();
         #pragma unroll
@@ -1983,7 +1982,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
             #endif
             cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k),cur_O_f32.format<float>());
         }
-        uint lse_offset = seq_idx * KV_HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
+        uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
         lse[lse_offset] = cur_lse[qi];
     }
 }
