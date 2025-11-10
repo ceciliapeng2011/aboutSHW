@@ -53,7 +53,8 @@ def _validate_quant_mode(mode: str) -> str:
     return mode
 
 kv_cache_quantization_mode = _validate_quant_mode(kv_cache_quantization_mode)
-kvcache_quantization_by_token = kv_cache_quantization_mode == "by_token"
+kvcache_quantization_by_token = int(kv_cache_quantization_mode == "by_token")
+print(f"{kv_cache_quantization_mode=}, {kvcache_quantization_by_token=}")
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -1058,8 +1059,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //# batch=1, seq_num=1 or >1
     //# query [seq_idx, seq_num, head_num, head_size]
     //# output[seq_idx, seq_num, head_num, head_size]
-    //#   key [block_num, head_kv_num, block_size, head_size] + [block_num, head_kv_num, block_size, 4] (scale/zp)
-    //# value [block_num, head_kv_num, block_size, head_size] + [block_num, head_kv_num, block_size, 4] (scale/zp)
+    //#   key [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
+    //# value [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
 
     //# KV_PARTITION_SIZE should be multiple of kv_block_size(KV_BLOCK_SIZE)
     //# kv_len dimision will be split into multiple partitions, each WG process a partition
@@ -1113,7 +1114,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //    show(Qmat);
     //}
 
-    constexpr uint per_kv_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #if KV_CACHE_COMPRESSION_BY_TOKEN
+        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #else
+        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #endif
     uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
 
     uint leftover_size = 0;
@@ -1137,21 +1143,21 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
         // split kv_partition into multi kv_block
         uint blk_indices = block_indices[start_block_idx + block_idx];
-        uint kv_base_offset = blk_indices * per_kv_block_element_num + kv_head_num_idx * (per_kv_block_element_num / KV_HEADS_NUM);
-        uint kv_scale_zp_offset = kv_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
+        uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+        uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
 
-        // printf("seq_idx = %d, head_num_idx = %d, kv_partition_idx = %d,  start_block_idx = %d, block_idx = %d, blk_indices = %d, KV_PARTITION_SIZE = %d, KV_BLOCK_SIZE = %d, total_blocks_num = %d, kv_pitch = %d, kv_base_offset = %d\n",
-        //        seq_idx, head_num_idx, kv_partition_idx, start_block_idx, block_idx, blk_indices, KV_PARTITION_SIZE, KV_BLOCK_SIZE, total_blocks_num, kv_pitch, kv_base_offset);
+        // printf("seq_idx = %d, head_num_idx = %d, kv_partition_idx = %d,  start_block_idx = %d, block_idx = %d, blk_indices = %d, KV_PARTITION_SIZE = %d, KV_BLOCK_SIZE = %d, total_blocks_num = %d, kv_pitch = %d, k_base_offset = %d\n",
+        //        seq_idx, head_num_idx, kv_partition_idx, start_block_idx, block_idx, blk_indices, KV_PARTITION_SIZE, KV_BLOCK_SIZE, total_blocks_num, kv_pitch, k_base_offset);
 
     #if USE_LSC_BLOCK_2D_DESC
         #if KV_CACHE_COMPRESSION
             // Transpose only support dword and qwork
-            lsc::block_2d_desc<uint, 1, REG_N, REG_K/4> b2dK(reinterpret_cast<uint*>(key + kv_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+            lsc::block_2d_desc<uint, 1, REG_N, REG_K/4> b2dK(reinterpret_cast<uint*>(key + k_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
         #else
-            lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dK(reinterpret_cast<uint*>(key + kv_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(half) - 1, kv_pitch - 1, 0, 0);
+            lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dK(reinterpret_cast<uint*>(key + k_base_offset),  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(half) - 1, kv_pitch - 1, 0, 0);
         #endif
     #else
-        uint kv_offset = kv_base_offset;
+        uint kv_offset = k_base_offset;
         uint kv_stride = HEAD_SIZE;
         uint kv_x0 = 0, kv_y0 = 0;
         uint kv_x1 = HEAD_SIZE*sizeof(KV_ELEMENT_TYPE);
@@ -1165,11 +1171,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         }
 
         #if KV_CACHE_COMPRESSION
+            #if KV_CACHE_COMPRESSION_BY_TOKEN
             // load scale/zp
             vector<half, KV_BLOCK_SIZE> scale_vec;
             vector<half, KV_BLOCK_SIZE> zp_vec;
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + kv_scale_zp_offset), scale_vec);
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + kv_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
             if(kv_pos_end < KV_BLOCK_SIZE) {
                 // fill leftover with last valid scale/zp
                 #pragma unroll
@@ -1178,6 +1185,13 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     zp_vec[i] = 0.0;
                 }
             }
+            #else
+            // load scale/zp
+            vector<half, HEAD_SIZE> scale_vec;
+            vector<half, HEAD_SIZE> zp_vec;
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + HEAD_SIZE * sizeof(half)), zp_vec);
+            #endif
         #endif
 
         //if(cm_global_id(0)==0 && cm_global_id(1)==0){
@@ -1188,7 +1202,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             // auto rSvec = rS[ki].format<float>();
             // uint kv_offset_y = kv_pos;
 
-            #if KV_CACHE_COMPRESSION
+            #if KV_CACHE_COMPRESSION && KV_CACHE_COMPRESSION_BY_TOKEN
                 vector<half, REG_N * 2> temp_scale, temp_zp;
                 temp_scale.select<REG_N,2>(0) = scale_vec.select<REG_N,1>(kv_pos);
                 temp_scale.select<REG_N,2>(1) = scale_vec.select<REG_N,1>(kv_pos);
@@ -1228,11 +1242,39 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     show_u8(Kt_quant.format<uint8_t, REG_K, REG_N>());
                     #endif
 
+                    #if KV_CACHE_COMPRESSION_BY_TOKEN
                     #pragma unroll
                     for(int r = 0; r < REG_K; r++) {
                         Kt[r] = Kt_quant[r] - temp_zp.format<half, 2, REG_N>()[r%2]; //vector - vector
                         Kt[r] = cm_mul<half>(Kt[r], temp_scale.format<half, 2, REG_N>()[r%2]);    // vector * vector
                     }
+                    #else
+                    vector<half, REG_K> temp_scale, temp_zp;
+                    temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
+                    temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
+
+                    // performance is very slow for this code, 37.2ms
+                    // #pragma unroll
+                    // for(int r = 0; r < REG_K; r+=2) {
+                        // #pragma unroll
+                        // for(int z = 0; z <= 1; z++) {
+                        //    Kt[r].select<REG_N/2, 2>(z) = Kt_quant[r].select<REG_N/2, 2>(z) - temp_zp[r+z];
+                        //    Kt[r].select<REG_N/2, 2>(z)  = cm_mul<half>(Kt[r].select<REG_N/2, 2>(z), temp_scale[r+z]);
+                        //    Kt[r+1].select<REG_N/2, 2>(z) = Kt_quant[r+1].select<REG_N/2, 2>(z) - temp_zp[r+z];
+                        //    Kt[r+1].select<REG_N/2, 2>(z)  = cm_mul<half>(Kt[r+1].select<REG_N/2, 2>(z), temp_scale[r+z]);
+                        //}
+                    // }
+
+                    auto Kt_dequant_out = Kt.format<half, REG_K/2, 2*REG_N>();
+                    auto Kt_dequant_tmp = Kt_quant.format<uint8_t, REG_K/2, 2*REG_N>();
+                    #pragma unroll
+                    for(int r = 0; r < REG_K/2; r++) {
+                        Kt_dequant_out[r].select<REG_N, 2>(0) = Kt_dequant_tmp[r].select<REG_N, 2>(0) - temp_zp[r*2];
+                        Kt_dequant_out[r].select<REG_N, 2>(0) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(0), temp_scale[r*2]);
+                        Kt_dequant_out[r].select<REG_N, 2>(1) = Kt_dequant_tmp[r].select<REG_N, 2>(1) - temp_zp[r*2+1];
+                        Kt_dequant_out[r].select<REG_N, 2>(1) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(1), temp_scale[r*2+1]);
+                    }
+                    #endif
                 #else
                     cm_load<lsc::Transpose>(Kt.format<uint>(), b2dK.set_block_y(kv_pos));
                     #if CLEAN_UNUSED_KVCACHE & 0
@@ -1371,19 +1413,19 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     #pragma unroll
     for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
         uint blk_indices = block_indices[start_block_idx + block_idx];
-        uint kv_base_offset = blk_indices * per_kv_block_element_num + kv_head_num_idx * (per_kv_block_element_num / KV_HEADS_NUM);
-        uint kv_scale_zp_offset = kv_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
+        uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+        uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
 
     #if USE_LSC_BLOCK_2D_DESC
         //# vector load cannot be used for block_2d_desc
         //# note: candidate template ignored: deduced type 'details::Block2DRefTy<half, 1U, 16U, 1U, (LoadOp)0U>' (aka 'vector_ref<half,32>') of 1st parameter
         #if KV_CACHE_COMPRESSION
-        lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + kv_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+        lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
         #else
-        lsc::block_2d_desc<half, 1, REG_K, REG_N>   b2dV(value + kv_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
+        lsc::block_2d_desc<half, 1, REG_K, REG_N>   b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
         #endif
     #else
-        uint kv_offset = kv_base_offset;
+        uint kv_offset = v_base_offset;
         uint kv_stride = HEAD_SIZE;
         uint kv_x0 = 0, kv_y0 = 0;
         uint kv_x1 = HEAD_SIZE*sizeof(half);
@@ -1403,8 +1445,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             // load scale/zp
             vector<half, KV_BLOCK_SIZE> scale_vec;
             vector<half, KV_BLOCK_SIZE> zp_vec;
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset), scale_vec);
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + kv_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset), scale_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
             if(kv_pos_end < KV_BLOCK_SIZE) {
                 // fill leftover with last valid scale/zp
                 for(int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
