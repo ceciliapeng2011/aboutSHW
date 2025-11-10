@@ -43,6 +43,17 @@ enable_gqa = num_heads > num_kv_heads
 kv_block_size = 256
 
 enable_kvcache_compression = 1
+kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
+kv_cache_quantization_mode = "by_channel"
+
+def _validate_quant_mode(mode: str) -> str:
+    mode = mode.strip().lower()
+    if mode not in {"by_token", "by_channel"}:
+        raise ValueError(f"Unsupported kv-cache quantization mode: {mode}")
+    return mode
+
+kv_cache_quantization_mode = _validate_quant_mode(kv_cache_quantization_mode)
+kvcache_quantization_by_token = kv_cache_quantization_mode == "by_token"
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -685,10 +696,54 @@ def dequant_per_token(kv, head_size, blk_size):
 
     return kv_dequant
 
+def quan_per_channel(kv):
+    blk_num, kv_heads, blksz, head_size = kv.shape
+    kv_max = kv.amax(dim=2, keepdim=True)
+    kv_min = kv.amin(dim=2, keepdim=True)
+    qrange = kv_max - kv_min
+
+    INTMAX = 255.0
+    INTMIN = 0.0
+    INTRANGE = INTMAX - INTMIN
+
+    # need to consider qrange equals to zero
+    kv_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
+    kv_scale[qrange!=0] = (INTRANGE / qrange[qrange!=0]).to(dtype=torch.float16)
+    kv_zp = ((0.0 - kv_min) * kv_scale + INTMIN).to(dtype=torch.float16)
+    kv_INT8 = torch.round(kv * kv_scale + kv_zp).clamp(INTMIN, INTMAX).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    dq_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
+    dq_scale[kv_scale!=0] = (1.0 / kv_scale[kv_scale!=0]).to(dtype=torch.float16)
+    dq_scale = dq_scale.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+
+    return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
+
+def dequant_per_channel(kv, head_size, blk_size):
+    blk_num, kv_head_num, _ = kv.shape
+    kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
+    kv_scale = kv[:,:,head_size * blk_size: (head_size * blk_size + head_size * 2)].view(dtype=torch.float16).reshape(blk_num, kv_head_num, 1, head_size)
+    kv_zp = kv[:,:, (head_size * blk_size + head_size * 2):(head_size * blk_size + head_size * 4)].view(dtype=torch.float16).reshape(blk_num, kv_head_num, 1, head_size)
+
+    # print("dequant_kv_u8 = ", kv_u8)
+    # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
+    # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
+
+    kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
+
+    for m in range(blk_num):
+        for n in range(kv_head_num):
+            for i in range(head_size):
+                kv_dequant[m,n,:,i] = (kv_u8[m,n,:,i].to(dtype=torch.float16) - kv_zp[m,n,0,i].to(dtype=torch.float16)) * kv_scale[m,n,0,i].to(dtype=torch.float16)
+
+    return kv_dequant
+
 if enable_clean_unused_kvcache:
     print("before blocking k:", k.shape, k.dtype)
     print("before blocking v:", v.shape, v.dtype)
-    k.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
+    if kvcache_quantization_by_token:
+        k.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
+    else:
+        k.view(torch.uint16)[0,kv_len:,:,:] = 0
     v.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
 
 # change from [batch, kv_len, num_kv_heads, head_size] to [total_blk_num, num_kv_heads, kv_block_size, head_size]
@@ -703,16 +758,22 @@ print()
 
 if enable_kvcache_compression:
     # print("quant = ", k.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size))
-    # k_origin = k.clone()
+    k_origin = k.clone()
     print("k = ", k.shape)
-    k = quan_per_token(k)
+    if kvcache_quantization_by_token:
+        k = quan_per_token(k)
+    else:
+        k = quan_per_channel(k)
     v = quan_per_token(v)
     print(f"quant k shape: {k.shape}, dtype={k.dtype}")
     print(f"quant v shape: {v.shape}, dtype={v.dtype}")
 
     enable_dequant_check = 1
     if enable_dequant_check:
-        k_dequan = dequant_per_token(k, head_size, kv_block_size)
+        if kvcache_quantization_by_token:
+            k_dequan = dequant_per_token(k, head_size, kv_block_size)
+        else:
+            k_dequan = dequant_per_channel(k, head_size, kv_block_size)
         v_dequan = dequant_per_token(v, head_size, kv_block_size)
         # print("de-quant = ", k_dequan.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size))
         # print("diff = ", (k_dequan - k_origin).abs())
@@ -826,6 +887,7 @@ src1 = r'''
 #pyeval f"#define CLEAN_UNUSED_KVCACHE {enable_clean_unused_kvcache}"
 
 #pyeval f"#define KV_CACHE_COMPRESSION {enable_kvcache_compression}"
+#pyeval f"#define KV_CACHE_COMPRESSION_BY_TOKEN {kvcache_quantization_by_token}"
 
 // #define KV_CACHE_COMPRESSION 0
 
