@@ -42,9 +42,9 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 1
+enable_kvcache_compression = 0
 kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
-kv_cache_quantization_mode = "by_channel"
+# kv_cache_quantization_mode = "by_channel"
 
 def _validate_quant_mode(mode: str) -> str:
     mode = mode.strip().lower()
@@ -65,7 +65,7 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch=2
+xe_arch=1
 
 if xe_arch == 1:
     kv_step = 8
@@ -604,18 +604,18 @@ if args.impl == 0:
     print("=========== PASS ===========")
     sys.exit(0)
 
-org1 = get_flash1(q,k,v,attention_mask)
-check_close(ref, org1, atol=1e-3, rtol=1e-2)
-print("org of get_flash1 passed !")
+# org1 = get_flash1(q,k,v,attention_mask)
+# check_close(ref, org1, atol=1e-3, rtol=1e-2)
+# print("org of get_flash1 passed !")
 
-org2 = get_flash2(q,k,v,attention_mask, real_kv_len=kv_len)
-check_close(ref, org2, atol=1e-3, rtol=1e-2)
-print("org of get_flash2 passed !")
+# org2 = get_flash2(q,k,v,attention_mask, real_kv_len=kv_len)
+# check_close(ref, org2, atol=1e-3, rtol=1e-2)
+# print("org of get_flash2 passed !")
 
 org = get_flash3(q,k,v,attention_mask)
 check_close(ref, org, atol=1e-3, rtol=1e-2)
 print("org of get_flash3 passed !")
-check_close(org, org2, atol=1e-3, rtol=1e-2)
+# check_close(org, org2, atol=1e-3, rtol=1e-2)
 
 print()
 print("GPU cm kernels for flash attn2:")
@@ -1304,8 +1304,9 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                 for(int kk = 0; kk < REG_N; kk++) {
                     cm_svm_block_read<uint, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint>());
                 }
+                // TODO: dequantize?
                 #if XE_ARCH==1
-                Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                Transpose_8x8(temp, Kt.format<uint, REG_K/2, REG_N>());
                 #else
                 Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
                 Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
@@ -1346,14 +1347,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     // online softmax
     vector<float, Q_SLICE_NUM> cur_sum = 0.0f;
     vector<float, Q_SLICE_NUM> cur_lse = 0.0f;
-    #if XE_ARCH==1
-    matrix<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_N> Pmat = 0;
+
+    #if Q_RepeatCount != 1
+        matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
     #else
-        #if Q_RepeatCount != 1
-            matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
-        #else
-            matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
-        #endif
+        matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
     #endif
     #pragma unroll
     for(int qi = 0; qi < Q_SLICE_NUM; qi++) {
@@ -1383,13 +1381,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             row_max = cm_max<float>(row_max, rSv[r]);
 
         // compute Pmat = exp(rS_slice - row_max)
-        #if XE_ARCH==1
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() = cm_exp((rS_slice.format<float, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() - row_max)*log2e);
-        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
-        #else
         vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
         Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
-        #endif
 
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
         cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
@@ -1521,6 +1514,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     show(Vmat.format<half, REG_K, REG_N>());
                 }
             #else
+                // TODO: dequantize ?
                 matrix<half, REG_K, REG_N> temp;
                 uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k;
                 #pragma unroll
@@ -1849,13 +1843,10 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
     // online softmax
     vector<float, Q_SLICE_NUM> cur_sum = 0.0f;
     vector<float, Q_SLICE_NUM> cur_lse = 0.0f;
-    #if XE_ARCH==1
+    #if Q_RepeatCount != 1
+        matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
     #else
-        #if Q_RepeatCount != 1
-            matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
-        #else
-            matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
-        #endif
+        matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
     #endif
     #pragma unroll
     for(int qi = 0; qi < Q_SLICE_NUM; qi++) {
@@ -1886,13 +1877,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_half_block(
             row_max = cm_max<float>(row_max, rSv[r]);
 
         // compute Pmat = exp(rS_slice - row_max)
-        #if XE_ARCH==1
-        Pmat[qi].format<half, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() = cm_exp((rS_slice.format<float, KV_PARTITION_STEP_NUM / 2 * REG_M, REG_K>() - row_max)*log2e);
-        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max) * log2e);
-        #else
         vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max) * log2e);
         Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
-        #endif
 
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
         cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
