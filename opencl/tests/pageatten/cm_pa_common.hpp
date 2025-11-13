@@ -292,7 +292,7 @@ void pa_kernel_lsc_prefetch_f16(
     // constexpr uint k_pitch = is_qkv_fused ? q_pitch : (num_kv_heads * head_size * sizeof(half));
     // constexpr uint v_pitch = is_qkv_fused ? q_pitch : (num_kv_heads * head_size * sizeof(half));
     //[block_num, kv_heads, block_size, head_size]
-    constexpr uint k_pitch =  head_size * sizeof(half);
+    constexpr uint k_pitch = head_size * sizeof(half);
     constexpr uint v_pitch = k_pitch;
 
     vector<float, q_step> cur_max;
@@ -362,6 +362,7 @@ void pa_kernel_lsc_prefetch_f16(
             b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
             b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
             if ((kv_pos + kv_step) > kv_stop) {
                 auto valid_rows = kv_stop - kv_pos;
                 for (int r = valid_rows; r < kv_step; r++)
@@ -412,22 +413,25 @@ void pa_kernel_lsc_prefetch_f16(
 
         b2dV.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+cur_block_id*blk_stride));
         b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
-        if (kv_pos == 0) {
-            // ugemm_PV0(slm_V, P, rO, slm_offset);
-            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
-            #pragma unroll
-            for(int k = 0, ri = 0; k < head_size; k += REG_N, ri += num_P_tiles) {
-                matrix<half, REG_K/2, REG_N*2> Vmat;
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
-                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-                if ((kv_pos + kv_step) > kv_stop) {
-                    uint valid_rows = kv_stop - kv_pos;
-                    uint valid_rows_vnni = (valid_rows+1)/2;
-                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
-                        Vmat.row(r) = 0.f;
-                    if (valid_rows % 2 == 1)
-                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
-                }
+
+        auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+        #pragma unroll
+        for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
+            matrix<half, REG_K/2, REG_N*2> Vmat;
+
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
+            cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+            // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+            if ((kv_pos + kv_step) > kv_stop) {
+                uint valid_rows = kv_stop - kv_pos;
+                uint valid_rows_vnni = (valid_rows+1)/2;
+                for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                    Vmat.row(r) = 0.f;
+                if (valid_rows % 2 == 1)
+                    Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+            }
+
+            if (kv_pos == 0) {
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
@@ -435,27 +439,7 @@ void pa_kernel_lsc_prefetch_f16(
                                     Vmat.format<int32_t>(),
                                     P2.row(p).format<int32_t>());
                 }
-            }
-        }
-        else {
-            //ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
-            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
-            #pragma unroll
-            for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
-                matrix<half, REG_K/2, REG_N*2> Vmat;
-
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
-                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-                if ((kv_pos + kv_step) > kv_stop) {
-                    uint valid_rows = kv_stop - kv_pos;
-                    uint valid_rows_vnni = (valid_rows+1)/2;
-                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
-                        Vmat.row(r) = 0.f;
-                    if (valid_rows % 2 == 1)
-                            Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
-                }
-                //# compensate cur_O
-                //  matrix <float, head_size/REG_K*2, REG_M*REG_N> rO;
+            } else {
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     auto cO = rO[ri + p].format<float, REG_M, REG_N>();
@@ -490,7 +474,6 @@ void pa_kernel_lsc_prefetch_f16(
             #pragma unroll
             for(int r = 0; r < cO.n_rows(); r++) {
                 cur_O_f16[r + p*REG_M] = cm_mul<float>(cO.row(r), cur_sum[r + p*REG_M]);
-
             }
         }
         b2dO.set_block_x(k);

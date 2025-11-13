@@ -250,7 +250,8 @@ class page_atten_cm:
                 t_block_indices_begins=cl.tensor(block_indices_begins.to(torch.int32).detach().numpy())
                 t_subsequence_begins=cl.tensor(subsequence_begins.to(torch.int32).detach().numpy())
 
-                print(f"calling cm_page_attention {GWS=} {LWS=} x {n_repeats} times, q:[{q_start}, {q_end}], past_lens:{int(past_lens)}, kv_blk_num:{blk_num}, sparse_block_sz:{self.sparse_block_sz} kv_cache:{"U8" if self.compressed_kvcache else "F16"}")
+                kv_precision = "U8" if self.compressed_kvcache else "F16"
+                print(f"calling cm_page_attention {GWS=} {LWS=} x {n_repeats} times, q:[{q_start}, {q_end}], past_lens:{int(past_lens)}, kv_blk_num:{blk_num}, sparse_block_sz:{self.sparse_block_sz} kv_cache:{kv_precision}")
                 if self.sparse_block_sz > 1:
                     t_block_mask = cl.tensor(block_mask_list[trunk_idx].to(torch.bool).detach().numpy())
                     t_block_mask_in_wg  = cl.tensor(block_mask_in_wg_list[trunk_idx].to(torch.bool).detach().numpy())
@@ -610,7 +611,8 @@ def test_ov():
     GWS = [1, pa_cm.num_heads, int(wg_count * wg_size)]
     LWS = [1, 1, wg_size]
 
-    print(f"calling cm_page_attention {GWS=} {LWS=} sparse_block_sz:{pa_cm.sparse_block_sz} kv_cache:{"U8" if pa_cm.compressed_kvcache else "F16"}")
+    kv_precision = "U8" if pa_cm.compressed_kvcache else "F16"
+    print(f"calling cm_page_attention {GWS=} {LWS=} sparse_block_sz:{pa_cm.sparse_block_sz} kv_cache:{kv_precision}")
     if pa_cm.sparse_block_sz > 1:
         t_block_mask = cl.tensor(block_mask.to(torch.bool).detach().numpy())
         t_block_mask_in_wg  = cl.tensor(block_mask_in_wg.to(torch.bool).detach().numpy())
