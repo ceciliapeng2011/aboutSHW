@@ -77,7 +77,7 @@ void pa_lsc_u8(
     lsc::block_2d_desc<uint8_t, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
     lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
     constexpr int quan_blk_stride = CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE+4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
-    int causal_left = q_start+past_lens;
+    int causal_left = q_start + past_lens;
 
     constexpr uint slm_buff_size = kv_step * head_size * sizeof(half);
     int slm_buff_id_write = 0;
@@ -328,19 +328,23 @@ void pa_kernel_lsc_prefetch_f16(
         #else
             // for xe1, load original Q
             matrix<half, REG_N, head_size> rQtmp;
-            for(int r = 0; r <= q_tokens_left; r++){
+            for(int r = 0; r < q_tokens_left; r++){
                 cm_svm_block_read<half, head_size>((svmptr_t)(q_base + r * head_size), rQtmp.row(r));
+            }
+            if (q_tokens_left < q_step) {
+                for(int r = q_tokens_left; r < q_step; r++) {
+                    rQtmp.row(r) = 0.f;
+                }
             }
             // Transpose Q
             auto rQref = rQtmp.format<uint, REG_N, head_size / 2>();
             for (int k = 0, ri = 0; k < head_size/2; k += REG_K/2, ri++) {
                 #if CMPA_XE_ARCH == 1
-                printf("call CMPA_XE_ARCH == 1. \n");
                 Transpose_8x8(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
                 #else
-                printf("call CMPA_XE_ARCH == 2. \n");
                 Transpose2DMatrix(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
                 #endif
+                rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
             }
         #endif
     }
@@ -395,7 +399,7 @@ void pa_kernel_lsc_prefetch_f16(
             svmptr_t base_k_cache_ptr = k_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
             auto kmatref = Kmat.format<half, kv_step, REG_K>();
             for(int kr = 0; kr < kv_step; kr++){
-                cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr *head_size), kmatref.row(kr));
+                cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr * head_size), kmatref.row(kr));
             }
             #endif
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
@@ -418,9 +422,15 @@ void pa_kernel_lsc_prefetch_f16(
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
                 #else
                 for(int kr = 0; kr < kv_step; kr++){
-                    cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr *head_size + ri * REG_K), kmatref.row(kr));
+                    cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr * head_size + ri * REG_K), kmatref.row(kr));
                 }
                 #endif
+                // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
+                if ((kv_pos + kv_step) > kv_stop) {
+                    auto valid_rows = kv_stop - kv_pos;
+                    for (int r = valid_rows; r < kv_step; r++)
+                        Kmat.format<half, num_K * REG_M, REG_K>().row(r) = 0.f;
+                }
                 #pragma unroll
                 for(int k = 0; k < num_K; k++) {
                     St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
@@ -431,7 +441,8 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
         if constexpr (use_causal_mask) {
-            // since kv_step == q_step == 16, causal_left is n*kv_step
+            // since kv_step == q_step == 16, causal_left is n * kv_step
+            // TODO: update for kv_step != q_step
             if (causal_left == 0) {
                 apply_causal_mask<1>(St);
             } else if (causal_left < 0) {
@@ -460,31 +471,32 @@ void pa_kernel_lsc_prefetch_f16(
 
         // constexpr int num_P_tiles = REG_N / REG_M;
         auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+        matrix<half, REG_K/2, REG_N*2> Vmat;
+        #if !USE_LSC
+        matrix<half, REG_K, REG_N> Vmat_tmp;
+        svmptr_t base_v_cache_ptr = v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
+        #endif
         #pragma unroll
         for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
-            matrix<half, REG_K/2, REG_N*2> Vmat;
             #if USE_LSC
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
             cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
-            matrix<half, REG_K/2, REG_N*2> Vmat_tmp;
-            svmptr_t base_v_cache_ptr = v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
-            auto Vmatref = Vmat_tmp.format<half, REG_K, REG_N>();
             for(int Vr = 0; Vr < REG_K; Vr++){
-                cm_svm_block_read<half, REG_N>((svmptr_t)(base_v_cache_ptr + Vr * head_size), Vmatref.row(Vr));
+                cm_svm_block_read<half, REG_N>((svmptr_t)(base_v_cache_ptr + k + Vr * head_size), Vmat_tmp.row(Vr));
             }
             // vnni transform from Vmatref to Vmat
-            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 0) = Vmatref.select<REG_K/2, 2, REG_N, 1>(0, 0);
-            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 1) = Vmatref.select<REG_K/2, 2, REG_N, 1>(1, 0);
+            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 0) = Vmat_tmp.select<REG_K/2, 2, REG_N, 1>(0, 0);
+            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 1) = Vmat_tmp.select<REG_K/2, 2, REG_N, 1>(1, 0);
             #endif
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
             if ((kv_pos + kv_step) > kv_stop) {
                 uint valid_rows = kv_stop - kv_pos;
                 uint valid_rows_vnni = (valid_rows+1)/2;
-                for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                for (int r = valid_rows_vnni; r < REG_K/2; r++)
                     Vmat.row(r) = 0.f;
                 if (valid_rows % 2 == 1)
-                    Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+                    Vmat.row(valid_rows_vnni-1).select<REG_N, 2>(1) = 0.f;
             }
 
             if (kv_pos == 0) {
@@ -538,8 +550,11 @@ void pa_kernel_lsc_prefetch_f16(
             #if USE_LSC
             cm_store(b2dO.set_block_y(p * REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p));
             #else
-            svmptr_t o_base = p * REG_M * head_size + k;
-            cm_svm_block_write(o_base, cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p));
+            svmptr_t output_ptr = o_base + p * REG_M * head_size + k;
+            auto cur_O_ref = cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p).format<half, REG_M, REG_N>();
+            for(int r = 0; r < REG_M; r++) {
+                cm_svm_block_write(output_ptr + r * head_size, cur_O_ref.row(r));
+            }
             #endif
         }
     }
