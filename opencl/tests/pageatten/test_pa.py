@@ -22,49 +22,54 @@ def get_cm_grf_width():
     return t_info.numpy()[0]
 
 CM_GRF_WIDTH = get_cm_grf_width()
+print(f"{CM_GRF_WIDTH=}")
+if CM_GRF_WIDTH == 512:
+    xe_arch = 2
+else:
+    xe_arch = 1
 
 def quan_per_token(kv):
-        blk_num, kv_heads, blksz, *_ = kv.shape
-        kv_max = kv.amax(dim=-1, keepdim = True)
-        kv_min = kv.amin(dim=-1, keepdim = True)
-        qrange = kv_max - kv_min
+    blk_num, kv_heads, blksz, *_ = kv.shape
+    kv_max = kv.amax(dim=-1, keepdim = True)
+    kv_min = kv.amin(dim=-1, keepdim = True)
+    qrange = kv_max - kv_min
 
-        INTMAX = 255.0
-        INTMIN = 0.0
-        INTRAGNE = INTMAX - INTMIN
-        kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
-        kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
-        #round half to even
-        kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        # print("################################################################################")
-        # print(f'KV\n:{kv.reshape(64, 16)}')
-        # print(f'kv_INT8\n:{kv_INT8.reshape(64, 16)}')
-        # print(f'kv_scale\n:{kv_scale.reshape( 1, 64)}')
-        # print(f'kv_zp\n:{kv_zp.reshape( 1, 64)}')
-        # print("################################################################################")
+    INTMAX = 255.0
+    INTMIN = 0.0
+    INTRAGNE = INTMAX - INTMIN
+    kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
+    kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
+    #round half to even
+    kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    # print("################################################################################")
+    # print(f'KV\n:{kv.reshape(64, 16)}')
+    # print(f'kv_INT8\n:{kv_INT8.reshape(64, 16)}')
+    # print(f'kv_scale\n:{kv_scale.reshape( 1, 64)}')
+    # print(f'kv_zp\n:{kv_zp.reshape( 1, 64)}')
+    # print("################################################################################")
 
-        dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
+    dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+    return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
 
 def dequant_per_token(kv, head_size, blk_size):
-        blk_num, kv_head_num, _ = kv.shape
-        kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-        kv_scale = kv[:,:,head_size * blk_size:head_size * blk_size + blk_size * 2].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-        kv_zp = kv[:,:,head_size * blk_size + blk_size * 2:head_size * blk_size + blk_size * 4].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
+    blk_num, kv_head_num, _ = kv.shape
+    kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
+    kv_scale = kv[:,:,head_size * blk_size:head_size * blk_size + blk_size * 2].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
+    kv_zp = kv[:,:,head_size * blk_size + blk_size * 2:head_size * blk_size + blk_size * 4].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
 
-        # print("dequant_kv_u8 = ", kv_u8)
-        # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
-        # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
+    # print("dequant_kv_u8 = ", kv_u8)
+    # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
+    # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
 
-        kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
+    kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
 
-        for m in range(blk_num):
-            for n in range(kv_head_num):
-                for i in range(blk_size):
-                    kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
+    for m in range(blk_num):
+        for n in range(kv_head_num):
+            for i in range(blk_size):
+                kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
 
-        return kv_dequant
+    return kv_dequant
 
 def ALIGN_UP(x, y):
     return (x + y -1) // y * y
@@ -98,6 +103,7 @@ class page_atten_cm:
                       f" -DCMPA_BLOCK_SZ={self.block_sz}"
                       f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
                       f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
+                      f" -DCMPA_XE_ARCH={int(xe_arch)}"
                       f" -mdump_asm -g2")
                      )
 
@@ -656,7 +662,7 @@ if __name__ == "__main__":
 
     # test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=sparse_ratio, check_acc=True)
     #ACC test PA base
-    if 0:
+    if 1:
         for block_sz in range(32, 144, 16):
             for blocks_per_trunk in range(1, 30, 6):
                 for seq_len in range(8192, 8248, 3):
@@ -692,7 +698,7 @@ if __name__ == "__main__":
                                 test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, sparse_ratio=sparse_ratio, check_acc=True)
 
     # perf for sparse X attention.
-    if 1:
+    if 0:
         seq_len = 32*1024
         block_sz = 256
         trunk_sz=seq_len
