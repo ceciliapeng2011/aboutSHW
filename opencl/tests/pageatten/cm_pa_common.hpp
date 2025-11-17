@@ -375,9 +375,12 @@ void pa_kernel_lsc_prefetch_f16(
             matrix<half, num_K, REG_M * REG_K> Kmat;
 
             #if USE_LSC
-            prefetch_K.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+prefetch_block_id*blk_stride));
+            prefetch_K.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+prefetch_block_id * blk_stride));
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+            #else
+            half* prefetch_k_pos = (half*)k_cache_base + prefetch_block_id * blk_stride + ((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ) * head_size;
+            cm_ptr_prefetch<REG_K/2, DataSize::U32, CacheHint::Cached, CacheHint::Cached>((const unsigned int *const)prefetch_k_pos, 0);
             #endif
 
 #if SPARSE_BLOCK_SIZE > 1
@@ -424,6 +427,7 @@ void pa_kernel_lsc_prefetch_f16(
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
                 #else
+                cm_ptr_prefetch<REG_K/2, DataSize::U32, CacheHint::Cached, CacheHint::Cached>((const unsigned int *const)prefetch_k_pos, ri*REG_K/2);
                 #pragma unroll
                 for(int kr = 0; kr < kv_step; kr++){
                     cm_svm_block_read<half, REG_K>((svmptr_t)((half*)base_k_cache_ptr + kr * head_size + ri * REG_K), kmatref.row(kr));

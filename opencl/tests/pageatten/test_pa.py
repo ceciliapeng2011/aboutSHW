@@ -663,7 +663,9 @@ if __name__ == "__main__":
 
     # test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=sparse_ratio, check_acc=True)
     #ACC test PA base
-    if 1:
+    test_page_attn_causal_batch1(8192, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=256, trunk_sz=4096, compressed_kvcache=False, sparse_block_sz = 1, check_acc=False)
+
+    if 0:
         for block_sz in range(32, 144, 16):
             for blocks_per_trunk in range(1, 30, 6):
                 for seq_len in range(8192, 8248, 3):
