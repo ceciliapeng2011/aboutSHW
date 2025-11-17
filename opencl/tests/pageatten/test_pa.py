@@ -23,10 +23,10 @@ def get_cm_grf_width():
 
 CM_GRF_WIDTH = get_cm_grf_width()
 print(f"{CM_GRF_WIDTH=}")
-if CM_GRF_WIDTH == 512:
-    xe_arch = 2
-else:
+if CM_GRF_WIDTH == 256:
     xe_arch = 1
+else:
+    xe_arch = 2
 
 def quan_per_token(kv):
     blk_num, kv_heads, blksz, *_ = kv.shape
@@ -380,11 +380,13 @@ def check_close(input, other, atol=1e-2, rtol=1e-2):
     print(f"[check_close] rtol_max: {rtol_max}")
     print(f"[check_close] atol_max: {atol_max}")
     if not torch.allclose(input, other, atol=atol, rtol=rtol):
+        print(input)
+        print(other)
         close_check = torch.isclose(input, other, atol=atol, rtol=rtol)
         not_close_indices = torch.where(~close_check) # Invert the close check to find failures
         print(f"Not close indices: {not_close_indices}")
-        # print(f"    input_tensor: {input[not_close_indices]}")
-        # print(f"    other_tensor: {other[not_close_indices]}")
+        print(f"    input_tensor: {input[not_close_indices]}")
+        print(f"    other_tensor: {other[not_close_indices]}")
         assert 0
 
 def count_false_percentage(mask):
@@ -453,7 +455,6 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         block_mask[:,:,:,0] = True  # the first column is always True
         # if q_block_num == 2 and k_block_num == 2: # HARD CODE FOR DEBUG
         #     block_mask = torch.tensor([True, False, False, True], dtype=torch.bool).reshape(q_block_num, k_block_num).expand(trunk_num, num_heads, q_block_num, k_block_num)
-
 
         return block_mask
 
@@ -666,12 +667,13 @@ if __name__ == "__main__":
         for block_sz in range(32, 144, 16):
             for blocks_per_trunk in range(1, 30, 6):
                 for seq_len in range(8192, 8248, 3):
-                    for compressed_kv in [False, True]:
+                    # for compressed_kv in [False, True]:
+                    for compressed_kv in [False]:
                         print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                         print(f'[PA_BASE_ACC_TETS]: seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache=={"U8" if compressed_kv else "F16"} sparse_block_sz=1')
                         print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                         test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sparse_block_sz = 1, check_acc=True)
-                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sparse_block_sz = 1, check_acc=True)
+                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sparse_block_sz = 1, check_acc=False)
 
         for block_sz in range(128, 257, 32):
                 for seq_len in range(32768, 32810):

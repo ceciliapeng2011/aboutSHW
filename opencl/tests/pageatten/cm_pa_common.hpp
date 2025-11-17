@@ -455,20 +455,18 @@ void pa_kernel_lsc_prefetch_f16(
             #else
             if (causal_left == 0) {
                 // q_step is half of kv_step
+                // calsual mask first half of the kv
                 apply_causal_mask<1>(St.select<q_step, 1, q_step, 1>(0, 0));
                 St.select<q_step, 1, q_step, 1>(q_step, 0) = -3.4e38f;
             } else if (causal_left < 0) {
                 St = -3.4e38f;
-            }
-            // } else if (causal_left < kv_step) {
+            } else if (causal_left < kv_step) {
                 // q_step is half of kv_step
-                // mask half of the kv
-                // below code also meet IGC: Internal Compiler Error: Access violation
-                // constexpr int num_Q_tiles = kv_step / q_step;
-                // auto St_ref = St.format<float, num_Q_tiles, q_step * q_step>();
-                // auto sub_matrix = St_ref.row(1).format<float, REG_N, REG_N>();
-                // apply_causal_mask<1>(sub_matrix);
-            // }
+                // calsual mask second half of the kv
+                // if w/o St += 0.f;, I will meet IGC: Internal Compiler Error: Access violation on ARL-H
+                St += 0.f;
+                apply_causal_mask<1>(St.select<q_step, 1, q_step, 1>(q_step, 0));
+            }
             #endif
             causal_left -= kv_step;
         } else {
