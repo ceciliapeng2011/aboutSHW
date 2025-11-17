@@ -308,7 +308,7 @@ void pa_kernel_lsc_prefetch_f16(
     cur_sum = 0;
     constexpr int num_P_tiles = REG_N / REG_M;
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
-    matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
+    matrix <float, head_size/REG_M, REG_M*REG_N> rO;
 
     auto q_tokens_left = q_len;// - q_start;
     static_assert(q_step == REG_N);
@@ -316,6 +316,7 @@ void pa_kernel_lsc_prefetch_f16(
 
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
+    if (q_tokens_left == 0) return;
 
     if (q_tokens_left > 0) {
         #if USE_LSC
@@ -328,8 +329,9 @@ void pa_kernel_lsc_prefetch_f16(
         #else
             // for xe1, load original Q
             matrix<half, REG_N, head_size> rQtmp;
+            #pragma unroll
             for(int r = 0; r < q_tokens_left; r++){
-                cm_svm_block_read<half, head_size>((svmptr_t)(q_base + r * head_size), rQtmp.row(r));
+                cm_svm_block_read<half, head_size>((svmptr_t)((half*)q_base + r * head_size), rQtmp.row(r));
             }
             if (q_tokens_left < q_step) {
                 for(int r = q_tokens_left; r < q_step; r++) {
@@ -396,10 +398,11 @@ void pa_kernel_lsc_prefetch_f16(
             b2dK.set_block_y(kv_pos % CMPA_BLOCK_SZ);
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
             #else
-            svmptr_t base_k_cache_ptr = k_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
+            half* base_k_cache_ptr = (half*)k_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
             auto kmatref = Kmat.format<half, kv_step, REG_K>();
+            #pragma unroll
             for(int kr = 0; kr < kv_step; kr++){
-                cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr * head_size), kmatref.row(kr));
+                cm_svm_block_read<half, REG_K>((svmptr_t)((half*)base_k_cache_ptr + kr * head_size), kmatref.row(kr));
             }
             #endif
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
@@ -421,8 +424,9 @@ void pa_kernel_lsc_prefetch_f16(
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
                 #else
+                #pragma unroll
                 for(int kr = 0; kr < kv_step; kr++){
-                    cm_svm_block_read<half, REG_K>((svmptr_t)(base_k_cache_ptr + kr * head_size + ri * REG_K), kmatref.row(kr));
+                    cm_svm_block_read<half, REG_K>((svmptr_t)((half*)base_k_cache_ptr + kr * head_size + ri * REG_K), kmatref.row(kr));
                 }
                 #endif
                 // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
@@ -441,13 +445,31 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
         if constexpr (use_causal_mask) {
+            #if kv_step == q_step
             // since kv_step == q_step == 16, causal_left is n * kv_step
-            // TODO: update for kv_step != q_step
             if (causal_left == 0) {
                 apply_causal_mask<1>(St);
             } else if (causal_left < 0) {
                 St = -3.4e38f;
             }
+            #else
+            if (causal_left == 0) {
+                // q_step is half of kv_step
+                apply_causal_mask<1>(St.select<q_step, 1, q_step, 1>(0, 0));
+                St.select<q_step, 1, q_step, 1>(q_step, 0) = -3.4e38f;
+            } else if (causal_left < 0) {
+                St = -3.4e38f;
+            }
+            // } else if (causal_left < kv_step) {
+                // q_step is half of kv_step
+                // mask half of the kv
+                // below code also meet IGC: Internal Compiler Error: Access violation
+                // constexpr int num_Q_tiles = kv_step / q_step;
+                // auto St_ref = St.format<float, num_Q_tiles, q_step * q_step>();
+                // auto sub_matrix = St_ref.row(1).format<float, REG_N, REG_N>();
+                // apply_causal_mask<1>(sub_matrix);
+            // }
+            #endif
             causal_left -= kv_step;
         } else {
             int kv_tokens = kv_stop - kv_pos;
@@ -455,7 +477,7 @@ void pa_kernel_lsc_prefetch_f16(
             for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         }
 
-        //show(St);
+        // show(St);
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
@@ -474,7 +496,7 @@ void pa_kernel_lsc_prefetch_f16(
         matrix<half, REG_K/2, REG_N*2> Vmat;
         #if !USE_LSC
         matrix<half, REG_K, REG_N> Vmat_tmp;
-        svmptr_t base_v_cache_ptr = v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
+        half* base_v_cache_ptr = (half*)v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
         #endif
         #pragma unroll
         for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
@@ -482,8 +504,9 @@ void pa_kernel_lsc_prefetch_f16(
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
             cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
+            #pragma unroll
             for(int Vr = 0; Vr < REG_K; Vr++){
-                cm_svm_block_read<half, REG_N>((svmptr_t)(base_v_cache_ptr + k + Vr * head_size), Vmat_tmp.row(Vr));
+                cm_svm_block_read<half, REG_N>((svmptr_t)((half*)base_v_cache_ptr + k + Vr * head_size), Vmat_tmp.row(Vr));
             }
             // vnni transform from Vmatref to Vmat
             Vmat.select<REG_K/2, 1, REG_N, 2>(0, 0) = Vmat_tmp.select<REG_K/2, 2, REG_N, 1>(0, 0);
@@ -526,7 +549,6 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
     }
-    if (q_tokens_left == 0) return;
 
     //# save cur_O/cur_sum.transpose(0, 1)
     matrix<half, num_P_tiles * REG_M, REG_N> cur_O_f16;
@@ -550,10 +572,11 @@ void pa_kernel_lsc_prefetch_f16(
             #if USE_LSC
             cm_store(b2dO.set_block_y(p * REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p));
             #else
-            svmptr_t output_ptr = o_base + p * REG_M * head_size + k;
+            half* output_ptr = (half*)o_base + p * REG_M * head_size + k;
             auto cur_O_ref = cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p).format<half, REG_M, REG_N>();
+            #pragma unroll
             for(int r = 0; r < REG_M; r++) {
-                cm_svm_block_write(output_ptr + r * head_size, cur_O_ref.row(r));
+                cm_svm_block_write<half, REG_N>((svmptr_t)((half*)output_ptr + r * head_size), cur_O_ref.row(r).format<half>());
             }
             #endif
         }
