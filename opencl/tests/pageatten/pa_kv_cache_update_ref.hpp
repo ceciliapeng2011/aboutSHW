@@ -1,26 +1,37 @@
-/*******************************************************************************
- * pa_kv_cache_update with optional SLM staging
- *   -DUSE_SLM=1 (default): stage prefill rows in SLM to avoid double DDR traffic
- *   -DUSE_SLM=0          : pure DDR path (safe fallback)
- ******************************************************************************/
+
+/*
+ * Copyright (c) 2020-2025, Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
 #include <cm/cm.h>
 #include <cm/cmtl.h>
 
-// ===== Incremental decode & statistics feature switches (can be overridden via build options) =====
+#ifndef ATTR
+#define ATTR [[type("svmptr_t")]]
+#define ATTR_BUF [[type("buffer_t")]]
+#endif
+
 #ifndef ENABLE_KV_CACHE_INCREMENTAL_DECODE
 #define ENABLE_KV_CACHE_INCREMENTAL_DECODE 1
 #endif
-#ifndef ENABLE_KV_CACHE_STATS
-#define ENABLE_KV_CACHE_STATS 0
-#endif
 
-#if ENABLE_KV_CACHE_STATS
-// Fallback non-atomic accumulation (indices are unique per (phys_block, head) in our usage)
-#define STAT_ADD_U32(buf, idx, val) (buf)[(idx)] += (val)
-#define STAT_ADD_F32(buf, idx, val) (buf)[(idx)] += (val)
-#endif
-
-// ==================== Compile-time switches ====================
 #ifndef USE_SLM
 #define USE_SLM 0
 #endif
@@ -39,15 +50,14 @@
     #define ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE (PAGED_ATTENTION_BLOCK_SIZE + COMP_BYTES_TOTAL)
 #endif
 
-#define SLM_RESERVE_BYTES (PAGED_ATTENTION_BLOCK_SIZE * K_HEAD_SIZE * sizeof(half))
-
 #if USE_SLM
-  #define GENX_ENTRY _GENX_MAIN_WITH_SLM(SLM_RESERVE_BYTES)
+    #define SLM_RESERVE_BYTES (PAGED_ATTENTION_BLOCK_SIZE * K_HEAD_SIZE * sizeof(half))
+    #define GENX_ENTRY _GENX_MAIN_WITH_SLM(SLM_RESERVE_BYTES)
 #else
   #define GENX_ENTRY _GENX_MAIN_
 #endif
 
-// ==================== utils ====================
+#if KV_CACHE_COMPRESSION_PER_CHANNEL
 CM_INLINE bool is_decode_block_leader(uint block_idx_in_seq, uint token_pos_in_blk, uint past_len) {
     const uint B  = PAGED_ATTENTION_BLOCK_SIZE;
     const uint sb = past_len / B;
@@ -67,15 +77,6 @@ CM_INLINE void compute_group_comp(half vmin_h, half vmax_h, half& scale_inv_out,
     const float zp_f    = -float(vmin_h) * scale_f;
     scale_inv_out = half(1.0f / scale_f);
     zp_out        = half(zp_f);
-}
-
-#if ENABLE_KV_CACHE_STATS
-template<int N>
-CM_INLINE half hsum_half(vector<half,N> v) {
-    half s = half(0.0f);
-    #pragma unroll
-    for (int i = 0; i < N; ++i) s += v(i);
-    return s;
 }
 #endif
 
@@ -136,13 +137,6 @@ void pa_kv_cache_update(const half* key [[type("svmptr_t")]],
                         const int32_t* blocked_indexes_end [[type("svmptr_t")]],
                         const int32_t* gws_seq_indexes_correspondence [[type("svmptr_t")]],
                         const int is_prefill_stage
-#if ENABLE_KV_CACHE_STATS
-                        , uint32_t* stat_inc_blocks        [[type("svmptr_t")]]
-                        , uint32_t* stat_full_blocks       [[type("svmptr_t")]]
-                        , uint32_t* stat_expanded_groups   [[type("svmptr_t")]]
-                        , float*    stat_inc_max_abs_err   [[type("svmptr_t")]]
-                        , float*    stat_inc_mse_acc       [[type("svmptr_t")]]
-#endif
                         ) {
 
 #if USE_SLM
@@ -371,31 +365,10 @@ void pa_kv_cache_update(const half* key [[type("svmptr_t")]],
                         vector<half, GROUP_SIZE> acc = cm_mul<half>(grp, half(1.0f / (float)s_inv)) + zp; // v * scale + zp with scale = 1/s_inv
                         vector<uchar, GROUP_SIZE> q  = cm_rnde<uchar, GROUP_SIZE>(acc);
                         cm_ptr_store<uint32_t, GROUP_SIZE/4>((uint32_t*)((uchar*)key_cache + row_bytes_try + h_beg), 0, q.format<uint32_t>());
-#if ENABLE_KV_CACHE_STATS
-                        // Error statistics (dequant vs original half)
-                        vector<half, GROUP_SIZE> deq = cm_mul<half>(((vector<half, GROUP_SIZE>)q - zp), s_inv);
-                        vector<half, GROUP_SIZE> diff = deq - grp;
-                        half max_abs = cm_reduced_max<half>(cm_abs(diff));
-                        vector<half, GROUP_SIZE> sq = cm_mul<half>(diff, diff);
-                        half mse_part = hsum_half(sq) / half((float)GROUP_SIZE);
-                        const uint stat_idx = (phys_block * KV_HEADS_NUM + head_idx);
-                        STAT_ADD_F32(stat_inc_max_abs_err, stat_idx, (float)max_abs);
-                        STAT_ADD_F32(stat_inc_mse_acc, stat_idx, (float)mse_part);
-#endif
                     }
-#if ENABLE_KV_CACHE_STATS
-                    STAT_ADD_U32(stat_inc_blocks, (phys_block * KV_HEADS_NUM + head_idx), 1u);
-#endif
                     // Skip full-block recompute path
                     goto BY_CHANNEL_VALUE_PATH;
                 }
-#if ENABLE_KV_CACHE_STATS
-                // Record expansion intent before falling back
-                const uint stat_idx_fb = (phys_block * KV_HEADS_NUM + head_idx);
-                STAT_ADD_U32(stat_full_blocks, stat_idx_fb, 1u);
-                #pragma unroll
-                for (uint g = 0; g < GROUP_NUM; ++g) if (group_expand(g)) STAT_ADD_U32(stat_expanded_groups, stat_idx_fb, 1u);
-#endif
             }
 #endif // ENABLE_KV_CACHE_INCREMENTAL_DECODE
             const uint total_tokens = past_len + new_tokens_total;
@@ -504,10 +477,6 @@ void pa_kv_cache_update(const half* key [[type("svmptr_t")]],
                 comp_new[0] = scale_inv_g(g);
                 comp_new[1] = zp_g(g);
             }
-#if ENABLE_KV_CACHE_STATS && ENABLE_KV_CACHE_INCREMENTAL_DECODE
-            // Full-block without prior incremental success (if incremental disabled, these counters remain zero unless recorded earlier)
-            STAT_ADD_U32(stat_full_blocks, (phys_block * KV_HEADS_NUM + head_idx), 1u);
-#endif
         }
 #else
         const uint block_k_base_offset =
