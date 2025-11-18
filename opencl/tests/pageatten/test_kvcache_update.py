@@ -3,6 +3,7 @@ import time
 import math
 
 from numpy import diff
+import numpy as np
 import torch
 import functools
 
@@ -11,6 +12,9 @@ from clops import compare
 from clops.utils import Colors
 
 kv_cache_compression_enabled = 1
+kv_cache_compression_by_channel = 1  # 0 = by-token, 1 = by-channel
+test_group_num = 4
+ENABLE_INCREMENTAL_DECODE = True     # passes -DENABLE_KV_CACHE_INCREMENTAL_DECODE=1
 
 class pa_kvcache_update_cm:
     def __init__(self, num_kv_heads, k_head_size, v_head_size, block_size):
@@ -32,18 +36,30 @@ class pa_kvcache_update_cm:
             adjusted_v_head_size = v_head_size
 
         jit_option = '-abortonspill -noschedule '
-        self.kernels = cl.kernels(src,
-                      (f' -cmc -Qxcm_jit_option="{jit_option}" -Qxcm_register_file_size=256 -mCM_printregusage -I{cwd}'
-                      f" -DKV_HEADS_NUM={num_kv_heads}"
-                      f" -DK_HEAD_SIZE={k_head_size}"
-                      f" -DV_HEAD_SIZE={v_head_size}"
-                      f" -DADJUSTED_K_HEAD_SIZE={adjusted_k_head_size}"
-                      f" -DADJUSTED_V_HEAD_SIZE={adjusted_v_head_size}"
-                      f" -DPAGED_ATTENTION_BLOCK_SIZE={self.block_size}"
-                      f" -DWG_SIZE={self.wg_size}"
-                      f" -DKV_CACHE_COMPRESSION_PER_TOKEN={kv_cache_compression_enabled}"
-                      f" -mdump_asm -g2")
-                    )
+        if kv_cache_compression_enabled and kv_cache_compression_by_channel:
+            compression_flag = " -DKV_CACHE_COMPRESSION_PER_CHANNEL=1"
+        elif kv_cache_compression_enabled:
+            compression_flag = " -DKV_CACHE_COMPRESSION_PER_TOKEN=1"
+        else:
+            compression_flag = ""
+
+        incr_flag  = " -DENABLE_KV_CACHE_INCREMENTAL_DECODE=1" if (kv_cache_compression_by_channel and ENABLE_INCREMENTAL_DECODE) else " -DENABLE_KV_CACHE_INCREMENTAL_DECODE=0"
+        print("incr_flag: ", incr_flag)
+        self.kernels = cl.kernels(
+            src,
+            (f' -cmc -Qxcm_jit_option="{jit_option}" -Qxcm_register_file_size=256 -mCM_printregusage -I{cwd}'
+             f" -DKV_HEADS_NUM={num_kv_heads}"
+             f" -DK_HEAD_SIZE={k_head_size}"
+             f" -DV_HEAD_SIZE={v_head_size}"
+             f" -DADJUSTED_K_HEAD_SIZE={adjusted_k_head_size}"
+             f" -DADJUSTED_V_HEAD_SIZE={adjusted_v_head_size}"
+             f" -DPAGED_ATTENTION_BLOCK_SIZE={self.block_size}"
+             f" -DWG_SIZE={self.wg_size}"
+             f" -DGROUP_NUM={test_group_num}"
+             f"{compression_flag}"
+             f"{incr_flag}"
+             f" -mdump_asm -g2")
+        )
 
     def __call__(self, key:torch.Tensor,
                  value:torch.Tensor,
@@ -58,14 +74,10 @@ class pa_kvcache_update_cm:
         batch_size_in_sequences = len(past_lens)
         key_pitch = key.stride()[0]
         val_pitch = value.stride()[0]
-        # print(f"============ {key.shape=} {key.is_contiguous()=}")
-        # print(f"============ {value.shape=} {value.is_contiguous()=}")
-        # print(f"============ {batch_size_in_tokens=} {batch_size_in_sequences=}")
-        # print(f"============ {key.stride()=} {value.stride()=}")
 
         t_key = cl.tensor(key.to(torch.float16).detach().numpy())
         t_value = cl.tensor(value.to(torch.float16).detach().numpy())
-        
+
         if kv_cache_compression_enabled:
             kv_cache_type = torch.uint8
         else:
@@ -78,25 +90,73 @@ class pa_kvcache_update_cm:
         t_block_indices_begins=cl.tensor(torch.tensor(block_indices_begins).to(torch.int32).detach().numpy())
         t_subsequence_begins=cl.tensor(torch.tensor(subsequence_begins).to(torch.int32).detach().numpy())
 
-        wg_count = (batch_size_in_tokens + self.wg_size - 1) // self.wg_size
-        GWS = [1, self.num_kv_heads, int(wg_count * self.wg_size)]
-        LWS = [1, 1, self.wg_size]
+        is_prefill_stage = 1 if all(p == 0 for p in past_lens) else 0
+        # print(f'{Colors.GREEN} pa_kv_cache_update: {is_prefill_stage=}, {past_lens=} {subsequence_begins=} {block_indices_begins=} {block_indices=} {Colors.END}')
+
+        if is_prefill_stage:
+            prefill_block_records = []  # list of (seq_idx, phys_block_id, global_start, global_end)
+            for seq_idx in range(batch_size_in_sequences):
+                new_tokens = subsequence_begins[seq_idx+1] - subsequence_begins[seq_idx]
+                if new_tokens == 0:
+                    continue
+                seq_begin = subsequence_begins[seq_idx]
+                required_blocks = (new_tokens + self.block_size - 1) // self.block_size
+                seq_block_indices_begin = block_indices_begins[seq_idx]
+                for lb in range(required_blocks):
+                    global_start = seq_begin + lb * self.block_size
+                    global_end   = min(seq_begin + new_tokens, global_start + self.block_size)
+                    phys_block_id = block_indices[seq_block_indices_begin + lb]
+                    prefill_block_records.append((seq_idx, int(phys_block_id), int(global_start), int(global_end)))
+
+            if len(prefill_block_records) == 0:
+                is_prefill_stage = 0
+                prefill_blocks = 0
+                t_blocked_indexes_start          = cl.tensor(torch.zeros(1, dtype=torch.int32).numpy())
+                t_blocked_indexes_end            = cl.tensor(torch.zeros(1, dtype=torch.int32).numpy())
+                t_gws_seq_indexes_correspondence = cl.tensor(torch.zeros(1, dtype=torch.int32).numpy())
+            else:
+                prefill_blocks = len(prefill_block_records)
+                arr_start = torch.tensor([rec[2] for rec in prefill_block_records], dtype=torch.int32)
+                arr_end   = torch.tensor([rec[3] for rec in prefill_block_records], dtype=torch.int32)
+                arr_seq   = torch.tensor([rec[0] for rec in prefill_block_records], dtype=torch.int32)
+                t_blocked_indexes_start          = cl.tensor(arr_start.numpy())
+                t_blocked_indexes_end            = cl.tensor(arr_end.numpy())
+                t_gws_seq_indexes_correspondence = cl.tensor(arr_seq.numpy())
+
+            GWS = [max(prefill_blocks, 1), self.num_kv_heads, 1]
+            LWS = [1, 1, 1]
+        else:
+            wg_count = (batch_size_in_tokens + self.wg_size - 1) // self.wg_size
+            GWS = [1, self.num_kv_heads, int(wg_count * self.wg_size)]
+            LWS = [1, 1, self.wg_size]
+            zero_i32 = torch.zeros(1, dtype=torch.int32)
+            t_blocked_indexes_start          = cl.tensor(zero_i32.numpy())
+            t_blocked_indexes_end            = cl.tensor(zero_i32.numpy())
+            t_gws_seq_indexes_correspondence = cl.tensor(zero_i32.numpy())
 
         for i in range(0, n_repeats):
-            print(f'{Colors.GREEN}calling pa_kv_cache_update {GWS=} {LWS=} {key_pitch=} {val_pitch=} {batch_size_in_sequences=} at {i}/{n_repeats} times {Colors.END}')
-            self.kernels.enqueue("pa_kv_cache_update", GWS, LWS, t_key, t_value,
-                            t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, 
-                            t_key_cache, t_value_cache,
-                            key_pitch, val_pitch, batch_size_in_sequences)
+            enqueue_args = [
+                "pa_kv_cache_update", GWS, LWS,
+                t_key, t_value,
+                t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins,
+                t_key_cache, t_value_cache,
+                key_pitch, val_pitch, batch_size_in_sequences,
+                t_blocked_indexes_start,
+                t_blocked_indexes_end,
+                t_gws_seq_indexes_correspondence,
+                int(is_prefill_stage)
+            ]
+            self.kernels.enqueue(*enqueue_args)
+
             ns = cl.finish()
-            for i, time_opt in enumerate(ns):
-                print(f'(pa_kv_cache_update)TPUT_{i}:[{key.numel()=}]+[{value.numel()=}] {time_opt*1e-3:,.0f} us')
+            for i_time, time_opt in enumerate(ns):
+                print(f'(pa_kv_cache_update)TPUT_{i_time}:[{key.numel()=}]+[{value.numel()=}] {time_opt*1e-3:,.0f} us')
                 if kv_cache_compression_enabled:
                     total_bytes = batch_size_in_tokens * self.num_kv_heads * (3 * self.k_head_size + 3 * self.v_head_size + 8)
                 else:
                     total_bytes = batch_size_in_tokens * self.num_kv_heads * (4 * self.k_head_size + 4 * self.v_head_size)
                 tput = total_bytes / time_opt
-                print(f'(pa_kv_cache_update)TPUT_{i}:[{total_bytes*1e-6:,} MB] {tput/1e3:,.2f} GB/s')
+                print(f'(pa_kv_cache_update)TPUT_{i_time}:[{total_bytes*1e-6:,} MB] {tput/1e3:,.2f} GB/s')
 
         return t_key_cache.numpy(), t_value_cache.numpy()
                     
@@ -104,6 +164,7 @@ class pa_kvcache_update_cm:
     @functools.cache
     def create_instance(num_kv_heads, k_head_size, v_head_size, block_size):
         return pa_kvcache_update_cm(num_kv_heads, k_head_size, v_head_size, block_size)
+
 
 def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_head_size=64, v_head_size=64, block_size=16, check_perf=False):   
     batch_size_in_sequences = len(num_tokens)
@@ -116,16 +177,19 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
     block_indices_begins = []    
     subsequence_begins.append(0)
     block_indices_begins.append(0)
+    full_lengths = []
     for i in range(batch_size_in_sequences):
         subsequence_length = num_tokens[i] + past_lens[i]
+        full_lengths.append(subsequence_length)
 
         k = torch.rand(subsequence_length, num_kv_heads*k_head_size).to(dtype=torch.float16)
         v = torch.rand(subsequence_length, num_kv_heads*v_head_size).to(dtype=torch.float16)
         key_data.append(k)
         value_data.append(v)
-        
+
         subsequence_start_pos = subsequence_begins[i]
-        subsequence_end_pos = subsequence_start_pos + num_tokens[i]
+        # Use full subsequence length (past + new) so kernel can load past tokens directly
+        subsequence_end_pos = subsequence_start_pos + subsequence_length
         subsequence_begins.append(subsequence_end_pos)
 
         required_blocks = (subsequence_length + block_size - 1) // block_size
@@ -149,16 +213,105 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
         batch_size_in_tokens = subsequence_begins[-1]
         mem = torch.zeros(batch_size_in_tokens, num_kv_heads*head_size).to(torch.float16)
         for i in range(batch_size_in_sequences):
-            mem[subsequence_begins[i] : subsequence_begins[i+1], :] = input_data[i][past_lens[i]:, :]
+            # Provide full (past + new) tokens to kernel; past_lens portion will be skipped by early return logic
+            mem[subsequence_begins[i] : subsequence_begins[i+1], :] = input_data[i][: full_lengths[i], :]
         return mem
     key = get_kv_input(num_kv_heads, k_head_size, key_data)
     value = get_kv_input(num_kv_heads, v_head_size, value_data)
+    # print(key)
     # print(f'{Colors.BLUE} ============ {key.shape=} {key.is_contiguous()=}" {Colors.END}')
     # print(f'{Colors.BLUE} ============ {value.shape=} {value.is_contiguous()=}" {Colors.END}')
     # print(f'{Colors.BLUE} {key_data=} {Colors.END}')
     # print(f'{Colors.BLUE} {key=} {Colors.END}')
     # print(f'{Colors.BLUE} {value_data=} {Colors.END}')
     # print(f'{Colors.BLUE} {value=} {Colors.END}')
+
+    def round_to_nearest_even(x):
+        floor_x = torch.floor(x)
+        frac = x - floor_x
+        is_half = frac == 0.5
+        return torch.where(
+            is_half,
+            floor_x + ((floor_x % 2) == 1).to(x.dtype),
+            torch.round(x)
+        )
+
+    def quant_per_channel_cm_layout_exact(kv: torch.Tensor, group_num: int = 1):
+        assert kv.dtype == torch.float16
+        B,H,T,C = kv.shape
+        assert C % group_num == 0
+        G   = group_num
+        GSZ = C // G
+
+        kv_f32 = kv.to(torch.float32)
+        q_all = torch.empty((B,H,T,C), dtype=torch.int8, device=kv.device)
+        comp_bytes = torch.empty((B,H, 4*G), dtype=torch.uint8, device=kv.device)
+
+        for g in range(G):
+            c0, c1 = g*GSZ, (g+1)*GSZ
+            blk = kv_f32[..., c0:c1]                           # [B,H,T,GSZ]
+
+            vmin = blk.amin(dim=(2,3), keepdim=True)           # [B,H,1,1]
+            vmax = blk.amax(dim=(2,3), keepdim=True)           # [B,H,1,1]
+            rng  = vmax - vmin
+            min_rng = vmax.abs() * 0.1
+            rng  = torch.where(rng <= min_rng,
+                            rng + torch.maximum(min_rng, torch.tensor(1.0, device=kv.device)),
+                            rng)
+            scale = 255.0 / rng                                # [B,H,1,1]
+            zp    = -vmin * scale                              # [B,H,1,1]
+            # q = torch.floor(blk * scale + zp + 0.5).clamp(0,255).to(torch.uint8)  # [B,H,T,GSZ]
+            q = round_to_nearest_even(blk * scale + zp).clamp(0, 255).to(torch.uint8)
+            q_all[..., c0:c1] = q.to(torch.int8)
+            scale_inv = (1.0/scale).to(torch.float16).view(B,H)   # [B,H]
+            zp_f16    = zp.to(torch.float16).view(B,H)            # [B,H]
+            comp_pair = torch.stack([scale_inv, zp_f16], dim=-1)  # [B,H,2]
+            comp_u8   = comp_pair.view(torch.uint8)               # [B,H,4]
+            comp_bytes[..., 4*g:4*(g+1)] = comp_u8
+
+        data_bytes = q_all.view(torch.uint8).reshape(B,H, T*C)     # [B,H, T*C]
+        out = torch.cat([data_bytes, comp_bytes], dim=2)           # [B,H, T*C + 4*G]
+        return out
+
+    def get_kv_cache_ref_by_channel_cm_layout_exact(
+        num_blocks, block_size, num_kv_heads, head_size, input_data,
+        past_lens, block_indices, block_indices_begins, num_tokens,
+        group_num=1, skip_input=True
+    ):
+        """
+        output:
+            [num_blocks, num_kv_heads, block_size*head_size + 4*group_num]  (uint8)
+        """
+        per_head_bytes = block_size * head_size + 4 * group_num
+        out = torch.zeros(num_blocks, num_kv_heads, per_head_bytes, dtype=torch.uint8)
+
+        for seq_idx in range(len(input_data)):
+            process_len = past_lens[seq_idx] if skip_input else past_lens[seq_idx] + num_tokens[seq_idx]
+            if process_len == 0:
+                continue
+
+            blocks_num = (process_len + block_size - 1) // block_size
+            for b in range(blocks_num):
+                blk_len = process_len % block_size if b == blocks_num - 1 else block_size
+                if blk_len == 0: blk_len = block_size
+                blk_start, blk_end = b*block_size, b*block_size + blk_len
+
+                for h in range(num_kv_heads):
+                    kv_block = input_data[seq_idx][blk_start:blk_end, h*head_size:(h+1)*head_size].to(torch.float16)
+                    if blk_len < block_size:
+                        pad = torch.zeros(block_size - blk_len, head_size, dtype=torch.float16)
+                        kv_block = torch.cat([kv_block, pad], dim=0)
+
+                    kv_bhtc = kv_block.unsqueeze(0).unsqueeze(0)  # [1,1,T,C]
+                    packed  = quant_per_channel_cm_layout_exact(kv_bhtc, group_num=group_num)[0,0]  # [T*C + 4G]
+
+                    blk_pos = int(block_indices[int(block_indices_begins[seq_idx]) + b])
+                    out[blk_pos, h, :] = packed
+
+        return out
+
+
+
 
     def round_to_even(tensor):
         rounded = torch.floor(tensor + 0.5)
@@ -182,21 +335,7 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
         # kv_u8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         kv_u8 = round_to_even((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
 
-        # torch.set_printoptions(precision=6)
-        # print("kv_fp16:\n", kv.reshape(blk_num, kv_heads, blksz, k_head_size))
-        # print("kv_max:\n", kv_max.reshape(blk_num, kv_heads, -1))
-        # print("kv_min:\n", kv_min.reshape(blk_num, kv_heads, -1))
-        # print("kv_scale:\n", kv_scale.reshape(blk_num, kv_heads, -1))
-        # print("kv_scale_div:\n", kv_scale_div.reshape(blk_num, kv_heads, -1))
-        # print("kv_zp:\n", kv_zp.reshape(blk_num, kv_heads, -1))
-        # print("kv_quant_fp16:\n", (kv*kv_scale+kv_zp).reshape(blk_num, kv_heads, blksz, k_head_size))
-
-        # print("quant_scale =", (1.0/kv_scale).reshape(blk_num,kv_heads,-1))
-        # print("quant_zp    =", kv_zp.reshape(blk_num,kv_heads,-1))
-
         dq_scale = kv_scale_div.to(dtype=torch.half).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        # kv_scale = ((U8_RANGE)/qrange).to(dtype=torch.half)
-        # dq_scale = (kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         kv_zp = kv_zp.to(dtype=torch.half).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         if blksz < block_size:
             kv_pad = torch.zeros(blk_num, kv_heads, (block_size - blksz)*k_head_size).to(dtype=torch.uint8)
@@ -205,8 +344,6 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
             dq_scale = torch.cat((dq_scale, scale_zp_pad), dim=-1)
             kv_zp = torch.cat((kv_zp, scale_zp_pad), dim=-1)
 
-        # print("dq_scale: ", dq_scale)
-        # print("kz_zp: ", kv_zp)
         return torch.concat((kv_u8, dq_scale, kv_zp), dim=-1)
 
     # generate key_cache / value_cache
@@ -271,65 +408,206 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
                 print('scale: shape = ', block_head_scale.shape, '\n', block_head_scale.reshape(1,blk_size))
                 print('zp: shape = ', block_head_zp.shape, '\n', block_head_zp.reshape(1,blk_size))
 
-                # block_head_data_f16 = block_head_data.to(dtype=torch.float16)
-                # for i in range(blk_size):
-                #     block_head_data_f16[i,:] = (block_head_data_f16[i,:] - block_head_zp[i,0]) * block_head_scale[i,0]
-                # print('dequant_data_f16: shape = ', block_head_data_f16.shape, '\n', block_head_data_f16)
+    def compare_kcache(ref_cache, opt_cache,
+                    block_size, head_size,
+                    num_blocks, num_kv_heads,
+                    GROUP_NUM,
+                    by_channel,
+                    past_lens=None,
+                    num_tokens=None):
+        """
+        ref_cache, opt_cache: [B, H, bytes]  (uint8)
+        """
+        if not kv_cache_compression_enabled:
+            compare(ref_cache.detach().numpy(), opt_cache.detach().numpy())
+            return
+
+        if by_channel:
+            data_bytes = block_size * head_size
+            full_ref = ref_cache[:, :, :data_bytes].to(torch.int32)
+            full_opt = opt_cache[:, :, :data_bytes].to(torch.int32)
+
+            if past_lens is not None and num_tokens is not None:
+                new_rows_ref = []
+                new_rows_opt = []
+                for seq_idx in range(len(past_lens)):
+                    past_len_seq = int(past_lens[seq_idx])
+                    new_tok_seq  = int(num_tokens[seq_idx])
+                    if new_tok_seq == 0:
+                        continue
+                    total_tokens_seq = past_len_seq + new_tok_seq
+                    first_new = past_len_seq
+                    last_new_excl = total_tokens_seq
+                    new_start_blk = first_new // block_size
+                    new_end_blk   = (last_new_excl - 1) // block_size
+                    for lb in range(new_start_blk, new_end_blk + 1):
+                        phys_block = int(block_indices[int(block_indices_begins[seq_idx]) + lb])
+                        blk_token_beg = lb * block_size
+                        blk_token_end_excl = blk_token_beg + block_size
+                        local_beg = max(first_new, blk_token_beg) - blk_token_beg
+                        local_end = min(last_new_excl, blk_token_end_excl) - blk_token_beg
+                        for h in range(num_kv_heads):
+                            beg_bytes = local_beg * head_size
+                            end_bytes = local_end * head_size
+                            slice_ref = full_ref[phys_block, h, beg_bytes:end_bytes]
+                            slice_opt = full_opt[phys_block, h, beg_bytes:end_bytes]
+                            new_rows_ref.append(slice_ref)
+                            new_rows_opt.append(slice_opt)
+                if len(new_rows_ref) == 0:
+                    print('[WARN] no new rows extracted; nothing to compare.')
+                    return
+                cat_ref = torch.cat(new_rows_ref).to(torch.int32)
+                cat_opt = torch.cat(new_rows_opt).to(torch.int32)
+                compare(cat_ref.detach().numpy(), cat_opt.detach().numpy(), atol=1)
+            else:
+                compare(full_ref.detach().numpy(), full_opt.detach().numpy(), atol=1)
+            return
+        else:
+            def decode(cache):
+                data = cache[:, :, : block_size * head_size].to(torch.uint8)
+                return data.to(torch.int32)
+            ref = decode(ref_cache)
+            opt = decode(opt_cache)
+            compare(ref.detach().numpy(), opt.detach().numpy(), atol=1)
+
+            ref_comp = ref_cache[:,:, block_size*head_size :].view(torch.float16)
+            opt_comp = opt_cache[:,:, block_size*head_size :].view(torch.float16)
+            compare(ref_comp.detach().numpy(), opt_comp.detach().numpy(), atol=1e-3)
+            return
+
+
+
 
     if kv_cache_compression_enabled:
-        key_cache = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, k_head_size, key_data)
-        value_cache = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data)
+        if kv_cache_compression_by_channel:
+            GROUP_NUM = test_group_num
+            key_cache = get_kv_cache_ref_by_channel_cm_layout_exact(
+                num_blocks, block_size, num_kv_heads, k_head_size, key_data,
+                past_lens, block_indices, block_indices_begins, num_tokens,
+                group_num=GROUP_NUM, skip_input=True)
+            value_cache = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data)
+            key_cache_ref = get_kv_cache_ref_by_channel_cm_layout_exact(
+                num_blocks, block_size, num_kv_heads, k_head_size, key_data,
+                past_lens, block_indices, block_indices_begins, num_tokens,
+                group_num=GROUP_NUM, skip_input=False)
 
-        # generate reference key/value cache
-        key_cache_ref = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, k_head_size, key_data, False)
-        value_cache_ref = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data, False)
+            value_cache_ref = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data, False)
 
-        # print("key_f16 = ", key_data)
-        # print_kv_cache_u8(key_cache_ref, block_size, k_head_size, "key_cache_ref")
-        # print_kv_cache_u8(value_cache_ref, block_size, v_head_size, "value_cache_ref")
+            # ---- Reference debug: per-group vmin/vmax for first block & head 0 ----
+            try:
+                if num_kv_heads > 0 and num_blocks > 0:
+                    ref_block0_head0 = []  # list of token rows (full block_size or filled length)
+                    subseq_len_total = num_tokens[0] + past_lens[0]
+                    blk0_len = block_size if subseq_len_total >= block_size else subseq_len_total
+                    raw_tokens = key_data[0][:blk0_len, :k_head_size]  # [blk0_len, k_head_size]
+                    import torch as _torch
+                    raw_tokens_f32 = _torch.tensor(raw_tokens, dtype=_torch.float16).to(_torch.float32)
+                    GSZ = k_head_size // GROUP_NUM
+                    for g in range(GROUP_NUM):
+                        c0, c1 = g*GSZ, (g+1)*GSZ
+                        grp_vals = raw_tokens_f32[:, c0:c1]
+                        vmin = grp_vals.min().item()
+                        vmax = grp_vals.max().item()
+                        rng = vmax - vmin
+                        min_rng = abs(vmax) * 0.1
+                        rng_inflated = rng + (min_rng if min_rng > 1.0 else 1.0) if rng <= min_rng else rng
+                        scale_inv = rng_inflated / 255.0
+                        zp = -vmin * (255.0 / rng_inflated)
+                        # print(f"[REF-DBG] blk0 head0 grp{g}: vmin={vmin:.6f} vmax={vmax:.6f} diff={rng:.6f} min_rng={min_rng:.6f} scale_inv={scale_inv:.6f} zp={zp:.6f}")
+            except Exception as e:
+                print(f"[REF-DBG] exception gathering ref stats: {e}")
+        else:
+            key_cache = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, k_head_size, key_data)
+            value_cache = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data)
+
+            # generate reference key/value cache
+            key_cache_ref = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, k_head_size, key_data, False)
+            value_cache_ref = get_kv_cache_u8(num_blocks, block_size, num_kv_heads, v_head_size, value_data, False)
     else:
         key_cache = get_kv_cache(num_blocks, block_size, num_kv_heads, k_head_size, key_data)
         value_cache = get_kv_cache(num_blocks, block_size, num_kv_heads, v_head_size, value_data)
-        # print(f'{Colors.BLUE} ============ {key_cache.shape=} {key_cache.is_contiguous()=} {Colors.END}')
-        # print(f'{Colors.BLUE} ============ {value_cache.shape=} {value_cache.is_contiguous()=} {Colors.END}')
-        # print(f'{Colors.BLUE} {key_cache=} {Colors.END}')
-        # print(f'{Colors.BLUE} {value_cache=} {Colors.END}')
-
         # generate reference key/value cache
         key_cache_ref = get_kv_cache(num_blocks, block_size, num_kv_heads, k_head_size, key_data, False)
         value_cache_ref = get_kv_cache(num_blocks, block_size, num_kv_heads, v_head_size, value_data, False)
-        # print(f'{Colors.BLUE} ============ {key_cache_ref.shape=} {key_cache_ref.is_contiguous()=} {Colors.END}')
-        # print(f'{Colors.BLUE} ============ {value_cache_ref.shape=} {value_cache_ref.is_contiguous()=} {Colors.END}')
-        # print(f'{Colors.BLUE} {key_cache_ref=} {Colors.END}')
-        # print(f'{Colors.BLUE} {value_cache_ref=} {Colors.END}')
     
     # opt
     pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, block_size)
     n_repeats = 20 if check_perf else 1
     out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices, block_indices_begins, n_repeats)
 
-    # if kv_cache_compression_enabled:
-    #     out_key_cache = torch.tensor(out_key_cache)
-    #     out_value_cache = torch.tensor(out_value_cache)
-    #     print(f'{Colors.BLUE} ============ {out_key_cache.shape=} {out_key_cache.dtype} {Colors.END}')
-    #     print("out_key_cache: value = ", out_key_cache[:,:,:block_size * k_head_size].reshape(num_blocks, num_kv_heads, block_size, k_head_size))
-    #     print("out_key_cache: scale = ", out_key_cache[:,:,block_size * k_head_size : block_size * k_head_size + block_size * 2].reshape(num_blocks, num_kv_heads, 2 * block_size).view(dtype=torch.float16))
-    #     print("out_key_cache: zp = ", out_key_cache[:,:,block_size * k_head_size + block_size * 2 : block_size * k_head_size + block_size * 4].reshape(num_blocks, num_kv_heads, 2 * block_size).view(dtype=torch.float16))
-    #     print("out_value_cache = ", out_value_cache[:,:,:block_size * v_head_size].reshape(num_blocks, num_kv_heads, block_size, v_head_size))
-    #     out_key_cache = out_key_cache.detach().numpy()
-    #     out_value_cache = out_value_cache.detach().numpy()
-
-    # print(f"key_cache_ref = \n{key_cache_ref.reshape(num_blocks, num_kv_heads, block_size, k_head_size + 4)}")
-    # print(f"out_key_cache = \n{out_key_cache.reshape(num_blocks, num_kv_heads, block_size, k_head_size + 4)}")
-
     if kv_cache_compression_enabled:
         out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8)
         out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8)
-        compare(key_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_key_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(key_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
 
-        compare(value_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_value_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(value_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+        data_bytes = block_size * k_head_size
+        ref_data_region = key_cache_ref[:,:,:data_bytes]
+        opt_data_region = out_key_cache[:,:,:data_bytes]
+        masked_ref_preview = ref_data_region.clone()
+        masked_opt_preview = opt_data_region.clone()
+        if kv_cache_compression_by_channel and past_lens is not None and num_tokens is not None:
+            for seq_idx in range(len(past_lens)):
+                past_len_seq = int(past_lens[seq_idx]); new_tok_seq = int(num_tokens[seq_idx])
+                total_tokens_seq = past_len_seq + new_tok_seq
+                blocks_num_seq = (total_tokens_seq + block_size - 1) // block_size
+                for lb in range(blocks_num_seq):
+                    phys_block = int(block_indices[int(block_indices_begins[seq_idx]) + lb])
+                    blk_token_beg = lb * block_size
+                    blk_token_end_excl = min((lb + 1) * block_size, total_tokens_seq)
+                    hist_beg = blk_token_beg
+                    hist_end = min(blk_token_end_excl, past_len_seq)
+                    if hist_end > hist_beg:
+                        for h in range(num_kv_heads):
+                            beg_bytes = (hist_beg - blk_token_beg) * k_head_size
+                            end_bytes = (hist_end - blk_token_beg) * k_head_size
+                            masked_ref_preview[phys_block, h, beg_bytes:end_bytes] = 0
+                            masked_opt_preview[phys_block, h, beg_bytes:end_bytes] = 0
+                    if blk_token_end_excl < (lb + 1) * block_size:
+                        pad_beg_tok = blk_token_end_excl - blk_token_beg
+                        for h in range(num_kv_heads):
+                            beg_bytes = pad_beg_tok * k_head_size
+                            end_bytes = block_size * k_head_size
+                            masked_ref_preview[phys_block, h, beg_bytes:end_bytes] = 0
+                            masked_opt_preview[phys_block, h, beg_bytes:end_bytes] = 0
+        # diff = (masked_opt_preview.to(torch.int32) - masked_ref_preview.to(torch.int32))
+        # idx = torch.nonzero(diff, as_tuple=False)
+        # if idx.numel() > 0:
+        #     b,h,o = idx[0].tolist()
+        #     tok = o // k_head_size
+        #     ch  = o %  k_head_size
+        #     print(f'[DEBUG] (masked) first mismatch: blk={b}, head={h}, tok={tok}, ch={ch}, ref={int(masked_ref_preview[b,h,o])}, opt={int(masked_opt_preview[b,h,o])}')
+        #     lo = max(ch-8, 0); hi = min(ch+8, k_head_size-1)
+        #     print('[DEBUG] (masked) ref token window:', masked_ref_preview[b,h,tok*k_head_size + lo: tok*k_head_size + hi + 1])
+        #     print('[DEBUG] (masked) opt token window:', masked_opt_preview[b,h,tok*k_head_size + lo: tok*k_head_size + hi + 1])
+        #     # Dump comp params (scale_inv, zp) per group for the mismatching block/head
+        #     data_bytes_dbg = block_size * k_head_size
+        #     if kv_cache_compression_by_channel:
+        #         print('[DEBUG] comp params (scale_inv, zp) per group for ref vs opt:')
+        #         for g in range(test_group_num):
+        #             ref_comp_bytes = key_cache_ref[b, h, data_bytes_dbg + g*4 : data_bytes_dbg + (g+1)*4]
+        #             opt_comp_bytes = out_key_cache[b, h, data_bytes_dbg + g*4 : data_bytes_dbg + (g+1)*4]
+        #             ref_scale_inv, ref_zp = ref_comp_bytes.view(dtype=torch.float16).tolist()
+        #             opt_scale_inv, opt_zp = opt_comp_bytes.view(dtype=torch.float16).tolist()
+        #             print(f'  group {g}: ref(scale_inv={ref_scale_inv:.6f}, zp={ref_zp:.6f}) opt(scale_inv={opt_scale_inv:.6f}, zp={opt_zp:.6f})')
+        # else:
+        #     print('[DEBUG] no mismatch in masked new-token rows before compare_kcache')
+
+        compare_kcache(
+            key_cache_ref, out_key_cache,
+            block_size, k_head_size,
+            num_blocks, num_kv_heads,
+            1,
+            by_channel = kv_cache_compression_by_channel,
+            past_lens = past_lens,
+            num_tokens = num_tokens
+        )
+
+        compare_kcache(
+            value_cache_ref, out_value_cache,
+            block_size, v_head_size,
+            num_blocks, num_kv_heads,
+            1,
+            by_channel = kv_cache_compression_by_channel
+        )
     else:
         compare(key_cache_ref.detach().numpy(), out_key_cache)
         compare(value_cache_ref.detach().numpy(), out_value_cache)
@@ -340,15 +618,16 @@ if __name__ == "__main__":
     torch.set_printoptions(linewidth=1024)
     
     cl.profiling(True)
+
+    test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+    test_pa_kv_cache_update([64*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+    test_pa_kv_cache_update([128*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+    test_pa_kv_cache_update([32*1024], [4*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+    test_pa_kv_cache_update([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
     
-    # test_pa_kv_cache_update([1024, 16, 17], [16, 0, 1])
-    test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-    test_pa_kv_cache_update([64*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-    test_pa_kv_cache_update([128*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-    test_pa_kv_cache_update([32*1024], [4*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-    test_pa_kv_cache_update([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-    
-    test_pa_kv_cache_update([1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
-    # test_pa_kv_cache_update([1], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
-    # test_pa_kv_cache_update([1024], [0], num_kv_heads=2, k_head_size=16, v_head_size=16, block_size=32, check_perf=False)
-    # test_pa_kv_cache_update([129], [0], num_kv_heads=2, k_head_size=64, v_head_size=64, block_size=16, check_perf=True)
+    test_pa_kv_cache_update([1024*128], [1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+    test_pa_kv_cache_update([1023], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+    test_pa_kv_cache_update([256], [128], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=False)
+
+    # Added targeted mixed decode scenario: past_lens != 0 and new tokens not aligned to block boundary
+    # Expect debug counters (update_calls may still be 0 with current kernel logic) for inspection.
