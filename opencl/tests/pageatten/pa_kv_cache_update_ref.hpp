@@ -104,14 +104,14 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
                 scale_val = half(0.0);
                 zp_val = max_val;
             } else {
-                scale_val = 255.0 / (max_val - min_val);
-                zp_val = (0.0 - min_val) * scale_val;
+                scale_val = half(255.0) / (max_val - min_val);
+                zp_val    = (half(0.0) - min_val) * scale_val;
             }
             vector<half, K_HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
             vector<uchar, K_HEAD_SIZE> data_u8 = cm_rnde<uchar, K_HEAD_SIZE>(dequant_data);
             cm_ptr_store<uint32_t, K_HEAD_SIZE / 4>((uint32_t*)(out + out_offset + token_pos * K_HEAD_SIZE), 0, data_u8.format<uint32_t>());
             half *out_scale_zp = (half*)(out + scale_offset);
-            out_scale_zp[0] = (max_val - min_val) / 255.0;
+            out_scale_zp[0] = (max_val - min_val) / half(255.0);
             out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
     };
     #endif
