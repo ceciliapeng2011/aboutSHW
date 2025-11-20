@@ -559,8 +559,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
                         cm_svm_block_read<uint16_t, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint16_t>());
                     }
                     #if XE_ARCH==1
-                    // Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
-                    Kt = temp.format<half, REG_K, REG_N>();
+                    Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
                     #else
                     Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,0));
                     Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,8));
