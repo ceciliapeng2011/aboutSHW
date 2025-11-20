@@ -405,6 +405,7 @@ inline void prepackAsVNNIWidth2(matrix_ref<T1, K, N> input, matrix_ref<T2, K/2, 
 
 extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
     KV_ELEMENT_TYPE* key [[type("svmptr_t")]],
+    SurfaceIndex key_buffer [[type("buffer_t")]],
     int* past_lens [[type("svmptr_t")]],
     int* block_indices [[type("svmptr_t")]],
     int* block_indices_begins [[type("svmptr_t")]],
@@ -574,6 +575,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
                         cm_svm_block_read<uint, REG_K/2>((svmptr_t)(key_base + kk * kv_stride), temp[kk].format<uint>());
                         #elif load_mode == LOAD_BY_CM_PTR_LOAD
                         temp[kk] = cm_ptr_load<uint, REG_K/2>((const unsigned int *const)key_base, (kk * kv_stride) * sizeof(half));
+                        #elif load_mode == LOAD_BY_CM_READ
+                        temp[kk] = cm_load<uint, REG_K/2>(key_buffer, (cur_kv_offset + kk * kv_stride) * sizeof(half));
                         #elif load_mode == LOAD_BY_REF
                         vector<uint, REG_K/2> *v_ptr = (vector<uint, REG_K/2> *)(key_base + kk * kv_stride);
                         temp[kk] = *v_ptr;
@@ -626,6 +629,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
 cl.profiling(True)
 
 t_k = cl.tensor(k.contiguous().detach().numpy())
+t_k_buf = cl.tensor(k.contiguous().detach().numpy())
 t_past_lens = cl.tensor(past_lens.detach().numpy())
 t_block_indices = cl.tensor(block_indices.detach().numpy())
 t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
@@ -640,7 +644,7 @@ print("first call ...")
 if kv_partition_size * 2 == kv_block_size:
     print("Not support for now.")
 else:
-    cm_kernels.enqueue("cm_sdpa_2nd_loading", GWS, LWS, t_k,
+    cm_kernels.enqueue("cm_sdpa_2nd_loading", GWS, LWS, t_k, t_k_buf,
                        t_past_lens, t_block_indices, t_block_indices_begins,
                        t_subsequence_begins)
 
@@ -649,9 +653,9 @@ all_layers = []
 mem_size = 0
 print(k.shape)
 while len(all_layers) < loop_cnt and mem_size < 8e9:
-    t_k = cl.tensor(k.detach().numpy())
     all_layers.append([
-        t_k,
+        cl.tensor(k.detach().numpy()),
+        cl.tensor(k.detach().numpy()),
     ])
     mem_size += k.numel() * k.element_size()
 
@@ -659,6 +663,7 @@ for i in range(loop_cnt):
     j  = i % len(all_layers)
     cm_kernels.enqueue("cm_sdpa_2nd_loading", GWS, LWS,
                         all_layers[j][0],
+                        all_layers[j][1],
                         t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins)
 
 latency = cl.finish()
