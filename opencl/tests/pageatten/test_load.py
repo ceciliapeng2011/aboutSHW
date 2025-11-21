@@ -27,6 +27,7 @@ parser.add_argument('-hs', "--head-size", type=int, default=128)
 parser.add_argument('-rkv', "--reset_kv_cache", type=int, default=1)
 parser.add_argument('-v', "--verbose", type=int, default=-1)
 parser.add_argument('-lm', "--load-mode", type=int, default=1)
+parser.add_argument('-lk', "--load-key", type=int, default=1)
 args = parser.parse_args()
 print(args)
 
@@ -51,11 +52,13 @@ if load_mode_string == None:
     print("This load mode is not supproted.")
     exit(0)
 print(f"Load mode is {load_mode}: {load_mode_string}")
+load_key = args.load_key
+print(f"Load key: {load_key}")
 
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 0
+enable_kvcache_compression = 1
 kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
 
 def _validate_quant_mode(mode: str) -> str:
@@ -256,6 +259,7 @@ src1 = r'''
 // xe-1:8, xe-2:16
 #pyeval f"#define XE_ARCH {xe_arch}"
 #pyeval f"#define load_mode {load_mode}"
+#pyeval f"#define load_key {load_key}"
 
 #if XE_ARCH==1
 #define REG_N 8
@@ -403,7 +407,7 @@ inline void prepackAsVNNIWidth2(matrix_ref<T1, K, N> input, matrix_ref<T2, K/2, 
     #define KV_ELEMENT_TYPE half
 #endif
 
-extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
+extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading_key(
     KV_ELEMENT_TYPE* key [[type("svmptr_t")]],
     SurfaceIndex key_buffer [[type("buffer_t")]],
     int* past_lens [[type("svmptr_t")]],
@@ -513,6 +517,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
 
         vector<half, REG_N> sum = 0;
 
+
         for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
 
             #if KV_CACHE_COMPRESSION && KV_CACHE_COMPRESSION_BY_TOKEN
@@ -552,17 +557,26 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
                 #endif
             #else
                 #if KV_CACHE_COMPRESSION
-                    matrix<uint16_t, REG_N, REG_K/2> temp; // 8 x 8
-                    uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k * 4;
-                    #pragma unroll
-                    for(int kk = 0; kk < REG_N; kk++) {
-                        cm_svm_block_read<uint16_t, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint16_t>());
-                    }
-                    #if XE_ARCH==1
-                    Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
+                    #if load_key == 1
+                        // printf("load key is 1.\n");
+                        matrix<uint16_t, REG_N, REG_K/2> temp; // 8 x 8
+                        uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k * 4;
+                        #pragma unroll
+                        for(int kk = 0; kk < REG_N; kk++) {
+                            cm_svm_block_read<uint16_t, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint16_t>());
+                        }
+                        #if XE_ARCH==1
+                        Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
+                        #else
+                        Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,0));
+                        Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,8));
+                        #endif
                     #else
-                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,0));
-                    Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,8));
+                        uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k * 4;
+                        #pragma unroll
+                        for(int kk = 0; kk < REG_K; kk++) {
+                            cm_svm_block_read<uint8_t, REG_N>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), Kt_quant_temp[kk].format<uint8_t>());
+                        }
                     #endif
                 #else
                     matrix<uint, REG_N, REG_K/2> temp;
@@ -613,13 +627,189 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading(
                 }
                 #endif
             #endif
-            
+
             sum.select<REG_N, 1>(0) += Kt.row(0);
             sum.select<REG_N, 1>(0) += Kt.row(11);
             }
         }
 
         cm_svm_block_write<half, REG_N>((svmptr_t)(key + k_base_offset), sum.format<half>());
+    }
+}
+
+extern "C" _GENX_MAIN_ void cm_sdpa_2nd_loading_value(
+    KV_ELEMENT_TYPE* value [[type("svmptr_t")]],
+    SurfaceIndex value_buffer [[type("buffer_t")]],
+    int* past_lens [[type("svmptr_t")]],
+    int* block_indices [[type("svmptr_t")]],
+    int* block_indices_begins [[type("svmptr_t")]],
+    int* subsequence_begins [[type("svmptr_t")]]
+    ) {
+    //# batch=1, seq_num=1 or >1
+    //#   key [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
+
+    //# KV_PARTITION_SIZE should be multiple of kv_block_size(KV_BLOCK_SIZE)
+    //# kv_len dimision will be split into multiple partitions, each WG process a partition
+    //# total_partitions_num = kv_len // KV_PARTITION_SIZE
+    //# GWS=[seq_num, num_kv_heads, total_partitions_num]
+    //# LWS=[1, 1, 1]
+
+    //# Each WG processes a partition, which is KV_PARTITION_SIZE long and multiple of KV_BLOCK_SIZE.
+    //# KV_BLOCK_SIZE can be 32/64/128/256, etc.
+    const auto seq_idx = cm_global_id(0);
+    const auto kv_head_num_idx = cm_global_id(1);
+    const auto head_num_idx = kv_head_num_idx * (HEADS_NUM/KV_HEADS_NUM);
+    //# KV_PARTITION_SIZE --> EU thread
+    const auto wg_thread_id = cm_global_id(2);
+    const uint kv_partition_num = cm_group_count(2);
+    const uint kv_partition_idx = cm_group_id(2);
+
+    const uint kv_len = past_lens[seq_idx] + 1;
+    // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
+    const uint start_block_idx = block_indices_begins[seq_idx] + kv_partition_idx * (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
+
+    if(kv_partition_idx * KV_PARTITION_SIZE > kv_len) {
+        // printf("WG exit: kv_partition_idx=%d, KV_PARTITION_SIZE=%d, kv_len=%d\n", kv_partition_idx, KV_PARTITION_SIZE, kv_len);
+        return;
+    }
+    const uint total_blocks_num = (kv_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
+
+    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #if KV_CACHE_COMPRESSION_BY_TOKEN
+        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #else
+        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #endif
+    uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
+
+    uint leftover_size = 0;
+    if(kv_partition_idx == kv_partition_num - 1) {
+        // last partition
+        leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
+    }
+    if(block_num > total_blocks_num - start_block_idx) {
+        block_num = total_blocks_num - start_block_idx;
+    }
+    vector<half, REG_K> sum = 0;
+    #pragma unroll
+    for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+        uint blk_indices = block_indices[start_block_idx + block_idx];
+        uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+        uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
+
+    #if USE_LSC_BLOCK_2D_DESC
+        #if KV_CACHE_COMPRESSION
+        lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+        #else
+        lsc::block_2d_desc<half, 1, REG_K, REG_N>   b2dV(value + v_base_offset,  KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
+        #endif
+    #else
+        uint kv_offset = v_base_offset;
+        uint kv_stride = HEAD_SIZE;
+        uint kv_x0 = 0, kv_y0 = 0;
+        uint kv_x1 = HEAD_SIZE*sizeof(half);
+        uint kv_y1 = KV_BLOCK_SIZE;
+    #endif
+
+        uint kv_pos_end = KV_BLOCK_SIZE;
+        if(block_idx == block_num - 1 && leftover_size > 0) {
+            kv_pos_end = leftover_size % KV_BLOCK_SIZE;
+            if(kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
+        }
+
+        #if KV_CACHE_COMPRESSION
+            // load scale/zp
+            vector<half, KV_BLOCK_SIZE> scale_vec;
+            vector<half, KV_BLOCK_SIZE> zp_vec;
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset), scale_vec);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+            if(kv_pos_end < KV_BLOCK_SIZE) {
+                // fill leftover with last valid scale/zp
+                for(int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
+                    scale_vec[i] = 0.0;
+                    zp_vec[i] = 0.0;
+                }
+            }
+        #endif
+        #pragma unroll
+        for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K, ki++) {
+
+            #if KV_CACHE_COMPRESSION
+            vector<half, REG_K> temp_scale = scale_vec.select<REG_K, 1>(kv_pos);
+            vector<half, REG_K> temp_zp = zp_vec.select<REG_K, 1>(kv_pos);
+            #endif
+            #pragma unroll
+            for(int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri ++ ) {
+                // Load V into register & pack as VNNI(as dpas-B tile)
+                matrix<half, REG_K, REG_N> VmatNormal;
+                matrix<half, REG_M, REG_K*REG_N> Vmat;
+                #if KV_CACHE_COMPRESSION
+                    matrix<uint8_t, REG_K, REG_N> Vt_quant;
+                #endif
+            #if USE_LSC_BLOCK_2D_DESC
+                b2dV.set_block_x(k); // x is the column index
+                #if KV_CACHE_COMPRESSION
+                    cm_load<lsc::Normal>(Vt_quant.format<uint8_t>(), b2dV.set_block_y(kv_pos));
+                #else
+                    cm_load<lsc::VNNI>(Vmat[0].format<half>(), b2dV.set_block_y(kv_pos)); // y is the row index
+                #endif
+            #else
+                #if KV_CACHE_COMPRESSION
+                    uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k;
+                    #pragma unroll
+                    for(int kk = 0; kk < REG_K; kk++) {
+                        cm_svm_block_read<uint8_t, REG_N>((svmptr_t)(value + cur_kv_offset + kk * kv_stride), Vt_quant[kk].format<uint8_t>());
+                    }
+                #else
+                    matrix<half, REG_K, REG_N> temp;
+                    uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k;
+                    #pragma unroll
+                    for(int kk = 0; kk < REG_K; kk++) {
+                        cm_svm_block_read<half, REG_N>((svmptr_t)(value + cur_kv_offset + kk * kv_stride), temp[kk].format<half>());
+                    }
+                    auto Vref = Vmat[0].format<half, REG_K/2, 2*REG_N>();
+                    Vref.select<REG_K/2, 1, REG_N, 2>(0, 0) = temp.select<REG_K/2, 2, REG_N, 1>(0, 0);
+                    Vref.select<REG_K/2, 1, REG_N, 2>(0, 1) = temp.select<REG_K/2, 2, REG_N, 1>(1, 0);
+                #endif
+            #endif
+            
+            #if KV_CACHE_COMPRESSION
+                #pragma unroll
+                for(int r = 0; r < REG_K; r++) {
+                    VmatNormal[r] = Vt_quant[r] - temp_zp[r]; // vector - scalar
+                    VmatNormal[r] = cm_mul<half>(VmatNormal[r], temp_scale[r]); // vector * scalar
+                }
+                if(kv_pos_end - kv_pos < KV_STEP) {
+                    #pragma unroll
+                    for(int r = kv_pos_end; r < KV_STEP; r++)  {
+                        VmatNormal[r] = 0;
+                    }
+                }
+                prepackAsVNNIWidth2(VmatNormal, Vmat.format<half, REG_K/2, REG_N*2>());
+            #endif
+
+            // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+            #if CLEAN_UNUSED_KVCACHE
+                if(kv_pos_end - kv_pos < KV_STEP) {
+                    auto VmatRef = Vmat[0].format<half, REG_K/2, REG_N*2>();
+                    uint valid_rows = kv_pos_end - kv_pos;
+                    uint valid_rows_vnni = (valid_rows+1)/2;
+                    for (int r = valid_rows_vnni; r < REG_K/2; r++) {
+                        VmatRef.row(r) = 0.0f;
+                    }
+                    if (valid_rows % 2 == 1) {
+                        VmatRef.row(valid_rows_vnni-1).select<REG_N, 2>(1) = 0.0f;
+                    }
+                }
+            #endif
+
+            sum.select<REG_K, 1>(0) += Vmat[0].format<half, REG_K, REG_N>().column(0);
+            sum.select<REG_K, 1>(0) += Vmat[0].format<half, REG_K, REG_N>().column(5);
+            }
+        }
+
+        cm_svm_block_write<half, REG_K>((svmptr_t)(value + v_base_offset), sum.format<half>());
     }
 }
 
@@ -643,11 +833,16 @@ print("first call ...")
 if kv_partition_size * 2 == kv_block_size:
     print("Not support for now.")
 else:
-    cm_kernels.enqueue("cm_sdpa_2nd_loading", GWS, LWS, t_k, t_k_buf,
-                       t_past_lens, t_block_indices, t_block_indices_begins,
-                       t_subsequence_begins)
+    if load_key:
+        cm_kernels.enqueue("cm_sdpa_2nd_loading_key", GWS, LWS, t_k, t_k_buf,
+                           t_past_lens, t_block_indices, t_block_indices_begins,
+                           t_subsequence_begins)
+    else:
+        cm_kernels.enqueue("cm_sdpa_2nd_loading_value", GWS, LWS, t_k, t_k_buf,
+                           t_past_lens, t_block_indices, t_block_indices_begins,
+                           t_subsequence_begins)
 
-loop_cnt = 100
+loop_cnt = 50
 all_layers = []
 mem_size = 0
 print(k.shape)
@@ -660,10 +855,16 @@ while len(all_layers) < loop_cnt and mem_size < 8e9:
 
 for i in range(loop_cnt):
     j  = i % len(all_layers)
-    cm_kernels.enqueue("cm_sdpa_2nd_loading", GWS, LWS,
-                        all_layers[j][0],
-                        all_layers[j][1],
-                        t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins)
+    if load_key == 1:
+        cm_kernels.enqueue("cm_sdpa_2nd_loading_key", GWS, LWS,
+                            all_layers[j][0],
+                            all_layers[j][1],
+                            t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins)
+    else:
+        cm_kernels.enqueue("cm_sdpa_2nd_loading_value", GWS, LWS,
+                            all_layers[j][0],
+                            all_layers[j][1],
+                            t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins)
 
 latency = cl.finish()
 # only load k for loading speed test
@@ -674,10 +875,10 @@ else:
 
 kvcache_loading_total_time=0
 num_runs = 0
-for ns in latency:
+for idx, ns in enumerate(latency):
     kvcache_loading_total_time += ns
     num_runs += 1
-    print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
+    print(f" iter [{idx}] {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
 
 print()
 print("kvcache_loading_total_time = ", kvcache_loading_total_time*1e-6, "ms")
