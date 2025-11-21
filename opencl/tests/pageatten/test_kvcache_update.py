@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import numpy as np
 
 from numpy import diff
 import torch
@@ -54,6 +55,7 @@ class pa_kvcache_update_cm:
                 block_indices:list,
                 block_indices_begins:list,
                 n_repeats = 1):
+        tput_records = []
         batch_size_in_tokens, _ = key.shape
         batch_size_in_sequences = len(past_lens)
         key_pitch = key.stride()[0]
@@ -98,7 +100,31 @@ class pa_kvcache_update_cm:
                 else:
                     total_bytes = batch_size_in_tokens * self.num_kv_heads * (4 * self.k_head_size + 4 * self.v_head_size)
                 tput = total_bytes / time_opt
+                tput_records.append(tput)
                 print(f'(pa_kv_cache_update)TPUT_{i}:[{total_bytes*1e-6:,} MB] {tput:,.2f} GB/s')
+
+        if len(tput_records) > 5:
+            vals = np.array(tput_records)
+            start_check = 3
+            start_idx = None
+
+            for i in range(start_check, len(vals) - 2):
+                if (abs(vals[i] - vals[i-1]) / vals[i-1] < 0.05 and
+                    abs(vals[i+1] - vals[i])   / vals[i]   < 0.05 and
+                    abs(vals[i+2] - vals[i+1]) / vals[i+1] < 0.05):
+                    start_idx = i
+                    break
+
+            if start_idx is None:
+                start_idx = 5
+
+            stable_vals = vals[start_idx:]
+            print(f"\n[Perf Analyzer] Starting point of stable interval = {start_idx}/{len(vals)}")
+            print(f"[Perf Analyzer] sample size = {len(stable_vals)}")
+            print(f"[Perf Analyzer] Stable Mean = {stable_vals.mean():.2f} GB/s")
+            print(f"[Perf Analyzer] Std = {stable_vals.std():.2f} GB/s\n")
+        else:
+            print("[Perf Analyzer] too small sample size")
 
         return t_key_cache.numpy(), t_value_cache.numpy()
                     
