@@ -65,7 +65,7 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch = 1
+xe_arch = 2
 
 if xe_arch == 1:
     kv_step = 8
@@ -1265,6 +1265,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     }
                     #if KV_CACHE_COMPRESSION_BY_TOKEN
                     matrix<half, REG_N, REG_K> KtNormal;
+                    #pragma unroll
                     for(int kk = 0; kk < REG_N; kk++) {
                         KtNormal[kk] = temp[kk] - temp_zp[kk];
                         KtNormal[kk] = cm_mul<half>(KtNormal[kk], temp_scale[kk]);
@@ -1274,31 +1275,25 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
                     temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
                     matrix<half, REG_N, REG_K> KtNormal;
+                    #pragma unroll
                     for(int kk = 0; kk < REG_N; kk++) {
                         KtNormal[kk] = temp[kk] - temp_zp;
                         KtNormal[kk] = cm_mul<half>(KtNormal[kk], temp_scale);
                     }
                     #endif
-
-                    #if XE_ARCH==1
-                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>(), Kt.format<uint32_t, REG_K/2, REG_N>());
-                    #else
-                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>().select<8,1,8,1>(0,0), Kt.format<uint32_t, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
-                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>().select<8,1,8,1>(8,0), Kt.format<uint32_t, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
-                    #endif
                 #else
-                    matrix<uint, REG_N, REG_K/2> temp;
+                    matrix<uint, REG_N, REG_K/2> KtNormal;
                     uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k * 2;
                     #pragma unroll
                     for(int kk = 0; kk < REG_N; kk++) {
-                        cm_svm_block_read<uint, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint>());
+                        cm_svm_block_read<uint, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), KtNormal[kk].format<uint>());
                     }
-                    #if XE_ARCH==1
-                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
-                    #else
-                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
-                    Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
-                    #endif
+                #endif
+                #if XE_ARCH==1
+                Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>(), Kt.format<uint, REG_K/2, REG_N>());
+                #else
+                Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(0,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                Transpose_8x8(KtNormal.format<uint, REG_N, REG_K/2>().select<8,1,8,1>(8,0), Kt.format<uint, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
                 #endif
             #endif
 
