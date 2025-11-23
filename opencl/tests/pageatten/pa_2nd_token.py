@@ -65,7 +65,7 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch = 2
+xe_arch = 1
 
 if xe_arch == 1:
     kv_step = 8
@@ -1196,11 +1196,17 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
         for(int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
             #if KV_CACHE_COMPRESSION && KV_CACHE_COMPRESSION_BY_TOKEN
-                vector<half, REG_N * 2> temp_scale, temp_zp;
-                temp_scale.select<REG_N,2>(0) = scale_vec.select<REG_N,1>(kv_pos);
-                temp_scale.select<REG_N,2>(1) = scale_vec.select<REG_N,1>(kv_pos);
-                temp_zp.select<REG_N,2>(0) = zp_vec.select<REG_N,1>(kv_pos);
-                temp_zp.select<REG_N,2>(1) = zp_vec.select<REG_N,1>(kv_pos);
+                #if USE_LSC_BLOCK_2D_DESC
+                    vector<half, REG_N * 2> temp_scale, temp_zp;
+                    temp_scale.select<REG_N,2>(0) = scale_vec.select<REG_N,1>(kv_pos);
+                    temp_scale.select<REG_N,2>(1) = scale_vec.select<REG_N,1>(kv_pos);
+                    temp_zp.select<REG_N,2>(0) = zp_vec.select<REG_N,1>(kv_pos);
+                    temp_zp.select<REG_N,2>(1) = zp_vec.select<REG_N,1>(kv_pos);
+                #else
+                    vector<half, REG_N> temp_scale, temp_zp;
+                    temp_scale.select<REG_N,1>(0) = scale_vec.select<REG_N,1>(kv_pos);
+                    temp_zp.select<REG_N,1>(0) = zp_vec.select<REG_N,1>(kv_pos);
+                #endif
             #endif
 
             #pragma unroll
@@ -1210,14 +1216,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             for(int k = 0, ri = 0; k < HEAD_SIZE/2; k += REG_K/2, ri ++ ) {
             #endif
                 matrix<half, REG_K, REG_N> Kt = 0;
-            #if KV_CACHE_COMPRESSION
-                matrix<uint8_t, REG_K, REG_N> Kt_quant_temp, Kt_quant;
-            #endif
             #if USE_LSC_BLOCK_2D_DESC
                 //# Load Kt into register & pack as VNNI(as dpas-B tile)
                 //# DWORD transposed load == (transposed + VNNI) load
                 b2dK.set_block_x(k);
                 #if KV_CACHE_COMPRESSION
+                    matrix<uint8_t, REG_K, REG_N> Kt_quant_temp, Kt_quant;
                     cm_load<lsc::Transpose>(Kt_quant_temp.format<uint>(), b2dK.set_block_y(kv_pos));
                     auto quant_src = Kt_quant_temp.format<ushort, REG_K/2, REG_N>();
                     auto quant_dst = Kt_quant.format<ushort, REG_K/2, REG_N>();
@@ -1227,22 +1231,60 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                         quant_dst.row(r  ) = quant_src.select<2,1,8,2>(r,0);
                         quant_dst.row(r+1) = quant_src.select<2,1,8,2>(r,1);
                     }
+                    #if KV_CACHE_COMPRESSION_BY_TOKEN
+                    #pragma unroll
+                    for(int r = 0; r < REG_K; r++) {
+                        Kt[r] = Kt_quant[r] - temp_zp.format<half, 2, REG_N>()[r%2]; //vector - vector
+                        Kt[r] = cm_mul<half>(Kt[r], temp_scale.format<half, 2, REG_N>()[r%2]);    // vector * vector
+                    }
+                    #else
+                    vector<half, REG_K> temp_scale, temp_zp;
+                    temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
+                    temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
+
+                    auto Kt_dequant_out = Kt.format<half, REG_K/2, 2*REG_N>();
+                    auto Kt_dequant_tmp = Kt_quant.format<uint8_t, REG_K/2, 2*REG_N>();
+                    #pragma unroll
+                    for(int r = 0; r < REG_K/2; r++) {
+                        Kt_dequant_out[r].select<REG_N, 2>(0) = Kt_dequant_tmp[r].select<REG_N, 2>(0) - temp_zp[r*2];
+                        Kt_dequant_out[r].select<REG_N, 2>(0) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(0), temp_scale[r*2]);
+                        Kt_dequant_out[r].select<REG_N, 2>(1) = Kt_dequant_tmp[r].select<REG_N, 2>(1) - temp_zp[r*2+1];
+                        Kt_dequant_out[r].select<REG_N, 2>(1) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(1), temp_scale[r*2+1]);
+                    }
+                    #endif
                 #else
                     cm_load<lsc::Transpose>(Kt.format<uint>(), b2dK.set_block_y(kv_pos));
                 #endif
             #else
                 #if KV_CACHE_COMPRESSION
-                    matrix<uint16_t, REG_N, REG_K/2> temp; // 8 x 8
+                    matrix<uint8_t, REG_N, REG_K> temp; // 8 x 16
                     uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k * 4;
                     #pragma unroll
                     for(int kk = 0; kk < REG_N; kk++) {
-                        cm_svm_block_read<uint16_t, REG_K/2>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint16_t>());
+                        cm_svm_block_read<uint8_t, REG_K>((svmptr_t)(key + cur_kv_offset + kk * kv_stride), temp[kk].format<uint8_t>());
                     }
-                    #if XE_ARCH==1
-                    Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
+                    #if KV_CACHE_COMPRESSION_BY_TOKEN
+                    matrix<half, REG_N, REG_K> KtNormal;
+                    for(int kk = 0; kk < REG_N; kk++) {
+                        KtNormal[kk] = temp[kk] - temp_zp[kk];
+                        KtNormal[kk] = cm_mul<half>(KtNormal[kk], temp_scale[kk]);
+                    }
                     #else
-                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
-                    Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
+                    vector<half, REG_K> temp_scale, temp_zp;
+                    temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
+                    temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
+                    matrix<half, REG_N, REG_K> KtNormal;
+                    for(int kk = 0; kk < REG_N; kk++) {
+                        KtNormal[kk] = temp[kk] - temp_zp;
+                        KtNormal[kk] = cm_mul<half>(KtNormal[kk], temp_scale);
+                    }
+                    #endif
+
+                    #if XE_ARCH==1
+                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>(), Kt.format<uint32_t, REG_K/2, REG_N>());
+                    #else
+                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>().select<8,1,8,1>(0,0), Kt.format<uint32_t, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                    Transpose_8x8(KtNormal.format<uint32_t, REG_N, REG_K/2>().select<8,1,8,1>(8,0), Kt.format<uint32_t, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
                     #endif
                 #else
                     matrix<uint, REG_N, REG_K/2> temp;
@@ -1260,29 +1302,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                 #endif
             #endif
 
-            #if KV_CACHE_COMPRESSION
-                #if KV_CACHE_COMPRESSION_BY_TOKEN
-                #pragma unroll
-                for(int r = 0; r < REG_K; r++) {
-                    Kt[r] = Kt_quant[r] - temp_zp.format<half, 2, REG_N>()[r%2]; //vector - vector
-                    Kt[r] = cm_mul<half>(Kt[r], temp_scale.format<half, 2, REG_N>()[r%2]);    // vector * vector
-                }
-                #else
-                vector<half, REG_K> temp_scale, temp_zp;
-                temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
-                temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
-
-                auto Kt_dequant_out = Kt.format<half, REG_K/2, 2*REG_N>();
-                auto Kt_dequant_tmp = Kt_quant.format<uint8_t, REG_K/2, 2*REG_N>();
-                #pragma unroll
-                for(int r = 0; r < REG_K/2; r++) {
-                    Kt_dequant_out[r].select<REG_N, 2>(0) = Kt_dequant_tmp[r].select<REG_N, 2>(0) - temp_zp[r*2];
-                    Kt_dequant_out[r].select<REG_N, 2>(0) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(0), temp_scale[r*2]);
-                    Kt_dequant_out[r].select<REG_N, 2>(1) = Kt_dequant_tmp[r].select<REG_N, 2>(1) - temp_zp[r*2+1];
-                    Kt_dequant_out[r].select<REG_N, 2>(1) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(1), temp_scale[r*2+1]);
-                }
-                #endif
-            #endif
             #if Q_RepeatCount != 1
                 matrix<half, Q_RepeatCount, REG_K> Qmat_data = Qmat.select<Q_RepeatCount,1,REG_K,1>(0, ri*REG_K);
                 matrix<float, Q_RepeatCount, REG_N> rS_data = 0;
@@ -1481,8 +1500,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                 }
             #endif
             #if Q_RepeatCount != 1
-            #pragma unroll
             matrix<half, Q_RepeatCount, REG_K> Pmat_data = Pmat.select<Q_RepeatCount,1,REG_K,1>(0, ki*REG_K);
+            #pragma unroll
             for (int tile=0; tile < VALUE_TILE_NUM; tile ++) {
                 matrix<float, Q_RepeatCount, REG_N> Omat_data = 0;
                 Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_RepeatCount>(
