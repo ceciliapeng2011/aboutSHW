@@ -42,7 +42,7 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 0
+enable_kvcache_compression = 1
 kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
 # kv_cache_quantization_mode = "by_channel"
 
@@ -65,7 +65,7 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch = 1
+xe_arch = 2
 
 if xe_arch == 1:
     kv_step = 8
@@ -1241,8 +1241,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     #if XE_ARCH==1
                     Transpose_8x8(temp, Kt_quant.format<uint16_t, REG_K/2, REG_N>());
                     #else
-                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,0));
-                    Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N/2>().select<8,1,8,1>(0,8));
+                    Transpose_8x8(temp.select<8,1,8,1>(0,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N>().select<8,1,8,1>(0,0));
+                    Transpose_8x8(temp.select<8,1,8,1>(8,0), Kt_quant_temp.format<uint16_t, REG_K/2, REG_N>().select<8,1,8,1>(0,8));
                     #endif
                 #else
                     matrix<uint, REG_N, REG_K/2> temp;
