@@ -2171,7 +2171,7 @@ f1 = torch.from_numpy(t_out_final.numpy())
 
 print("ref = ", org.transpose(1,2)[0,0,-1,:])
 print("res = ", f1[0,0,-1,:])
-# check_close(org.transpose(1,2), f1, atol=1e-2, rtol=1e-3)
+check_close(org.transpose(1,2), f1, atol=1e-2, rtol=1e-3)
 #sys.exit(0)
 
 loop_cnt = 100
