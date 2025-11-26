@@ -1454,15 +1454,14 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                         cm_svm_block_read<uint8_t, REG_N * VALUE_TILE_NUM>((svmptr_t)(value + cur_kv_offset + kk * kv_stride), Vt_quant[kk].format<uint8_t>());
                     }
                 #else
-                    matrix<half, REG_K, REG_N * VALUE_TILE_NUM> temp;
                     uint cur_kv_offset = kv_offset + kv_pos * kv_stride + k;
                     #pragma unroll
                     for(int kk = 0; kk < REG_K; kk++) {
-                        cm_svm_block_read<half, REG_N * VALUE_TILE_NUM>((svmptr_t)(value + cur_kv_offset + kk * kv_stride), temp[kk].format<half>());
+                        cm_svm_block_read<half, REG_N * VALUE_TILE_NUM>((svmptr_t)(value + cur_kv_offset + kk * kv_stride), VmatNormal[kk].format<half>());
                     }
                     auto Vref = Vmat.format<half, REG_K/2, 2 * REG_N * VALUE_TILE_NUM>();
-                    Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 0) = temp.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(0, 0);
-                    Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 1) = temp.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(1, 0);
+                    Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(0, 0);
+                    Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(1, 0);
                 #endif
             #endif
 
@@ -1480,7 +1479,9 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                         VmatNormal[r] = 0;
                     }
                 }
-                prepackAsVNNIWidth2(VmatNormal, Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>());
+                auto Vref = Vmat.format<half, REG_K/2, 2 * REG_N * VALUE_TILE_NUM>();
+                Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(0, 0);
+                Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(1, 0);
             #endif
 
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
