@@ -42,7 +42,7 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 1
+enable_kvcache_compression = 0
 kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
 # kv_cache_quantization_mode = "by_channel"
 
@@ -1300,12 +1300,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
             #if Q_RepeatCount != 1
                 matrix<half, Q_RepeatCount, REG_K> Qmat_data = Qmat.select<Q_RepeatCount,1,REG_K,1>(0, ri*REG_K);
-                matrix<float, Q_RepeatCount, REG_N> rS_data = 0;
+                auto rS_data = rS.select<Q_RepeatCount, 1, REG_N, 1>(0, ki*REG_N);
                 rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_RepeatCount>(
                             rS_data.format<float>(),
                             Kt.format<int32_t>(),
                             Qmat_data.format<int32_t>());
-                rS.select<Q_RepeatCount, 1, REG_N, 1>(0, ki*REG_N) += rS_data;
             #else
                 #pragma unroll
                 for(int qi = 0; qi < Q_SLICE_NUM; qi ++) {
@@ -1326,9 +1325,9 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     vector<float, Q_SLICE_NUM> cur_lse = 0.0f;
 
     #if Q_RepeatCount != 1
-        matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
+        matrix<half, Q_RepeatCount, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat;
     #else
-        matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
+        matrix<half, Q_SLICE_NUM, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat;
     #endif
     #pragma unroll
     for(int qi = 0; qi < Q_SLICE_NUM; qi++) {
@@ -1349,6 +1348,9 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
         // compute row_max
         auto rSv = rS_slice.format<float>();
+        #if XE_ARCH==1
+        float row_max = cm_reduced_max<float>(rSv);
+        #else
         float row_max = rSv[0];
         // It is performance hotspot for u8,  must add unroll
         #if KV_CACHE_COMPRESSION
@@ -1356,17 +1358,17 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         #endif
         for(int r = 1; r < rSv.n_elems(); r++)
             row_max = cm_max<float>(row_max, rSv[r]);
+        #endif
 
         // compute Pmat = exp(rS_slice - row_max)
-        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rS_slice.format<float>() - row_max)*log2e);
+        vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rSv - row_max)*log2e);
         Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
 
         cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
         cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max; // log2(sum(exp(x))) = log2e * log(sum(exp(x)))
 
         // compute row sum of P
-        auto rPv = Pmat[qi].format<half, 1, KV_PARTITION_STEP_NUM * REG_N>();
-        cur_sum[qi] = cm_sum<float>(rPv[0]);
+        cur_sum[qi] = cm_sum<float>(Pmat[qi]);
     }
     
     #if !USE_LSC_BLOCK_2D_DESC && KV_CACHE_COMPRESSION
@@ -1417,6 +1419,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
             if(kv_pos_end < KV_BLOCK_SIZE) {
                 // fill leftover with last valid scale/zp
+                #pragma unroll
                 for(int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
                     scale_vec[i] = 0.0;
                     zp_vec[i] = 0.0;
@@ -1429,21 +1432,19 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             #if KV_CACHE_COMPRESSION
             vector<half, REG_K> temp_scale = scale_vec.select<REG_K, 1>(kv_pos);
             vector<half, REG_K> temp_zp = zp_vec.select<REG_K, 1>(kv_pos);
+            matrix<uint8_t, REG_K, REG_N * VALUE_TILE_NUM> Vt_quant;
             #endif
             #pragma unroll
             for(int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N * VALUE_TILE_NUM, ri += VALUE_TILE_NUM ) {
                 // Load V into register & pack as VNNI(as dpas-B tile)
                 matrix<half, REG_K, REG_N * VALUE_TILE_NUM> VmatNormal;
                 matrix<half, REG_K, REG_N * VALUE_TILE_NUM> Vmat;
-                #if KV_CACHE_COMPRESSION
-                    matrix<uint8_t, REG_K, REG_N * VALUE_TILE_NUM> Vt_quant;
-                #endif
             #if USE_LSC_BLOCK_2D_DESC
                 b2dV.set_block_x(k); // x is the column index
                 #if KV_CACHE_COMPRESSION
                     cm_load<lsc::Normal>(Vt_quant.format<uint8_t>(), b2dV.set_block_y(kv_pos));
                 #else
-                    cm_load<lsc::VNNI>(Vmat[0].format<half>(), b2dV.set_block_y(kv_pos)); // y is the row index
+                    cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_y(kv_pos)); // y is the row index
                 #endif
             #else
                 #if KV_CACHE_COMPRESSION
@@ -1466,9 +1467,10 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             #endif
 
             #if KV_CACHE_COMPRESSION
+                VmatNormal = Vt_quant;
                 #pragma unroll
                 for(int r = 0; r < REG_K; r++) {
-                    VmatNormal[r] = Vt_quant[r] - temp_zp[r]; // vector - scalar
+                    VmatNormal[r] = VmatNormal[r] - temp_zp[r]; // vector - scalar
                     VmatNormal[r] = cm_mul<half>(VmatNormal[r], temp_scale[r]); // vector * scalar
                 }
 
@@ -1487,6 +1489,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     auto VmatRef = Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>();
                     uint valid_rows = kv_pos_end - kv_pos;
                     uint valid_rows_vnni = (valid_rows+1)/2;
+                    #pragma unroll
                     for (int r = valid_rows_vnni; r < REG_K/2; r++) {
                         VmatRef.row(r) = 0.0f;
                     }
@@ -1499,12 +1502,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
             matrix<half, Q_RepeatCount, REG_K> Pmat_data = Pmat.select<Q_RepeatCount,1,REG_K,1>(0, ki*REG_K);
             #pragma unroll
             for (int tile=0; tile < VALUE_TILE_NUM; tile ++) {
-                matrix<float, Q_RepeatCount, REG_N> Omat_data = 0;
+                auto Omat_data = Omat.select<Q_RepeatCount,1,REG_N,1>(0, (ri + tile)*REG_N);
                 Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_RepeatCount>(
                             Omat_data.format<float>(),
                             Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile).format<int32_t>(),
                             Pmat_data.format<int32_t>());
-                Omat.select<Q_RepeatCount,1,REG_N,1>(0, (ri + tile)*REG_N) += Omat_data;
             }
             #else
             #pragma unroll
@@ -1523,7 +1525,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         }
     }
 
-    //# save Output
+    // save Output
     #pragma unroll
     for (int qi = 0; qi < Q_SLICE_NUM; qi++) {
         matrix<float, REG_M, REG_N> cur_O_f32;
@@ -1534,11 +1536,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
         for(int k = 0, ri=0; k < HEAD_SIZE; k += REG_N, ri++) {
             auto cO = Omat_slice[ri].format<float, REG_M, REG_N>();
             #if XE_ARCH==1
-            cur_O_f32= cm_mul<float>(cO, div_cur_sum);
+            cur_O_f32 = cm_mul<float>(cO, div_cur_sum);
             #else
-            cur_O_f32= cm_div_ieee(cO, cur_sum[qi]);
+            cur_O_f32 = cm_div_ieee(cO, cur_sum[qi]);
             #endif
-            cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k),cur_O_f32.format<float>());
+            cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), cur_O_f32.format<float>());
         }
         uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
         lse[lse_offset] = cur_lse[qi];
@@ -2129,8 +2131,8 @@ if enable_kvcache_compression and False:
 # f"-cmc -mdump_asm -g2 "
 cwd = os.path.dirname(os.path.realpath(__file__))
 print("compiling ...")
-# cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -Qxcm_jit_option='-abortonspill' -mdump_asm -g2 -I{cwd}")
-cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -mdump_asm -g2 -I{cwd}")
+cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -Qxcm_jit_option='-abortonspill' -mdump_asm -g2 -I{cwd}")
+# cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -mdump_asm -g2 -I{cwd}")
 print("first call ...")
 # cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, q_len, kv_len, t_q, t_k, t_v, t_out, t_lse)
 
@@ -2222,14 +2224,21 @@ intermedia_size = batch * num_heads * kv_partition_num * (head_size + 1) * 4
 kvcache_total_time=0
 intermedia_total_time=0
 num_runs = 0
-for ns in latency:
+num_warmup = 0
+for iter, ns in enumerate(latency):
     if first_kernel:
-        kvcache_total_time += ns
-        num_runs += 1
-        print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
+        if num_warmup <= 4:
+            num_warmup += 1
+        else:
+            kvcache_total_time += ns
+            num_runs += 1
+        print(f" {iter} {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
         #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s")
     else:
-        intermedia_total_time += ns
+        if num_warmup <= 4:
+            num_warmup += 1
+        else:
+            intermedia_total_time += ns
         #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {intermedia_size/(ns):.3f} GB/s, intermedia = {intermedia_size*1e-6:.1f} MB")
     first_kernel =  1 - first_kernel
 
@@ -2239,6 +2248,7 @@ print("intermedia_total_time = ", intermedia_total_time*1e-6, "ms")
 print("kvcache_total_time = ", kvcache_total_time*1e-6, "ms")
 
 print(f"num_runs = {num_runs}, avg kvcache = {kvcache_size*num_runs/kvcache_total_time:.3f} GB/s, avg intermedia = {intermedia_size*num_runs/(intermedia_total_time):.3f} GB/s")
+print(f"num_runs = {num_runs}, avg pa kernel time for Qwen3-8B = {(kvcache_total_time + intermedia_total_time) * 1e-6 / num_runs * 36:.3f} ms")
 print()
 
 f1 = torch.from_numpy(all_layers[0][4].numpy())
