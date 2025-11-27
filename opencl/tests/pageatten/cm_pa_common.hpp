@@ -379,6 +379,7 @@ void pa_kernel_lsc_prefetch_f16(
     cur_max = -3e38f;
     cur_sum = 0;
     constexpr int num_P_tiles = REG_N / REG_M;
+    constexpr int VALUE_TILE_NUM = 2;
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, head_size/REG_M, REG_M*REG_N> rO;
 
@@ -425,10 +426,10 @@ void pa_kernel_lsc_prefetch_f16(
 
     #if USE_LSC
     lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
-    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K, REG_N*VALUE_TILE_NUM> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
     static_assert(wg_local_size == 16);
     lsc::block_2d_desc<half, 1, kv_step/wg_local_size, REG_K> prefetch_K(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
-    lsc::block_2d_desc<half, 1, REG_K/wg_local_size, REG_N> prefetch_V(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K/wg_local_size, REG_N*VALUE_TILE_NUM> prefetch_V(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
     #endif
     constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     int causal_left = q_start+past_lens;
@@ -565,26 +566,24 @@ void pa_kernel_lsc_prefetch_f16(
         b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
         #endif
 
-        // constexpr int num_P_tiles = REG_N / REG_M;
         auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
-        matrix<half, REG_K/2, REG_N*2> Vmat;
+        matrix<half, REG_K/2, REG_N*2*VALUE_TILE_NUM> Vmat;
         #if !USE_LSC
-        matrix<half, REG_K, REG_N> Vmat_tmp;
+        matrix<half, REG_K, REG_N*VALUE_TILE_NUM> Vmat_tmp;
         half* base_v_cache_ptr = (half*)v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
         #endif
         #pragma unroll
-        for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
+        for(int k = 0, ri=0; k < head_size; k += REG_N * VALUE_TILE_NUM, ri += num_P_tiles * VALUE_TILE_NUM) {
             #if USE_LSC
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
             cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
             #pragma unroll
             for(int Vr = 0; Vr < REG_K; Vr++){
-                cm_svm_block_read<half, REG_N>((svmptr_t)((half*)base_v_cache_ptr + k + Vr * head_size), Vmat_tmp.row(Vr));
+                cm_svm_block_read<half, REG_N*VALUE_TILE_NUM>((svmptr_t)((half*)base_v_cache_ptr + k + Vr * head_size), Vmat_tmp.row(Vr));
             }
-            // vnni transform from Vmatref to Vmat
-            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 0) = Vmat_tmp.select<REG_K/2, 2, REG_N, 1>(0, 0);
-            Vmat.select<REG_K/2, 1, REG_N, 2>(0, 1) = Vmat_tmp.select<REG_K/2, 2, REG_N, 1>(1, 0);
+            Vmat.select<REG_K/2, 1, REG_N*VALUE_TILE_NUM, 2>(0, 0) = Vmat_tmp.select<REG_K/2, 2, REG_N*VALUE_TILE_NUM, 1>(0, 0);
+            Vmat.select<REG_K/2, 1, REG_N*VALUE_TILE_NUM, 2>(0, 1) = Vmat_tmp.select<REG_K/2, 2, REG_N*VALUE_TILE_NUM, 1>(1, 0);
             #endif
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
             if ((kv_pos + kv_step) > kv_stop) {
@@ -593,32 +592,48 @@ void pa_kernel_lsc_prefetch_f16(
                 for (int r = valid_rows_vnni; r < REG_K/2; r++)
                     Vmat.row(r) = 0.f;
                 if (valid_rows % 2 == 1)
-                    Vmat.row(valid_rows_vnni-1).select<REG_N, 2>(1) = 0.f;
+                    Vmat.row(valid_rows_vnni - 1).select<REG_N*VALUE_TILE_NUM, 2>(1) = 0.f;
             }
 
             if (kv_pos == 0) {
                 #pragma unroll
-                for(int p = 0; p < num_P_tiles; p++) {
-                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
-                                    0,
-                                    Vmat.format<int32_t>(),
-                                    P2.row(p).format<int32_t>());
+                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
+                    int rO_base = ri + tile * num_P_tiles;
+                    auto Vtile = Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile);
+                    #pragma unroll
+                    for (int p = 0; p < num_P_tiles; p++) {
+                        rO[rO_base + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                            0,
+                            Vtile.format<int32_t>(),
+                            P2.row(p).format<int32_t>());
+                    }
                 }
             } else {
                 #pragma unroll
-                for(int p = 0; p < num_P_tiles; p++) {
-                    auto cO = rO[ri + p].format<float, REG_M, REG_N>();
+                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
+                    int rO_base = ri + tile * num_P_tiles;
                     #pragma unroll
-                    for(int r = 0; r < REG_M; r++)
-                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
+                    for(int p = 0; p < num_P_tiles; p++) {
+                        auto cO = rO[rO_base + p].format<float, REG_M, REG_N>();
+                        #pragma unroll
+                        for(int r = 0; r < REG_M; r++)
+                            cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
+                    }
                 }
 
                 #pragma unroll
-                for(int p = 0; p < num_P_tiles; p++) {
-                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
-                                rO[ri + p].format<float>(),
-                                Vmat.format<int32_t>(),
-                                P2.row(p).format<int32_t>());
+                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
+                    int rO_base = ri + tile * num_P_tiles;
+                    auto Vtile =
+                        Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>()
+                            .select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile);
+                    #pragma unroll
+                    for (int p = 0; p < num_P_tiles; p++) {
+                        rO[rO_base + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
+                            rO[rO_base + p].format<float>(),
+                            Vtile.format<int32_t>(),
+                            P2.row(p).format<int32_t>());
+                    }
                 }
             }
         }
