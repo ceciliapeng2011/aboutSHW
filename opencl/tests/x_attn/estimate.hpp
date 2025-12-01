@@ -850,7 +850,13 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     n_start = MYMIN(n_start, N);
     int n_end = MYMIN(n_start + BLOCK_SG_N, N);
     int valid_n = n_end - n_start;
+    #if BLOCK_SG_M == 64 && BLOCK_SG_N == 32
     matrix<SOFTMAX_TYPE, BLOCK_SG_M, 4> sum_t;
+    #elif BLOCK_SG_M == 32 && BLOCK_SG_N == 16
+    matrix<SOFTMAX_TYPE, BLOCK_SG_M, 2> sum_t;
+    #else
+    assert("Unsupported BLOCK_SG_M!\n");
+    #endif
     vector<int, BLOCK_SG_M> seq_m;
     cmtl::cm_vector_assign(seq_m.select_all(), 0, 1);
     vector_ref<int, BLOCK_SG_N> seq = seq_m.select<BLOCK_SG_N, 1>();
@@ -949,8 +955,16 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
                 } SIMD_IF_END;
             }
         }
+        #if BLOCK_SG_M == 64 && BLOCK_SG_N == 32
         sum_t.select<32, 1, 4, 1>( 0).format<SOFTMAX_TYPE>() = reduce2d<4, 1, 4>(acc_half.select<32, 1, 32, 1>( 0)).format<SOFTMAX_TYPE>();
         sum_t.select<32, 1, 4, 1>(32).format<SOFTMAX_TYPE>() = reduce2d<4, 1, 4>(acc_half.select<32, 1, 32, 1>(32)).format<SOFTMAX_TYPE>();
+        #elif BLOCK_SG_M == 32 && BLOCK_SG_N == 16
+        sum_t.select<16, 1, 2, 1>( 0).format<SOFTMAX_TYPE>() = reduce2d<2, 1, 2>(acc_half.select<16, 1, 16, 1>( 0)).format<SOFTMAX_TYPE>();
+        sum_t.select<16, 1, 2, 1>(16).format<SOFTMAX_TYPE>() = reduce2d<2, 1, 2>(acc_half.select<16, 1, 16, 1>(16)).format<SOFTMAX_TYPE>();
+        #else
+        assert("Unsupported BLOCK_SG_M!\n");
+        #endif
+
     }
     // store
     #if USE_LSC_BLOCK_2D_DESC == 1
@@ -969,10 +983,10 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     uint off_c = offset_partial_sum;
     off_c += pitch_c * (id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M);
     off_c += ((id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) / block_size_div_stride) * sizeof(SOFTMAX_TYPE);
-    cm_store_2d(sum_t.select<8, 1, 4, 1>( 0).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 0) * pitch_c, pitch_c);
-    cm_store_2d(sum_t.select<8, 1, 4, 1>( 8).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 1) * pitch_c, pitch_c);
-    cm_store_2d(sum_t.select<8, 1, 4, 1>(16).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 2) * pitch_c, pitch_c);
-    // cm_store_2d(sum_t.select<8, 1, 4, 1>(24).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 3) * pitch_c, pitch_c);
+    cm_store_2d(sum_t.select<8, 1, 2, 1>( 0).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 0) * pitch_c, pitch_c);
+    cm_store_2d(sum_t.select<8, 1, 2, 1>( 8).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 1) * pitch_c, pitch_c);
+    cm_store_2d(sum_t.select<8, 1, 2, 1>(16).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 2) * pitch_c, pitch_c);
+    cm_store_2d(sum_t.select<8, 1, 2, 1>(24).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 3) * pitch_c, pitch_c);
     // cm_store_2d(sum_t.select<8, 1, 4, 1>(32).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 4) * pitch_c, pitch_c);
     // cm_store_2d(sum_t.select<8, 1, 4, 1>(40).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 5) * pitch_c, pitch_c);
     // cm_store_2d(sum_t.select<8, 1, 4, 1>(48).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 6) * pitch_c, pitch_c);
