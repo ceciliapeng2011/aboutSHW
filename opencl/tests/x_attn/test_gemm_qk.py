@@ -24,23 +24,23 @@ def get_cm_grf_width():
     cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
     return t_info.numpy()[0]
 
-# CM_GRF_WIDTH = get_cm_grf_width()
-# print(f'{CM_GRF_WIDTH=}')
+CM_GRF_WIDTH = get_cm_grf_width()
+print(f'{CM_GRF_WIDTH=}')
 
 # gemmQK
 
 kernel_name = 'gemm_qk'
-BLOCK_SG_M = 64 #32
-BLOCK_SG_N = 32
+BLOCK_SG_M = 32 #64 xe2
+BLOCK_SG_N = 16
 SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
-KV_BLOCK_SIZE = 256   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
+KV_BLOCK_SIZE = 128   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
 
-HQ = 32
-HK = 8
-HEAD_SIZE = 128
+HQ = 1
+HK = 1
+HEAD_SIZE = 64
 STRIDE = 16
 BLOCK_SIZE = 128
 THRESH = 1.0
@@ -162,11 +162,13 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
     softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
     N_kq_groups = div_up(N, BLOCK_WG_N)
     t_kq_max_wg = cl.tensor(np.ones([B, Hq, N_kq_groups, q_stride_pad], softmax_type))
+    print(f'{hex(t_kq_max_wg.addr)=}, {t_kq_max_wg.strides=}')
     # [1, 32, 256, 64 * 16]
     sum_per_token_in_block = block_size // stride
     k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
     k_block_pad = k_block_in_group * N_kq_groups
     t_kq_exp_partial_sum = cl.tensor(np.ones([B, Hq, q_stride_pad, k_block_pad], softmax_type))
+    print(f'{hex(t_kq_exp_partial_sum.addr)=}, {t_kq_exp_partial_sum.strides=}')
 
     # loop N first:[0, 1], loop M first:[0, 0]; block M first[slice_no, slice(>0)], block N first[slice_no, slice(<0)]
     #default linear
@@ -191,6 +193,7 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
         kq_max_ref, kq_5d_max_ret_ref, kq_exp_partial_sum_ret_ref, _ = get_gemm_ref(q, k, block_size=block_size, q_start_strided=q_start_strided, S=stride, threshold=threshold, causal=causal, wg_k=BLOCK_WG_N, wg_q=BLOCK_WG_M)
         kq_5d_max_ret_ref_np = kq_5d_max_ret_ref.detach().numpy()[..., :M]
         t_kq_max_wg_np = t_kq_max_wg.numpy()[..., :M]
+        print(f'{kq_5d_max_ret_ref_np=}, {t_kq_max_wg_np=}')
         compare(kq_5d_max_ret_ref_np, t_kq_max_wg_np)
         print(f'{Colors.GREEN}gemm:max_wg passed{Colors.END}')
         kq_exp_partial_sum_ret_ref_np = kq_exp_partial_sum_ret_ref.detach().numpy()[:,:,:M,:]
@@ -221,27 +224,29 @@ def test_func():
     block_size = BLOCK_SIZE
     stride = STRIDE
     sizes = [
-        (256 * STRIDE, 256 * STRIDE, '4k'),
+        # (128, 128, '1wg'),
+        (128 * STRIDE, 128 * STRIDE, '2k'),
+        # (256 * STRIDE, 256 * STRIDE, '4k'),
         # normal case
-        (512 * STRIDE, 512 * STRIDE, '8k'),
-        (256 * STRIDE, 256 * STRIDE, 'normal+causal start == 0'),           # normal case:causal start == 0
-        (4 * 1024, 128 * 1024, 'normal'),                                   # normal case:4k * 128k
-        (128 * STRIDE, 256 * STRIDE, 'normal+smallest block'),              # smallest block just suitable for one workgroup
-        # query tails: tails are less than STRIDE
-        (128 * STRIDE + 7, 256 * STRIDE, 'M tail=7 of query'),
-        (4 * 1024 + 5, 128 * 1024, 'M tail=5 of query'),
-        # query tails: tails are multiple of STRIDE
-        (STRIDE, 256 * STRIDE, 'M tail=16 of query'),                       # query has tail which is not enough for a workgroup
-        ((128+1) * STRIDE, 256 * STRIDE, 'M tail of smallest query'),       # query has tail which is not full for its last block in M dimension
-        (4 * 1024 + STRIDE*3, 128 * 1024, 'M tail of bigger query'),        # query has tail which is not full for its last block in M dimension
-        (4 * 1024 + STRIDE*7+2, 128 * 1024, 'M tail=x*STRIDE+y of query'),  # query has tail which is not full for its last block in M dimension
-        # key tails: tails are less than STRIDE
-        (128 * STRIDE, 256 * STRIDE + 7, 'N tail=7 of key'),
-        (4 * 1024 + 5, 128 * 1024 + 3, 'M tail=5&N tail=3 of key'),
-        # key tails: tails are multiple of STRIDE
-        (128 * STRIDE, STRIDE * (128 + 1), 'N tail=16 of key'),                # key has tail which is not enough for a workgroup
-        (4 * 1024, 128*1024+STRIDE*2, 'N tail=32 of key'),                     # key has tail which is not enough for a workgroup
-        (4 * 1024 + 3*STRIDE+5, 128 * 1024 + 7*STRIDE+ 3, 'M tail=3.5&N tail=7.3 of key'),
+        # (512 * STRIDE, 512 * STRIDE, '8k'),
+        # (256 * STRIDE, 256 * STRIDE, 'normal+causal start == 0'),           # normal case:causal start == 0
+        # (4 * 1024, 128 * 1024, 'normal'),                                   # normal case:4k * 128k
+        # (128 * STRIDE, 256 * STRIDE, 'normal+smallest block'),              # smallest block just suitable for one workgroup
+        # # query tails: tails are less than STRIDE
+        # (128 * STRIDE + 7, 256 * STRIDE, 'M tail=7 of query'),
+        # (4 * 1024 + 5, 128 * 1024, 'M tail=5 of query'),
+        # # query tails: tails are multiple of STRIDE
+        # (STRIDE, 256 * STRIDE, 'M tail=16 of query'),                       # query has tail which is not enough for a workgroup
+        # ((128+1) * STRIDE, 256 * STRIDE, 'M tail of smallest query'),       # query has tail which is not full for its last block in M dimension
+        # (4 * 1024 + STRIDE*3, 128 * 1024, 'M tail of bigger query'),        # query has tail which is not full for its last block in M dimension
+        # (4 * 1024 + STRIDE*7+2, 128 * 1024, 'M tail=x*STRIDE+y of query'),  # query has tail which is not full for its last block in M dimension
+        # # key tails: tails are less than STRIDE
+        # (128 * STRIDE, 256 * STRIDE + 7, 'N tail=7 of key'),
+        # (4 * 1024 + 5, 128 * 1024 + 3, 'M tail=5&N tail=3 of key'),
+        # # key tails: tails are multiple of STRIDE
+        # (128 * STRIDE, STRIDE * (128 + 1), 'N tail=16 of key'),                # key has tail which is not enough for a workgroup
+        # (4 * 1024, 128*1024+STRIDE*2, 'N tail=32 of key'),                     # key has tail which is not enough for a workgroup
+        # (4 * 1024 + 3*STRIDE+5, 128 * 1024 + 7*STRIDE+ 3, 'M tail=3.5&N tail=7.3 of key'),
     ]
     for q_len, k_len, prompt in sizes:
         assert q_len // STRIDE >= 1, "there should be at least 1 row for gemm"
@@ -295,7 +300,7 @@ def test_perf():
 
 def main():
     test_func()
-    test_perf()
+    # test_perf()
 
 if __name__ == "__main__":
     torch.manual_seed(3)

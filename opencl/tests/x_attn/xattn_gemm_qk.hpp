@@ -120,7 +120,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
 #define CONCAT_IMPL(a, b) gemm_qk_ ##a ##x ##b ##_xe2
 #define CONCAT(x, y) CONCAT_IMPL(x, y)
 #define FUNC CONCAT(BLOCK_SG_M, BLOCK_SG_N)
-    FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
+    gemm_qk(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
 }
 
 // }  // NAMESPACE
