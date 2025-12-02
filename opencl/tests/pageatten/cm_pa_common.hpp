@@ -568,15 +568,16 @@ void pa_kernel_lsc_prefetch_f16(
 
         auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
         matrix<half, REG_K/2, REG_N*2*VALUE_TILE_NUM> Vmat;
-        matrix<half, REG_K, REG_N*VALUE_TILE_NUM> Vmat_tmp;
         #if !USE_LSC
+        matrix<half, REG_K, REG_N*VALUE_TILE_NUM> Vmat_tmp;
         half* base_v_cache_ptr = (half*)v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
         #endif
         #pragma unroll
         for(int k = 0, ri=0; k < head_size; k += REG_N * VALUE_TILE_NUM, ri += num_P_tiles * VALUE_TILE_NUM) {
             #if USE_LSC
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
-            cm_load<lsc::Normal>(Vmat_tmp.format<half>(), b2dV.set_block_x(k));
+            // cm_load<lsc::Normal>(Vmat_tmp.format<half>(), b2dV.set_block_x(k));
+            cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
             #pragma unroll
             for(int Vr = 0; Vr < REG_K; Vr++){
@@ -584,6 +585,16 @@ void pa_kernel_lsc_prefetch_f16(
             }
             #endif
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+            #if USE_LSC
+            if ((kv_pos + kv_step) > kv_stop) {
+                uint valid_rows = kv_stop - kv_pos;
+                uint valid_rows_vnni = (valid_rows+1)/2;
+                for (int r = valid_rows_vnni; r < REG_K/2; r++)
+                    Vmat.row(r) = 0.f;
+                if (valid_rows % 2 == 1)
+                    Vmat.row(valid_rows_vnni - 1).select<REG_N*VALUE_TILE_NUM, 2>(1) = 0.f;
+            }
+            #else
             if ((kv_pos + kv_step) > kv_stop) {
                 uint valid_rows = kv_stop - kv_pos;
                 for (uint r = valid_rows; r < kv_step; r++)
@@ -592,6 +603,7 @@ void pa_kernel_lsc_prefetch_f16(
             prepackAsVNNIWidth2(
                 Vmat_tmp.format<half, REG_K, REG_N*VALUE_TILE_NUM>(),
                 Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>());
+            #endif
 
             if (kv_pos == 0) {
                 #pragma unroll
