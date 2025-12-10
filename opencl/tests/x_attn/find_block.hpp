@@ -32,8 +32,6 @@
 #define CUR_TYPE_(a) MYCONCAT(IS_, a)
 #define CUR_TYPE CUR_TYPE_(SOFTMAX_TYPE)
 
-#define USE_LSC_BLOCK_2D_DESC 0
-
 template <int M, int N>
 CM_INLINE void cm_load_2d(matrix_ref<SOFTMAX_TYPE, M, N> out, svmptr_t base, uint offset, uint pitch, uint valid_m) {
     #pragma unroll
@@ -57,7 +55,7 @@ CM_INLINE void cm_store_2d(matrix_ref<SOFTMAX_TYPE, M, N> out, svmptr_t base, ui
 // kq_sum:             [b, hq, q_stride_pad/TOKEN_IN_BLOCK, k_block_pad]
 CM_INLINE void find(uint slm, int m_block,
     svmptr_t kq_max_wg,
-    //#if USE_LSC_BLOCK_2D_DESC == 1
+    //#ifdef CM_HAS_LSC_UNTYPED_2D
     svmptr_t kq_exp_partial_sum,
     // #else
     // SurfaceIndex kq_exp_partial_sum [[type("buffer_t")]],
@@ -105,7 +103,7 @@ CM_INLINE void find(uint slm, int m_block,
         }
         return;
     }
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<SOFTMAX_TYPE, 1, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX / (sizeof(SOFTMAX_TYPE) / sizeof(half))> desc_sum{ kq_exp_partial_sum, (uint)valid_m - 1, (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1),
         0, 0 };
     #else
@@ -124,7 +122,7 @@ CM_INLINE void find(uint slm, int m_block,
         }
     }
     // compensation: val*exp(local - global)
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     desc_sum.set_block_x(0);
     #else
     off_sum = 0;
@@ -132,7 +130,7 @@ CM_INLINE void find(uint slm, int m_block,
     for (int j = 0, idx = 0; j < k_block_pad; j += TOKEN_SHARE_MAX, idx++) {
         vector<SOFTMAX_TYPE, TOKEN_IN_BLOCK> max_m_in_group;
         max_m_in_group.format<int>() = cm_ptr_load<int, TOKEN_IN_BLOCK / (sizeof(int) / sizeof(SOFTMAX_TYPE))>((int*)kq_max_wg, q_stride_pad * idx * (int)sizeof(SOFTMAX_TYPE));
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
 #if CUR_TYPE == IS_float
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached,  0, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>(), desc_sum);
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 16, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>(), desc_sum);
@@ -154,7 +152,7 @@ CM_INLINE void find(uint slm, int m_block,
                 sum_m.row(i) += data.row(i);
             }
         }
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
 #if CUR_TYPE == IS_float
         cm_store<CacheHint::Uncached, CacheHint::WriteBack,  0, 0>(desc_sum, data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>());
         cm_store<CacheHint::Uncached, CacheHint::WriteBack, 16, 0>(desc_sum, data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>());
@@ -170,7 +168,7 @@ CM_INLINE void find(uint slm, int m_block,
         cm_store_2d(data, kq_exp_partial_sum, off_sum, pitch_sum, valid_m);
 #endif
 #endif
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
         desc_sum.set_block_x(desc_sum.get_block_x() + TOKEN_SHARE_MAX);
 #else
         off_sum += TOKEN_SHARE_MAX * sizeof(SOFTMAX_TYPE);
@@ -187,7 +185,7 @@ CM_INLINE void find(uint slm, int m_block,
     }
     // compensation: sum(val*inv_sum_v)
     vector<float, TOKEN_SHARE_MAX> sum_m_after_add = 0;
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
     desc_sum.set_block_x(0);
 #else
     off_sum = 0;
@@ -198,7 +196,7 @@ CM_INLINE void find(uint slm, int m_block,
 #endif
     vector<uchar, TOKEN_SHARE_MAX> zero = 0;
     for (int j = 0; j < k_block_pad; j += TOKEN_SHARE_MAX) {
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
 #if CUR_TYPE == IS_float
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached,  0, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>(), desc_sum);
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 16, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>(), desc_sum);
@@ -221,7 +219,7 @@ CM_INLINE void find(uint slm, int m_block,
             data.row(0) += data.row(i) * inv_sum_v[i];
         }
 
-#if USE_LSC_BLOCK_2D_DESC == 1
+#ifdef CM_HAS_LSC_UNTYPED_2D
         desc_sum.set_block_x(desc_sum.get_block_x() + TOKEN_SHARE_MAX);
 #else
         off_sum += TOKEN_SHARE_MAX * sizeof(SOFTMAX_TYPE);
