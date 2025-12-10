@@ -643,15 +643,19 @@ void pa_kernel_lsc_prefetch_f16(
             cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
                 #if CMPA_USE_STATEFUL_V_CM_LOAD
-                uint row_offset = v_stateful_row_offset + k * sizeof(half);
-                uint prefetch_row_offset = v_prefetch_stateful_row_offset + k * sizeof(half);
+                // uint row_offset = v_stateful_row_offset + k * sizeof(half);
+                // uint prefetch_row_offset = v_prefetch_stateful_row_offset + k * sizeof(half);
+                constexpr uint elem_size = sizeof(half);
+                constexpr int value_row_u32 = (REG_N * VALUE_TILE_NUM * sizeof(half)) / sizeof(uint);
                 #pragma unroll
                 for(int Vr = 0; Vr < REG_K; Vr++){
-                    uint cur_row_offset = row_offset + Vr * token_stride_bytes;
+                    uint elem_offset = cur_block_id * blk_stride
+                                    + (kv_pos % CMPA_BLOCK_SZ) * head_size
+                                    + Vr * head_size
+                                    + k;
+                    uint cur_row_offset = v_cache_stateful_offset_bytes + elem_offset * elem_size;
                     auto row_vec_u32 = cm_load<uint, value_row_u32>(v_cache_stateful, cur_row_offset);
                     Vmat_tmp.row(Vr).format<uint>() = row_vec_u32;
-                    // uint prefetch_offset = prefetch_row_offset + Vr * token_stride_bytes;
-                    // cm_prefetch<value_row_u32, DataSize::U32>(v_cache_stateful, prefetch_offset);
                 }
                 #else
                 #pragma unroll
