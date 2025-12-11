@@ -355,8 +355,8 @@ void pa_kernel_lsc_prefetch_f16(
     int q_len, //q_step
     int kv_len, //not used for now
     svmptr_t q_base [[type("svmptr_t")]],
-    SurfaceIndex query_gather,
-    uint32_t query_gather_offset_bytes,
+    SurfaceIndex q_gather,
+    uint32_t q_gather_offset_bytes,
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
     SurfaceIndex v_cache_stateful,
@@ -406,16 +406,16 @@ void pa_kernel_lsc_prefetch_f16(
         #else
         constexpr int q_tile_uints = REG_K / 2;
         constexpr int q_tile_elems = q_tile_uints * REG_N;
+        vector<ushort,  q_tile_elems> gather_pred;
 
         #pragma unroll
         for (int ri = 0; ri < head_size/REG_K; ri++) {
             vector<unsigned, q_tile_elems> gather_offsets;
-            vector<ushort,  q_tile_elems> gather_pred;
             uint col_uint_base = ri * q_tile_uints;
             #pragma unroll
             for (int col = 0; col < REG_N; col++) {
                 bool active = (col < q_tokens_left);
-                uint token_base = query_gather_offset_bytes + col * q_pitch;
+                uint token_base = q_gather_offset_bytes + col * q_pitch;
                 #pragma unroll
                 for (int row = 0; row < q_tile_uints; row++) {
                     int idx = row * REG_N + col;
@@ -429,7 +429,7 @@ void pa_kernel_lsc_prefetch_f16(
                         VectorSize::N1,
                         DataSize::U32,
                         CacheHint::Cached,
-                        CacheHint::Cached>(query_gather, gather_offsets, gather_pred);
+                        CacheHint::Cached>(q_gather, gather_offsets, gather_pred);
             rQ[ri].format<uint>()  = gathered;
             rQ[ri].format<half>()  = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
         }
@@ -440,10 +440,8 @@ void pa_kernel_lsc_prefetch_f16(
     lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
     static_assert(wg_local_size == 16);
     lsc::block_2d_desc<half, 1, kv_step/wg_local_size, REG_K> prefetch_K(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
-    #if !CMPA_USE_STATEFUL_V_CM_LOAD
     lsc::block_2d_desc<half, 1, REG_K, REG_N*VALUE_TILE_NUM> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
     lsc::block_2d_desc<half, 1, REG_K/wg_local_size, REG_N*VALUE_TILE_NUM> prefetch_V(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
-    #endif
     #endif
     constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     constexpr uint blk_stride_bytes = blk_stride * sizeof(half);

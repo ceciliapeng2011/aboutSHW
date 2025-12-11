@@ -5,7 +5,7 @@
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
     half* query [[type("svmptr_t")]],
-    SurfaceIndex query_gather [[type("buffer_t")]],
+    SurfaceIndex q_gather [[type("buffer_t")]],
 #if CMPA_KVCACHE_U8
     int8_t* k_cache [[type("svmptr_t")]],
     int8_t* v_cache [[type("svmptr_t")]],
@@ -150,7 +150,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
                             reinterpret_cast<svmptr_t>(query + q_offset),
-                            query_gather,
+                            q_gather,
                             q_offset_bytes,
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
