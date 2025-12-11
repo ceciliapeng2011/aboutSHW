@@ -443,11 +443,9 @@ void pa_kernel_lsc_prefetch_f16(
     lsc::block_2d_desc<half, 1, REG_K, REG_N*VALUE_TILE_NUM> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
     lsc::block_2d_desc<half, 1, REG_K/wg_local_size, REG_N*VALUE_TILE_NUM> prefetch_V(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
     #endif
-    constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
+    constexpr int blk_stride = CMFLA_NUM_KV_HEADS * CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     constexpr uint blk_stride_bytes = blk_stride * sizeof(half);
     constexpr uint token_stride_bytes = head_size * sizeof(half);
-    constexpr uint value_row_bytes = REG_N * VALUE_TILE_NUM * sizeof(half);
-    constexpr uint value_row_u32 = value_row_bytes / sizeof(uint);
     int causal_left = q_start+past_lens;
 
     for(int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step) {
@@ -581,43 +579,37 @@ void pa_kernel_lsc_prefetch_f16(
         b2dV.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+cur_block_id*blk_stride));
         b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
         #endif
-        uint v_prefetch_stateful_row_offset = v_cache_stateful_offset_bytes + prefetch_block_id * blk_stride_bytes + ((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ) * token_stride_bytes;
         auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
         matrix<half, REG_K/2, REG_N*2*VALUE_TILE_NUM> Vmat;
-        #if !USE_LSC
-        half* base_v_cache_ptr = (half*)v_cache_base + cur_block_id*blk_stride + (kv_pos % CMPA_BLOCK_SZ)*head_size;
-        matrix<half, REG_K, REG_N*VALUE_TILE_NUM> Vmat_tmp;
-        #endif
-        uint v_stateful_row_offset = v_cache_stateful_offset_bytes + cur_block_id * blk_stride_bytes + (kv_pos % CMPA_BLOCK_SZ) * token_stride_bytes;
         #pragma unroll
         for(int k = 0, ri=0; k < head_size; k += REG_N * VALUE_TILE_NUM, ri += num_P_tiles * VALUE_TILE_NUM) {
             #if USE_LSC
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
             cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
             #else
-                constexpr uint elem_size = sizeof(half);
-                constexpr int value_row_u32 = (REG_N * VALUE_TILE_NUM * sizeof(half)) / sizeof(uint);
-                #pragma unroll
-                for(int Vr = 0; Vr < REG_K; Vr++){
-                    uint elem_offset = cur_block_id * blk_stride
-                                    + (kv_pos % CMPA_BLOCK_SZ) * head_size
-                                    + Vr * head_size
-                                    + k;
-                    uint cur_row_offset = v_cache_stateful_offset_bytes + elem_offset * elem_size;
-                    auto row_vec_u32 = cm_load<uint, value_row_u32>(v_cache_stateful, cur_row_offset);
-                    Vmat_tmp.row(Vr).format<uint>() = row_vec_u32;
-                }
-                if ((kv_pos + kv_step) > kv_stop) {
-                    uint valid_rows = kv_stop - kv_pos;
-                    for (uint r = valid_rows; r < kv_step; r++)
-                        Vmat_tmp.row(r) = 0.f;
-                }
-                #pragma unroll
-                for (int r = 0; r < REG_K/2; r++) {
-                    Vmat.row(r).select<REG_N*VALUE_TILE_NUM, 2>(0) = Vmat_tmp.row(r*2);
-                    Vmat.row(r).select<REG_N*VALUE_TILE_NUM, 2>(1) = Vmat_tmp.row(r*2+1);
-                }
-
+            matrix<half, REG_K, REG_N*VALUE_TILE_NUM> Vmat_tmp;
+            constexpr uint elem_size = sizeof(half);
+            constexpr int value_row_u32 = (REG_N * VALUE_TILE_NUM * sizeof(half)) / sizeof(uint);
+            #pragma unroll
+            for(int Vr = 0; Vr < REG_K; Vr++){
+                uint elem_offset = cur_block_id * blk_stride
+                                + (kv_pos % CMPA_BLOCK_SZ) * head_size
+                                + Vr * head_size
+                                + k;
+                uint cur_row_offset = v_cache_stateful_offset_bytes + elem_offset * elem_size;
+                auto row_vec_u32 = cm_load<uint, value_row_u32>(v_cache_stateful, cur_row_offset);
+                Vmat_tmp.row(Vr).format<uint>() = row_vec_u32;
+            }
+            if ((kv_pos + kv_step) > kv_stop) {
+                uint valid_rows = kv_stop - kv_pos;
+                for (uint r = valid_rows; r < kv_step; r++)
+                    Vmat_tmp.row(r) = 0.f;
+            }
+            #pragma unroll
+            for (int r = 0; r < REG_K/2; r++) {
+                Vmat.row(r).select<REG_N*VALUE_TILE_NUM, 2>(0) = Vmat_tmp.row(r*2);
+                Vmat.row(r).select<REG_N*VALUE_TILE_NUM, 2>(1) = Vmat_tmp.row(r*2+1);
+            }
             #endif
 
             if (kv_pos == 0) {

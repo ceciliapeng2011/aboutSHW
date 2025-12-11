@@ -733,7 +733,7 @@ if __name__ == "__main__":
                 print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 print("-----------------------------------------------------------------------------------------------------------------------------------------")
-                test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=False, sparse_block_sz = sparse_block_sz, sparse_ratio=1.0-density, check_acc=True)
+                test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=1.0-density, check_acc=True)
                 # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=1.0-density, check_acc=False)
                 # exit()
     # test_ov()
