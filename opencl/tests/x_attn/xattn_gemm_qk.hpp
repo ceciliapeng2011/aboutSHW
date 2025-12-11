@@ -59,8 +59,9 @@ CM_INLINE void get_mn(uint& id_wg_m, uint& id_wg_n, uint M, uint N, int slice_no
     }
 }
 
+
 extern "C" _GENX_MAIN_ void gemm_qk(
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     svmptr_t key_cache ATTR,
     svmptr_t query ATTR,
     #else
@@ -70,7 +71,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     svmptr_t block_indices ATTR,
     svmptr_t block_indices_begins ATTR,
     svmptr_t kq_max_wg ATTR,
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     svmptr_t kq_exp_partial_sum ATTR,
     #else
     SurfaceIndex kq_exp_partial_sum [[type("buffer_t")]],
@@ -91,7 +92,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     uint id_wg_m, id_wg_n;
     get_mn(id_wg_m, id_wg_n, M, N, slice_no, slice, BLOCK_WG_M, BLOCK_WG_N);
 
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     // key cache: [block, HQ, KV_BLOCK_SIZE, HEAD_SIZE_KEY]
 #if USE_INT8
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
@@ -99,8 +100,12 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
 #endif
     // query: [l_q, HQ * HEAD_SIZE]
+    //[B, Lq, Hq * HD]
+    // query_stride = stride * HD * HQ * 2  elements
+    // [B, Hq, L, HD] -> [B, L, Hq * HD]
     query += hq * HEAD_SIZE * (uint)sizeof(half);
     #endif
+    
 
     // kq_max: [hq, m_pad]
     // kq_max_wg: [hq, n_groups, m_pad]
@@ -113,7 +118,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     const uint n_after_sum_in_group = BLOCK_WG_N / sum_per_n_token_in_block;
     const uint n_after_sum_pad = n_after_sum_in_group * n_groups;
     const uint offset_partial_sum = hq * n_after_sum_pad * m_pad * (uint)sizeof(SOFTMAX_TYPE);
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     kq_exp_partial_sum += offset_partial_sum;
     #endif
 
