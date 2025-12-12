@@ -233,7 +233,7 @@ CM_INLINE void Transpose_32x32(matrix_ref<T1, 32, 32> in, matrix_ref<T2, 32, 32>
 template <int group_count, int op, int stop, typename T, int N, int M>
 CM_INLINE constexpr auto reduce2d(matrix_ref<T, N, M> src) {
     constexpr int group_size = M / group_count;
-    if constexpr (N > stop) {
+    if constexpr (N > stop && group_size > 1) {
         matrix<T, N / 2, M> result;
         // half of group will be reduced
         constexpr int new_group_size = group_size / 2;
@@ -304,7 +304,16 @@ template <int M, int N>
 CM_INLINE void cm_load_2d(matrix_ref<half, M, N> out, SurfaceIndex base, uint offset, uint pitch, bool showit = 0) {
     #pragma unroll
     for(int i = 0; i < out.n_rows(); i++) {
-        out.row(i).format<uint>() = cm_load<uint, N/2>(base, offset + i * pitch);
+        out.row(i).format<uint>() = cm_load<uint, N/2,DataSize::U32, CacheHint::Cached, CacheHint::Cached>(base, offset + i * pitch);
+    }
+}
+
+//half
+template <int M, int N>
+CM_INLINE void cm_prefetch_2d(SurfaceIndex base, uint offset, uint pitch) {
+    #pragma unroll
+    for(int i = 0; i < M; i++) {
+        cm_prefetch<N/2, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(base, offset + i * pitch);
     }
 }
 
@@ -353,7 +362,7 @@ CM_INLINE void cm_store_2d(matrix_ref<uint, M, N> out, SurfaceIndex base, uint o
 // src_a is query, src_b is key
 
 CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
-        #if USE_LSC_BLOCK_2D_DESC == 1
+        #ifdef CM_HAS_LSC_UNTYPED_2D
         svmptr_t key_cache ATTR,
         svmptr_t query ATTR,
         #else
@@ -363,14 +372,17 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         svmptr_t block_indices ATTR,
         svmptr_t block_indices_begins ATTR,
         svmptr_t kq_max_wg ATTR,
-        #if USE_LSC_BLOCK_2D_DESC == 1
+        #ifdef CM_HAS_LSC_UNTYPED_2D
         svmptr_t kq_exp_partial_sum ATTR,
         #else
         SurfaceIndex kq_exp_partial_sum [[type("buffer_t")]],
         #endif
         const uint M, const uint N, const uint K, const uint query_stride, const uint q_start_strided, const uint offset_partial_sum) {
-    constexpr int SG_SIZE = 8;     // Xe1==8?
+
+    constexpr int SG_SIZE = details::get_dpas_execution_size((CmPrecisionType)9);    
     constexpr int BLOCK_WG_K = 64;	// same in sg  // because unroll 4 times along K ??
+    constexpr int SUM_N = BLOCK_SG_N / (BLOCK_SIZE/STRIDE);
+
 #ifndef BLOCK_SG_M
     #define BLOCK_SG_M  64
     #define BLOCK_SG_N  32
@@ -385,11 +397,11 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     static constexpr int DEPTH = 8;
     static constexpr int BLOCK_REG_M = REPEAT;      // 8
     static constexpr int BLOCK_REG_N = SG_SIZE;     // 16 Xe1?
-    static constexpr int BLOCK_DPAS_C = BLOCK_REG_M * BLOCK_REG_N;  // 8*16 Xe1?
+    static constexpr int BLOCK_DPAS_C = BLOCK_REG_M * BLOCK_REG_N;  // src0
     static constexpr int VNNI = sizeof(half);
     static constexpr int BLOCK_REG_K = DEPTH * sizeof(int) / VNNI;   // 8*2
-    static constexpr int BLOCK_REG_A = BLOCK_REG_M * BLOCK_REG_K;    // 8*16
-    static constexpr int BLOCK_REG_B = BLOCK_REG_N * BLOCK_REG_K;    // 16*16 Xe1?
+    static constexpr int BLOCK_REG_A = BLOCK_REG_M * BLOCK_REG_K;    // src2
+    static constexpr int BLOCK_REG_B = BLOCK_REG_N * BLOCK_REG_K;    // scr1
 
     static constexpr int BLOCK_WG_M = SG_M * BLOCK_SG_M;   // 4*64=256
     static constexpr int BLOCK_WG_N = SG_N * BLOCK_SG_N;   // 8*32=256
@@ -398,8 +410,15 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     static constexpr int REG_N = BLOCK_SG_N / BLOCK_REG_N;  // 32/16=2 times per thread Xe1?
     static constexpr int REG_K = BLOCK_WG_K / BLOCK_REG_K;  // 64/16=4
     static constexpr int REG_MN = REG_M * REG_N;
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     static constexpr int KEY_LINES_PER_LOAD = KV_BLOCK_SIZE / STRIDE;   // 256/16=16, i.e. BLOCK_REG_N because KV_BLOCK_SIZE=BLOCK_REG_N*STRIDE ?
-
+    #else
+    static constexpr int KEY_LINES_PER_LOAD = SG_SIZE;
+    vector<uint, KEY_LINES_PER_LOAD> gather_offsets_b;
+    cmtl::cm_vector_assign(gather_offsets_b.select_all(), 0, 1);
+    vector<uint, BLOCK_SG_M> block_offsets_a;
+    cmtl::cm_vector_assign(block_offsets_a.select_all(), 0, 1);
+    #endif 
     matrix<float, REG_M * REG_N, BLOCK_DPAS_C> acc = 0;                              // --> 64*2 regs   // 8*2 x (8*16) Xe1?
     uint id_sg_n = cm_local_id(0);
     uint id_sg_m = cm_local_id(1);
@@ -407,7 +426,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
 
     static_assert(REG_N == 2, "block_2d_desc for b is manually unrolled by 2");         // Xe1? // each b buffer process two adjacent key_cache blocks
     static_assert(HEAD_SIZE % BLOCK_WG_K == 0, "K dimension must be multiple of BLOCK_WG_K");
-    static_assert(KV_BLOCK_SIZE == 128, "block size of key(key_cache) should be 256");
+    static_assert(KV_BLOCK_SIZE == 256, "block size of key(key_cache) should be 256");
     uint N_block = (N + BLOCK_WG_N - 1) / BLOCK_WG_N;
     uint M_aligned = (M + BLOCK_WG_M - 1) / BLOCK_WG_M * BLOCK_WG_M;
     uint K_block_pad = N_block * (BLOCK_WG_N / (BLOCK_SIZE / STRIDE));
@@ -429,6 +448,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         }
         {
             // store
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             matrix<SOFTMAX_TYPE, 8, 4> sum_t = 0;
             lsc::block_2d_desc<SOFTMAX_TYPE, 1, 8, 4> desc_c{ kq_exp_partial_sum, M - 1, (uint)(K_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(K_block_pad * sizeof(SOFTMAX_TYPE) - 1),
                 (int)((id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) / block_size_div_stride), (int)(id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M) };
@@ -440,6 +460,19 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
             cm_store<CacheHint::Uncached, CacheHint::WriteBack, 0, 8 * 5>(desc_c, sum_t.format<SOFTMAX_TYPE>());
             cm_store<CacheHint::Uncached, CacheHint::WriteBack, 0, 8 * 6>(desc_c, sum_t.format<SOFTMAX_TYPE>());
             cm_store<CacheHint::Uncached, CacheHint::WriteBack, 0, 8 * 7>(desc_c, sum_t.format<SOFTMAX_TYPE>());
+            #else
+            matrix<SOFTMAX_TYPE, 8, SUM_N> sum_t = 0;
+            const uint pitch_c = K_block_pad * sizeof(SOFTMAX_TYPE);
+            uint off_c = offset_partial_sum;
+            off_c += pitch_c * (id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M);
+            off_c += ((id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) / block_size_div_stride) * sizeof(SOFTMAX_TYPE);
+
+            #pragma unroll
+            for (uint i = 0; i < BLOCK_SG_M/8; i++) {
+                cm_store_2d(sum_t.format<uint, 8, SUM_N>(), kq_exp_partial_sum, off_c + (8 * i) * pitch_c, pitch_c);
+            }
+            #endif
+
         }
 
         return;
@@ -448,9 +481,9 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     // assume block index coming from 0 in block_indices_begins
     int block_index_begin = ((int*)block_indices_begins)[0];
     int* block_indices_p = (int*)block_indices + block_index_begin;
-    int b_adjacent_between_head = query_stride / STRIDE;   // query_stride_in_original_space = HEAD_SIZE * HQ * 2 ?
+    int b_adjacent_between_head = query_stride / STRIDE;   // HEAD_SIZE * HQ  +  HEAD_SIZE * HQ (padding 0)
     // M[0:16*2]xK[0:16]
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<half, 1, 32, BLOCK_REG_K> desc_a{ query, M - 1, (uint)((query_stride - hq * HEAD_SIZE) * sizeof(half) - 1), (uint)(query_stride * sizeof(half) - 1),
         (STRIDE - 1) * b_adjacent_between_head, (int)(id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M) };   // 32 = BLOCK_SG_M/2 ?
     // prefetch A
@@ -458,11 +491,11 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         (STRIDE - 1) * b_adjacent_between_head, (int)(id_wg_m * BLOCK_WG_M + id_sg_mn * (BLOCK_WG_M / SG_MN)) };  // 32 = BLOCK_REG_K * 2 (prefetch every 2 iters) ?
     #else
     const uint pitch_a = query_stride * sizeof(half);
-    uint base_off_a = hq * HEAD_SIZE * (uint)sizeof(half);
+    uint base_off_a = hq * HEAD_SIZE * (uint)sizeof(half);  /*q header base*/
     uint base_off_prefetch_a = base_off_a;
 
-    base_off_a += pitch_a * (id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M);
-    uint off_a = base_off_a + ((STRIDE - 1) * b_adjacent_between_head) * sizeof(half);
+    base_off_a += pitch_a * /*Y_offset*/(id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M);
+    uint off_a = base_off_a + /*X_offset*/ ((STRIDE - 1) * b_adjacent_between_head) * sizeof(half);
 
     base_off_prefetch_a += pitch_a * (id_wg_m * BLOCK_WG_M + id_sg_mn * (BLOCK_WG_M / SG_MN));
     uint off_prefetch_a = base_off_prefetch_a + ((STRIDE - 1) * b_adjacent_between_head) * sizeof(half);
@@ -476,57 +509,83 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     block_idx = MYMIN(block_idx, max_block_idx);
 #if USE_INT8
     uint offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b0{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
-    uint scale_offset0 = offset + KV_BLOCK_SIZE * HEAD_SIZE;
+    uint scale_offset0 = offset + KV_BLOCK_SIZE * HEAD_SIZE;   //KV_BLOCK_SIZE *128(int8)  + KV_BLOCK_SIZE(half)   + KV_BLOCK_SIZE(half)
+    #else 
+    const uint pitch_b = K * sizeof(char);
+    uint hk = hq / (HQ / HK);
+    uint off_b0 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char)) + offset;
+    uint scale_offset0 = off_b0 + KV_BLOCK_SIZE * HEAD_SIZE;   //KV_BLOCK_SIZE *128(int8)  + KV_BLOCK_SIZE(half)   + KV_BLOCK_SIZE(half) 
+    #endif 
+
     block_idx = MYMIN(block_idx + 1, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b1{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
     uint scale_offset1 = offset + KV_BLOCK_SIZE * HEAD_SIZE;
+    #else
+    uint off_b1 = off_b0 + KEY_LINES_PER_LOAD * pitch_b; 
+    //uint off_b1 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half)) + offset;
+    uint scale_offset1 = scale_offset0 + KV_BLOCK_SIZE * 2;
+    //off_b1 += offset;
+    #endif 
+
     // prefetch B
     block_idx = (uint)(id_wg_n * BLOCK_WG_N + id_sg_mn * (BLOCK_WG_N / SG_MN)) * STRIDE / KV_BLOCK_SIZE;
     block_idx = MYMIN(block_idx, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
     static_assert(BLOCK_WG_N / SG_MN <= KEY_LINES_PER_LOAD, "prefetch lines should be inside one block");
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<uchar, 1, BLOCK_WG_N / SG_MN, 32> desc_prefetch_b{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
+    #else
+    uint off_prefetch_b = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
+    off_prefetch_b += offset;
+    vector<uint, KEY_LINES_PER_LOAD> offsets_scale0 = (gather_offsets_b) * STRIDE * sizeof(half) + scale_offset0;
+    vector<uint, KEY_LINES_PER_LOAD> offsets_scale1 = offsets_scale0 + KV_BLOCK_SIZE*2;
+    #endif
 
     // N[:]xK[0:32]                                                     --> 16 * 1 regs
-    matrix<int, KEY_LINES_PER_LOAD, 8> b0_up_s8, b0_down_s8, b1_up_s8, b1_down_s8;
-    matrix<half, 2, BLOCK_REG_B> b0;                      // --> 16 regs
-    matrix<half, 2, KEY_LINES_PER_LOAD * 2> scales, zps;
-    matrix<half, 2, KV_BLOCK_SIZE> scales_block, zps_block;
+    matrix<int, KEY_LINES_PER_LOAD, 8> b0_up_s8, b0_down_s8, b1_up_s8, b1_down_s8; //ping pong
+    matrix<half, REG_N, BLOCK_REG_B> b0;                      // after dequant
+    matrix<half, REG_N, KEY_LINES_PER_LOAD * 2> scales, zps;
+    matrix<half, REG_N, KEY_LINES_PER_LOAD*STRIDE> scales_block, zps_block;
 #else
     uint offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b0{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
         0, 0 };
     #else
+    const uint pitch_b = K * sizeof(half);
     uint hk = hq / (HQ / HK);
-    uint off_b0 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
-    off_b0 += offset;
+    uint off_b0 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half)) + offset;
+    //off_b0 += offset;
     #endif
     block_idx = MYMIN(block_idx + 1, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b1{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
         0, 0 };
     #else
-    uint off_b1 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
-    off_b1 += offset;
+    //uint off_b1 = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half)) + offset;
+    uint off_b1 = off_b0 + KEY_LINES_PER_LOAD * pitch_b;
+    //off_b1 += offset;
     #endif
     // prefetch B
     block_idx = (uint)(id_wg_n * BLOCK_WG_N + id_sg_mn * (BLOCK_WG_N / SG_MN)) * STRIDE / KV_BLOCK_SIZE;
     block_idx = MYMIN(block_idx, max_block_idx);
-    offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
+    offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));  //paged offset
     static_assert(BLOCK_WG_N / SG_MN <= KEY_LINES_PER_LOAD, "prefetch lines should be inside one block");
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<half, 1, BLOCK_WG_N / SG_MN, 32> desc_prefetch_b{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
         0, 0 };
     #else
     uint off_prefetch_b = hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
     off_prefetch_b += offset;
+
     #endif
     // 0~2 M[:]xK[0:16] 2~4 K[16:32]                                                     --> 32 * 2 regs
     matrix<half, REG_N, BLOCK_REG_B> b0, b1;      // ping-pong B
@@ -534,30 +593,35 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
 
     // warmup
     // prefetch
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b);
     desc_prefetch_b.set_block_x(desc_prefetch_b.get_block_x() + 32);
     cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_a);
     desc_prefetch_a.set_block_x(desc_prefetch_a.get_block_x() + 32);
     #else
-    cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(key_cache, off_prefetch_b);
+
+    cm_prefetch_2d<BLOCK_WG_N / SG_MN, 32>(key_cache,off_prefetch_b,pitch_b);
     off_prefetch_b += 32 * sizeof(half);  
-    cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(query, off_prefetch_a);
+    cm_prefetch_2d<BLOCK_WG_M / SG_MN, 32>(query,off_prefetch_a,pitch_a);
     off_prefetch_a += 32 * sizeof(half);
     #endif
 
     // load b: N[0:16]xK[0:16]
 #if USE_INT8
     {
-        lsc::block_2d_desc<int, 1, 16, 16 / 2> desc_scale{ key_cache + scale_offset0, 16 * 2 - 1, (uint)(16 * sizeof(half) - 1), (uint)(16 * sizeof(half) - 1),
+        #ifdef CM_HAS_LSC_UNTYPED_2D
+        //16 * 16 half,  1D->2D
+        matrix<half, KEY_LINES_PER_LOAD, STRIDE> tmp_scale, tmp_zp;  //KV_BLOCK_SIZE/2
+        lsc::block_2d_desc<int, 1, 16, 16 / 2> desc_scale{ key_cache + scale_offset0, KV_BLOCK_SIZE/16 * 2 - 1, (uint)(16 * sizeof(half) - 1), (uint)(16 * sizeof(half) - 1),
             0, 0 };
-        matrix<half, 16, 16> tmp_scale, tmp_zp;
         cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached, 0, 0>(tmp_scale.format<int>(), desc_scale);
         cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached, 0, 16>(tmp_zp.format<int>(), desc_scale);
+
         scales_block[0].format<half, 16, 16>().select<8, 2, 16, 1>(0) = tmp_scale.format<half, 8, 32>().select<8, 1, 16, 2>(0, 0);
         scales_block[0].format<half, 16, 16>().select<8, 2, 16, 1>(1) = tmp_scale.format<half, 8, 32>().select<8, 1, 16, 2>(0, 1);
         zps_block[0].format<half, 16, 16>().select<8, 2, 16, 1>(0) = tmp_zp.format<half, 8, 32>().select<8, 1, 16, 2>(0, 0);
         zps_block[0].format<half, 16, 16>().select<8, 2, 16, 1>(1) = tmp_zp.format<half, 8, 32>().select<8, 1, 16, 2>(0, 1);
+        
         desc_scale.set_base(key_cache + scale_offset1);
         cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached, 0, 0>(tmp_scale.format<int>(), desc_scale);
         cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached, 0, 16>(tmp_zp.format<int>(), desc_scale);
@@ -565,42 +629,73 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         scales_block[1].format<half, 16, 16>().select<8, 2, 16, 1>(1) = tmp_scale.format<half, 8, 32>().select<8, 1, 16, 2>(0, 1);
         zps_block[1].format<half, 16, 16>().select<8, 2, 16, 1>(0) = tmp_zp.format<half, 8, 32>().select<8, 1, 16, 2>(0, 0);
         zps_block[1].format<half, 16, 16>().select<8, 2, 16, 1>(1) = tmp_zp.format<half, 8, 32>().select<8, 1, 16, 2>(0, 1);
+        #else
+        matrix<half, KEY_LINES_PER_LOAD, STRIDE> tmp_scale, tmp_zp;  //KV_BLOCK_SIZE/2
+        tmp_scale.format<uint>() = cm_load<uint, VectorSize::N8 /*(STRIDE / 2)*/>(key_cache, offsets_scale0); 
+        scales_block[0].format<half, 16, 8>().select<8, 2, 8, 1>(0) = tmp_scale.format<half, 4, 32>().select<4, 1, 16, 2>(0, 0);
+        scales_block[0].format<half, 16, 8>().select<8, 2, 8, 1>(1) = tmp_scale.format<half, 4, 32>().select<4, 1, 16, 2>(0, 1);
+    
+        vector<uint, KEY_LINES_PER_LOAD> offsets_scale0_ = offsets_scale0 + KEY_LINES_PER_LOAD*STRIDE * sizeof(half);
+        tmp_scale.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_scale0_);
+        scales_block[1].format<half, 16, 8>().select<8, 2, 8, 1>(0) = tmp_scale.format<half, 4, 32>().select<4, 1, 16, 2>(0, 0);
+        scales_block[1].format<half, 16, 8>().select<8, 2, 8, 1>(1) = tmp_scale.format<half, 4, 32>().select<4, 1, 16, 2>(0, 1);
+        tmp_zp.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_scale1);       
+        zps_block[0].format<half, 16, 8>().select<8, 2, 8, 1>(0) = tmp_zp.format<half, 4, 32>().select<4, 1, 16, 2>(0, 0);
+        zps_block[0].format<half, 16, 8>().select<8, 2, 8, 1>(1) = tmp_zp.format<half, 4, 32>().select<4, 1, 16, 2>(0, 1);
+
+        vector<uint, KEY_LINES_PER_LOAD> offsets_scale1_ = offsets_scale1 + KEY_LINES_PER_LOAD*STRIDE * sizeof(half);
+        tmp_zp.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_scale1_);       
+        zps_block[1].format<half, 16, 8>().select<8, 2, 8, 1>(0) = tmp_zp.format<half, 4, 32>().select<4, 1, 16, 2>(0, 0);
+        zps_block[1].format<half, 16, 8>().select<8, 2, 8, 1>(1) = tmp_zp.format<half, 4, 32>().select<4, 1, 16, 2>(0, 1);
+
+        #endif
     }
 
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_up_s8.format<int>(), desc_b0);
     cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_down_s8.format<int>(), desc_b1);
+    #else
+    vector<uint, KEY_LINES_PER_LOAD> offsets_0 = (gather_offsets_b) * pitch_b + off_b0;
+    vector<uint, KEY_LINES_PER_LOAD> offsets_1 = (gather_offsets_b) * pitch_b + off_b1;
+    b0_up_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+    b0_down_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
+
+    #endif
 #else
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[0].format<int>(), desc_b0);
     cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[1].format<int>(), desc_b1);
     #else
-    cm_gather_2d(b0[0].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b0, K * sizeof(half));
-    cm_gather_2d(b0[1].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b1, K * sizeof(half));
+
+    vector<uint, KEY_LINES_PER_LOAD> offsets_0 = (gather_offsets_b) * pitch_b + off_b0;
+    vector<uint, KEY_LINES_PER_LOAD> offsets_1 = (gather_offsets_b) * pitch_b + off_b1;
+    b0[0].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0); 
+    b0[1].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
     #endif
 #endif
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     desc_b0.set_block_x(desc_b0.get_block_x() + 8);
     desc_b1.set_block_x(desc_b1.get_block_x() + 8);
     #else
-    off_b0 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
-    off_b1 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
+    offsets_0 += 8 * sizeof(uint); 
+    offsets_1 += 8 * sizeof(uint);
     #endif
 
     cm_sbarrier(1);
 
 #if USE_INT8
-    auto dec = [&](vector<int, 64> B0_i8, vector<int, 64> B1_i8, matrix_ref<half, REG_N, BLOCK_REG_B> B0) {
+    auto dec = [&](vector<int, KEY_LINES_PER_LOAD*4> B0_i8, vector<int, KEY_LINES_PER_LOAD*4> B1_i8, matrix_ref<half, REG_N, BLOCK_REG_B> B0) {
 #pragma unroll
         for (int n = 0; n < REG_N; n++) {
-            auto b = B0[n].format<half, 8, 32>();
+            auto b = B0[n].format<half, BLOCK_REG_K/2, BLOCK_REG_N*2>(); 
 #pragma unroll
-            for (int m = 0; m < 8; m++) {
+            for (int m = 0; m < BLOCK_REG_K/2; m++) {
                 auto b_row = b[m];
-                vector<ushort, 16> d0;
+                vector<ushort, BLOCK_REG_N> d0;
                 if (n == 0)
-                    d0 = B0_i8.format<ushort, 4, 32>()[m / 2].select<16, 2>(m % 2);
+                    d0 = B0_i8.format<ushort, 4, BLOCK_REG_N*2>()[m / 2].select<BLOCK_REG_N, 2>(m % 2);
                 else
-                    d0 = B1_i8.format<ushort, 4, 32>()[m / 2].select<16, 2>(m % 2);
+                    d0 = B1_i8.format<ushort, 4, BLOCK_REG_N*2>()[m / 2].select<BLOCK_REG_N, 2>(m % 2);
                 b_row.format<ushort>() = d0.format<uchar>();
                 b_row *= half{32768.0};
                 b_row *= half{512.0};
@@ -609,37 +704,38 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         }
     };
 #endif
+
     auto dot = [&](matrix<half, REG_M, BLOCK_REG_A> A, matrix<half, REG_N, BLOCK_REG_B> B) {
 #pragma unroll
         for (int reg_n = 0; reg_n < REG_N; reg_n++) {
 #pragma unroll
             for (uint reg_m = 0; reg_m < REG_M; reg_m++) {
                 acc.row((ushort)(reg_m * REG_N + reg_n)) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, 8, 8>(acc.row((ushort)(reg_m * REG_N + reg_n)),
-                    B.row((ushort)reg_n).format<int>(), A.row((ushort)reg_m).format<int>());
+                   B.row((ushort)reg_n).format<int>(), A.row((ushort)reg_m).format<int>());
             }
         }
     };
 
     for (uint s = 0; s < STRIDE; s++) {
 #if USE_INT8
-        auto tmp = scales_block[0].select<16, 1>(s * 16);
-        scales[0].select<16, 2>(0) = tmp;
-        scales[0].select<16, 2>(1) = scales[0].select<16, 2>(0);
-        tmp = scales_block[1].select<16, 1>(s * 16);
-        scales[1].select<16, 2>(0) = tmp;
-        scales[1].select<16, 2>(1) = scales[1].select<16, 2>(0);
-        tmp = zps_block[0].select<16, 1>(s * 16);
-        zps[0].select<16, 2>(0) = tmp;
-        zps[0].select<16, 2>(1) = zps[0].select<16, 2>(0);
-        tmp = zps_block[1].select<16, 1>(s * 16);
-        zps[1].select<16, 2>(0) = tmp;
-        zps[1].select<16, 2>(1) = zps[1].select<16, 2>(0);
+        auto tmp = scales_block[0].select<KEY_LINES_PER_LOAD, 1>(s * KEY_LINES_PER_LOAD);
+        scales[0].select<KEY_LINES_PER_LOAD, 2>(0) = tmp;
+        scales[0].select<KEY_LINES_PER_LOAD, 2>(1) = scales[0].select<KEY_LINES_PER_LOAD, 2>(0);
+        tmp = scales_block[1].select<KEY_LINES_PER_LOAD, 1>(s * KEY_LINES_PER_LOAD);
+        scales[1].select<KEY_LINES_PER_LOAD, 2>(0) = tmp;
+        scales[1].select<KEY_LINES_PER_LOAD, 2>(1) = scales[1].select<KEY_LINES_PER_LOAD, 2>(0);
+        tmp = zps_block[0].select<KEY_LINES_PER_LOAD, 1>(s * KEY_LINES_PER_LOAD);
+        zps[0].select<KEY_LINES_PER_LOAD, 2>(0) = tmp;
+        zps[0].select<KEY_LINES_PER_LOAD, 2>(1) = zps[0].select<KEY_LINES_PER_LOAD, 2>(0);
+        tmp = zps_block[1].select<KEY_LINES_PER_LOAD, 1>(s * KEY_LINES_PER_LOAD);
+        zps[1].select<KEY_LINES_PER_LOAD, 2>(0) = tmp;
+        zps[1].select<KEY_LINES_PER_LOAD, 2>(1) = zps[1].select<KEY_LINES_PER_LOAD, 2>(0);
 #endif
         #pragma unroll
         for (uint hs = 0; hs < HEAD_SIZE / BLOCK_WG_K; hs++) {
             // --------------------------------------------- unroll 0 ?      -----------------------------
             // prefetch
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b);
             desc_prefetch_b.set_block_x(desc_prefetch_b.get_block_x() + 32);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_a);
@@ -648,9 +744,10 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
             else
                 desc_prefetch_a.set_block_x(desc_prefetch_a.get_block_x() + 32);
             #else
-            cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(key_cache, off_prefetch_b);
+            //cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(key_cache, off_prefetch_b);
+            cm_prefetch_2d<BLOCK_WG_N / SG_MN, 32>(key_cache,off_prefetch_b,pitch_b);
+            cm_prefetch_2d<BLOCK_WG_M / SG_MN, 32>(query,off_prefetch_a,pitch_a);
             off_prefetch_b += 32 * sizeof(half);
-            cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(query, off_prefetch_a);
             if (hs == HEAD_SIZE / BLOCK_WG_K - 1)
                 off_prefetch_a = base_off_prefetch_a + ((STRIDE - 1 - s - 1) * b_adjacent_between_head) * sizeof(half);
             else
@@ -658,70 +755,81 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
             #endif
 
             // load a: M[0:16*4]xK[0:16]
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
             #else
-            cm_load_2d(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>(), query, off_a, pitch_a, (id_sg_mn==0 && s==0));
+            cm_load_2d(a0.format<half, BLOCK_SG_M, BLOCK_REG_K>(), query, off_a, pitch_a, (id_sg_mn==0 && s==0));
+
+            uint query_header_xbase = hq * HEAD_SIZE;
+            uint offset_a_x = ((STRIDE - 1) * b_adjacent_between_head  + query_header_xbase) * sizeof(half);
+
+            matrix_ref<half, BLOCK_SG_M, BLOCK_REG_K> aa = a0.format<half, BLOCK_SG_M, BLOCK_REG_K>();
+
             #endif
-            // if(id_sg_mn==0 && s==0) show(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>());
 
             // load b: N[0:16*2]xK[16:32]
 #if USE_INT8
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1_up_s8.format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1_down_s8.format<int>(), desc_b1);
-            dec(b0_up_s8.format<int>().select<64, 1>(), b0_down_s8.format<int>().select<64, 1>(), b0);
+            #else
+            b1_up_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b1_down_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
+            #endif
+            dec(b0_up_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(), b0_down_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(), b0);
             dot(a0, b0);
 #else
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1[0].format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1[1].format<int>(), desc_b1);
             #else
-            cm_gather_2d(b1[0].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b0, K * sizeof(half));
-            cm_gather_2d(b1[1].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b1, K * sizeof(half));
+
+            b1[0].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b1[1].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
             #endif
             // if(id_sg_mn==0 && s==0) show(b0.format<half, 2, 16*16>());
             dot(a0, b0);
 #endif
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             desc_a.set_block_x(desc_a.get_block_x() + BLOCK_REG_K);
             desc_b0.set_block_x(desc_b0.get_block_x() + 8);
             desc_b1.set_block_x(desc_b1.get_block_x() + 8);
             #else
             off_a += BLOCK_REG_K * sizeof(half);
-            off_b0 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
-            off_b1 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
+            offsets_0 += 8 * sizeof(uint);   //16 fp16, 32 int8
+            offsets_1 += 8 * sizeof(uint);
             #endif
 
             // --------------------------------------------- unroll 1 ?      -----------------------------
 
             // load a: M[0:16*4]xK[16:32]
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
             #else
-            cm_load_2d(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
+            cm_load_2d(a0.format<half, BLOCK_SG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
             #endif
 
 #if USE_INT8
-            dec(b0_up_s8.format<int>().select<64, 1>(64), b0_down_s8.format<int>().select<64, 1>(64), b0);
+            dec(b0_up_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(KEY_LINES_PER_LOAD*4), b0_down_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(KEY_LINES_PER_LOAD*4), b0);
             dot(a0, b0);
 #else
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[0].format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[1].format<int>(), desc_b1);
             desc_b0.set_block_x(desc_b0.get_block_x() + 8);
             desc_b1.set_block_x(desc_b1.get_block_x() + 8);
             #else
-            cm_gather_2d(b0[0].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b0, K * sizeof(half));
-            cm_gather_2d(b0[1].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b1, K * sizeof(half));
-            off_b0 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
-            off_b1 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
+            b0[0].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b0[1].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
+            offsets_0 += 8 * sizeof(uint);   //16 fp16, 32 int8
+            offsets_1 += 8 * sizeof(uint);
             #endif
             // if(id_sg_mn==0 && s==0) show(b1.format<half, 2, 16*16>());
             dot(a0, b1);
 #endif
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             desc_a.set_block_x(desc_a.get_block_x() + BLOCK_REG_K);
             #else
             off_a += BLOCK_REG_K * sizeof(half);
@@ -730,7 +838,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
             // --------------------------------------------- unroll 2 ?      -----------------------------
 
             // prefetch
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b);
             desc_prefetch_b.set_block_x(desc_prefetch_b.get_block_x() + 32);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_a);
@@ -740,45 +848,50 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
             #else
-            cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(key_cache, off_prefetch_b);
+            cm_prefetch_2d<BLOCK_WG_N / SG_MN, 32>(key_cache,off_prefetch_b,pitch_b);
+            cm_prefetch_2d<BLOCK_WG_M / SG_MN, 32>(query,off_prefetch_a,pitch_a);
             off_prefetch_b += 32 * sizeof(half);
-            cm_prefetch<16, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(query, off_prefetch_a);
             off_prefetch_a += 32 * sizeof(half);
 
             // load a: M[0:16*4]xK[32:48]
-            cm_load_2d(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
+            cm_load_2d(a0.format<half, BLOCK_SG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
             #endif
 
             // load b: N[0:16*2]xK[32:64]
 #if USE_INT8
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_up_s8.format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_down_s8.format<int>(), desc_b1);
-            dec(b1_up_s8.format<int>().select<64, 1>(), b1_down_s8.format<int>().select<64, 1>(), b0);
+            #else
+            b0_up_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b0_down_s8.format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
+            #endif
+            dec(b1_up_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(), b1_down_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(), b0);
             dot(a0, b0);
 #else
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1[0].format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1[1].format<int>(), desc_b1);
             #else
-            cm_gather_2d(b1[0].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b0, K * sizeof(half));
-            cm_gather_2d(b1[1].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b1, K * sizeof(half));
+            b1[0].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b1[1].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
             #endif
             dot(a0, b0);
 #endif
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             desc_a.set_block_x(desc_a.get_block_x() + BLOCK_REG_K);
             desc_b0.set_block_x(desc_b0.get_block_x() + 8);
             desc_b1.set_block_x(desc_b1.get_block_x() + 8);
             #else
             off_a += BLOCK_REG_K * sizeof(half);
-            off_b0 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
-            off_b1 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
+            offsets_0 += 8 * sizeof(uint);   //16 fp16, 32 int8
+            offsets_1 += 8 * sizeof(uint);
             #endif
 
             // --------------------------------------------- unroll 3 ?      -----------------------------
 
             // load a: M[0:16*4]xK[48:64]
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
             cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
             if (hs == HEAD_SIZE / BLOCK_WG_K - 1) {
@@ -787,31 +900,28 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
                 desc_a.set_block_x(desc_a.get_block_x() + BLOCK_REG_K);
             }
             #else
-            // read_2d(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>(), reinterpret_cast<svmptr_t>(ptr_a), pitch_a * sizeof(half));
-            cm_load_2d(a0.format<half, BLOCK_REG_M*REG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
+            cm_load_2d(a0.format<half, BLOCK_SG_M, BLOCK_REG_K>(), query, off_a, pitch_a);
             if (hs == HEAD_SIZE / BLOCK_WG_K - 1) {
-                // ptr_a = base_a + ((STRIDE - 1 - s - 1) * b_adjacent_between_head);
                 off_a = base_off_a + ((STRIDE - 1 - s - 1) * b_adjacent_between_head) * sizeof(half);
             } else {
-                // ptr_a += BLOCK_REG_K;
                 off_a += BLOCK_REG_K * sizeof(half);
             }
             #endif
 
 #if USE_INT8
-            dec(b1_up_s8.format<int>().select<64, 1>(64), b1_down_s8.format<int>().select<64, 1>(64), b0);
+            dec(b1_up_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(KEY_LINES_PER_LOAD*4), b1_down_s8.format<int>().select<KEY_LINES_PER_LOAD*4, 1>(KEY_LINES_PER_LOAD*4), b0);
             dot(a0, b0);
 #else
-            #if USE_LSC_BLOCK_2D_DESC == 1
+            #ifdef CM_HAS_LSC_UNTYPED_2D
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[0].format<int>(), desc_b0);
             cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0[1].format<int>(), desc_b1);
             desc_b0.set_block_x(desc_b0.get_block_x() + 8);
             desc_b1.set_block_x(desc_b1.get_block_x() + 8);
             #else
-            cm_gather_2d(b0[0].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b0, K * sizeof(half));
-            cm_gather_2d(b0[1].format<half, BLOCK_REG_N, BLOCK_REG_K>(), key_cache, off_b1, K * sizeof(half));
-            off_b0 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
-            off_b1 += BLOCK_REG_K * sizeof(KV_ELEMENT_TYPE);
+            b0[0].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_0);
+            b0[1].format<uint>() = cm_load<uint, VectorSize::N8>(key_cache, offsets_1);
+            offsets_0 += 8 * sizeof(uint); 
+            offsets_1 += 8 * sizeof(uint);
             #endif
             dot(a0, b1);
 #endif
@@ -839,7 +949,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         }
     }
 
-    // if(id_sg_m==0 && id_sg_n==0) show(acc.format<float, REG_M * REG_N, BLOCK_DPAS_C>());
+    //if(id_sg_m==0 && id_sg_n==0) show(acc.format<float, REG_M * REG_N, BLOCK_DPAS_C>());
     // if(id_sg_m==0 && id_sg_n==0) show(acc_half.format<float, REG_M * BLOCK_REG_M, REG_N * BLOCK_REG_N>());
 
     // if M(aka query) has tails, the following will not change the accuracy:
@@ -850,13 +960,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     n_start = MYMIN(n_start, N);
     int n_end = MYMIN(n_start + BLOCK_SG_N, N);
     int valid_n = n_end - n_start;
-    #if BLOCK_SG_M == 64 && BLOCK_SG_N == 32
-    matrix<SOFTMAX_TYPE, BLOCK_SG_M, 4> sum_t;
-    #elif BLOCK_SG_M == 32 && BLOCK_SG_N == 16
-    matrix<SOFTMAX_TYPE, BLOCK_SG_M, 2> sum_t;
-    #else
-    assert("Unsupported BLOCK_SG_M!\n");
-    #endif
+    matrix<SOFTMAX_TYPE, BLOCK_SG_M, SUM_N> sum_t;
     vector<int, BLOCK_SG_M> seq_m;
     cmtl::cm_vector_assign(seq_m.select_all(), 0, 1);
     vector_ref<int, BLOCK_SG_N> seq = seq_m.select<BLOCK_SG_N, 1>();
@@ -887,16 +991,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         }
     }
 
-    #if BLOCK_SG_M == 64 && BLOCK_SG_N == 32
-    max_m.select<32, 1>() = reduce2d<1, 0, 1>(acc_half.select<32, 1, 32, 1>()).format<SOFTMAX_TYPE>();
-    max_m.select<32, 1>(32) = reduce2d<1, 0, 1>(acc_half.select<32, 1, 32, 1>(32)).format<SOFTMAX_TYPE>();
-    #elif BLOCK_SG_M == 32 && BLOCK_SG_N == 16
-    max_m.select<16, 1>() = reduce2d<1, 0, 1>(acc_half.select<16, 1, 16, 1>()).format<SOFTMAX_TYPE>();
-    max_m.select<16, 1>(16) = reduce2d<1, 0, 1>(acc_half.select<16, 1, 16, 1>(16)).format<SOFTMAX_TYPE>();
-    // if(id_sg_m==0 && id_sg_n==0) show(max_m.format<SOFTMAX_TYPE, 1, BLOCK_SG_M>());
-    #else
-    assert("Unsupported BLOCK_SG_M!\n");
-    #endif
+        max_m.select<BLOCK_SG_M, 1>() = reduce2d<1, 0, 1>(acc_half.select<BLOCK_SG_M, 1, BLOCK_SG_N, 1>()).format<SOFTMAX_TYPE>();
 
     {
         uint slm_offset = (id_sg_n * BLOCK_WG_M + id_sg_m * BLOCK_SG_M) * (uint)sizeof(SOFTMAX_TYPE);
@@ -927,6 +1022,7 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
         uint offset = (id_wg_n * M_aligned + id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M) * sizeof(SOFTMAX_TYPE);
         cm_ptr_store<int>((int*)kq_max_wg, offset, max_m.format<int>());
     }
+    
     {
         // kq_exp_partial_sum: [b, hq, M_aligned, N/(BLOCK_SIZE/STRIDE)]
         if (valid_n == BLOCK_SG_N && skip_mask) {
@@ -955,19 +1051,12 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
                 } SIMD_IF_END;
             }
         }
-        #if BLOCK_SG_M == 64 && BLOCK_SG_N == 32
-        sum_t.select<32, 1, 4, 1>( 0).format<SOFTMAX_TYPE>() = reduce2d<4, 1, 4>(acc_half.select<32, 1, 32, 1>( 0)).format<SOFTMAX_TYPE>();
-        sum_t.select<32, 1, 4, 1>(32).format<SOFTMAX_TYPE>() = reduce2d<4, 1, 4>(acc_half.select<32, 1, 32, 1>(32)).format<SOFTMAX_TYPE>();
-        #elif BLOCK_SG_M == 32 && BLOCK_SG_N == 16
-        sum_t.select<16, 1, 2, 1>( 0).format<SOFTMAX_TYPE>() = reduce2d<2, 1, 2>(acc_half.select<16, 1, 16, 1>( 0)).format<SOFTMAX_TYPE>();
-        sum_t.select<16, 1, 2, 1>(16).format<SOFTMAX_TYPE>() = reduce2d<2, 1, 2>(acc_half.select<16, 1, 16, 1>(16)).format<SOFTMAX_TYPE>();
-        #else
-        assert("Unsupported BLOCK_SG_M!\n");
-        #endif
+
+        sum_t.select<BLOCK_SG_M, 1, SUM_N, 1>( 0).format<SOFTMAX_TYPE>() = reduce2d<SUM_N, 1, SUM_N>(acc_half.select<BLOCK_SG_M, 1, BLOCK_SG_N, 1>(0)).format<SOFTMAX_TYPE>();
 
     }
     // store
-    #if USE_LSC_BLOCK_2D_DESC == 1
+    #ifdef CM_HAS_LSC_UNTYPED_2D
     lsc::block_2d_desc<SOFTMAX_TYPE, 1, 8, 4> desc_c{ kq_exp_partial_sum, M - 1, (uint)(K_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(K_block_pad * sizeof(SOFTMAX_TYPE) - 1),
         (int)((id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) / block_size_div_stride), (int)(id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M) };
     cm_store<CacheHint::Uncached, CacheHint::WriteBack, 0, 8 * 0>(desc_c, sum_t.select<8, 1, 4, 1>( 0).format<SOFTMAX_TYPE>());
@@ -983,14 +1072,12 @@ CM_INLINE void gemm_qk(uint id_wg_m, uint id_wg_n, uint hq, uint slm,
     uint off_c = offset_partial_sum;
     off_c += pitch_c * (id_wg_m * BLOCK_WG_M + id_sg_m * BLOCK_SG_M);
     off_c += ((id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) / block_size_div_stride) * sizeof(SOFTMAX_TYPE);
-    cm_store_2d(sum_t.select<8, 1, 2, 1>( 0).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 0) * pitch_c, pitch_c);
-    cm_store_2d(sum_t.select<8, 1, 2, 1>( 8).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 1) * pitch_c, pitch_c);
-    cm_store_2d(sum_t.select<8, 1, 2, 1>(16).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 2) * pitch_c, pitch_c);
-    cm_store_2d(sum_t.select<8, 1, 2, 1>(24).format<uint, 8, 2>(), kq_exp_partial_sum, off_c + (8 * 3) * pitch_c, pitch_c);
-    // cm_store_2d(sum_t.select<8, 1, 4, 1>(32).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 4) * pitch_c, pitch_c);
-    // cm_store_2d(sum_t.select<8, 1, 4, 1>(40).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 5) * pitch_c, pitch_c);
-    // cm_store_2d(sum_t.select<8, 1, 4, 1>(48).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 6) * pitch_c, pitch_c);
-    // cm_store_2d(sum_t.select<8, 1, 4, 1>(56).format<uint, 8, 4>(), kq_exp_partial_sum, off_c + (8 * 7) * pitch_c, pitch_c);
+
+    #pragma unroll
+    for (uint i = 0; i < BLOCK_SG_M/8; i++) {
+        cm_store_2d(sum_t.select<8, 1, SUM_N, 1>( i*8).format<uint, 8, SUM_N>(), kq_exp_partial_sum, off_c + (8 * i) * pitch_c, pitch_c);
+    }
+
     #endif
 }
 #endif
