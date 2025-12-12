@@ -12,8 +12,8 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 #else
     half* k_cache [[type("svmptr_t")]],
     half* v_cache [[type("svmptr_t")]],
-    SurfaceIndex v_cache_stateful [[type("buffer_t")]],
 #endif
+    SurfaceIndex v_cache_stateful [[type("buffer_t")]],
     int32_t* past_lens [[type("svmptr_t")]],
     int32_t* block_indices [[type("svmptr_t")]],
     int32_t* block_indices_begins [[type("svmptr_t")]],
