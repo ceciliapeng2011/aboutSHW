@@ -308,19 +308,12 @@ CM_INLINE void cm_load_2d(matrix_ref<half, M, N> out, SurfaceIndex base, uint of
     }
 }
 
-template <int M, int N>
-CM_INLINE void cm_load_2d(matrix_ref<half, M, N> out, SurfaceIndex base, vector_ref<uint, M> offsets) {
-    #pragma unroll
-    for(int i = 0; i < out.n_rows(); i++) {
-        out.row(i).format<uint>() = cm_load<uint, N/2>(base, offsets[i]);
-    }
-}
-
+//half
 template <int M, int N>
 CM_INLINE void cm_prefetch_2d(SurfaceIndex base, uint offset, uint pitch) {
     #pragma unroll
     for(int i = 0; i < M; i++) {
-        //cm_prefetch<N/2, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(base, offset + i * pitch);
+        cm_prefetch<N/2, DataSize::U32, CacheHint::Cached, CacheHint::Cached>(base, offset + i * pitch);
     }
 }
 
