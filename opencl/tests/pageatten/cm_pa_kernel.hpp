@@ -5,6 +5,7 @@
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
     half* query [[type("svmptr_t")]],
+    SurfaceIndex q_gather [[type("buffer_t")]],
 #if CMPA_KVCACHE_U8
     int8_t* k_cache [[type("svmptr_t")]],
     int8_t* v_cache [[type("svmptr_t")]],
@@ -12,6 +13,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     half* k_cache [[type("svmptr_t")]],
     half* v_cache [[type("svmptr_t")]],
 #endif
+    SurfaceIndex v_cache_stateful [[type("buffer_t")]],
     int32_t* past_lens [[type("svmptr_t")]],
     int32_t* block_indices [[type("svmptr_t")]],
     int32_t* block_indices_begins [[type("svmptr_t")]],
@@ -102,6 +104,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 
     //Q/O[B, L, H, S]
     uint q_offset = (q_start_sg*num_heads + h)*head_size;
+    uint q_offset_bytes = q_offset * sizeof(half);
 
 #if SPARSE_BLOCK_SIZE > 1
     bool *block_mask_base, *wg_block_mask_base;
@@ -139,6 +142,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             block_indices);
 #else
     uint kv_offset = hkv*head_size*pa_block_sz;
+    uint kv_offset_bytes = kv_offset * sizeof(half);
     pa_kernel_lsc_prefetch_f16<is_causal, num_heads, num_kv_heads, head_size, 0, 16>(
                             wg_local_id,
                             q_start_sg, //q_start for SG,
@@ -146,8 +150,12 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
                             reinterpret_cast<svmptr_t>(query + q_offset),
+                            q_gather,
+                            q_offset_bytes,
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
+                            v_cache_stateful,
+                            kv_offset_bytes,
 #if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
