@@ -120,6 +120,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 
 #if CMPA_KVCACHE_U8
     uint kv_offset = hkv*(head_size+4)*pa_block_sz;
+    uint kv_offset_bytes = kv_offset * sizeof(half);
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
                             slm_V,
@@ -130,8 +131,12 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
                             reinterpret_cast<svmptr_t>(query + q_offset),
+                            q_gather,
+                            q_offset_bytes,
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
+                            v_cache_stateful,
+                            kv_offset_bytes,
 #if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),

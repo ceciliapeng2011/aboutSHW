@@ -33,8 +33,12 @@ void pa_lsc_u8(
     int q_len,
     int kv_len,
     svmptr_t q_base [[type("svmptr_t")]],
+    SurfaceIndex q_gather,
+    uint32_t q_gather_offset_bytes,
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
+    SurfaceIndex v_cache_stateful,
+    uint32_t v_cache_stateful_offset_bytes,
 #if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
@@ -74,27 +78,60 @@ void pa_lsc_u8(
             rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
         }
         #else
-            // for xe1, load original Q
-            matrix<half, REG_N, head_size> rQtmp;
+            // // for xe1, load original Q
+            // matrix<half, REG_N, head_size> rQtmp;
+            // #pragma unroll
+            // for(int r = 0; r < q_tokens_left; r++){
+            //     cm_svm_block_read<half, head_size>((svmptr_t)((half*)q_base + r * (q_pitch / sizeof(half))), rQtmp.row(r));
+            // }
+            // if (q_tokens_left < q_step) {
+            //     for(int r = q_tokens_left; r < q_step; r++) {
+            //         rQtmp.row(r) = 0.f;
+            //     }
+            // }
+            // // Transpose Q
+            // auto rQref = rQtmp.format<uint, REG_N, head_size / 2>();
+            // for (int k = 0, ri = 0; k < head_size/2; k += REG_K/2, ri++) {
+            //     #if CMPA_XE_ARCH == 1
+            //     Transpose_8x8(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
+            //     #else
+            //     Transpose2DMatrix(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
+            //     #endif
+            //     rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+            // }
+        // ===== 非 LSC：与 f16 相同的 gather load 路径 =====
+        constexpr int q_tile_uints  = REG_K / 2;                    // 每列有多少个 uint
+        constexpr int q_tile_elems  = q_tile_uints * REG_N;         // gather 向量长度
+        vector<ushort, q_tile_elems> gather_pred;
+
+        #pragma unroll
+        for (int ri = 0; ri < head_size/REG_K; ri++) {
+            vector<unsigned, q_tile_elems> gather_offsets;
+            uint col_uint_base = ri * q_tile_uints;
+
             #pragma unroll
-            for(int r = 0; r < q_tokens_left; r++){
-                cm_svm_block_read<half, head_size>((svmptr_t)((half*)q_base + r * (q_pitch / sizeof(half))), rQtmp.row(r));
-            }
-            if (q_tokens_left < q_step) {
-                for(int r = q_tokens_left; r < q_step; r++) {
-                    rQtmp.row(r) = 0.f;
+            for (int col = 0; col < REG_N; col++) {
+                bool active     = (col < q_tokens_left);
+                uint token_base = q_gather_offset_bytes + col * q_pitch;  // 每个 token 起始位置（按 byte）
+
+                #pragma unroll
+                for (int row = 0; row < q_tile_uints; row++) {
+                    int idx      = row * REG_N + col;
+                    uint col_byte = (col_uint_base + row) * sizeof(uint);
+                    gather_offsets[idx] = token_base + col_byte;
+                    gather_pred[idx]    = active ? 0xFFFF : 0;
                 }
             }
-            // Transpose Q
-            auto rQref = rQtmp.format<uint, REG_N, head_size / 2>();
-            for (int k = 0, ri = 0; k < head_size/2; k += REG_K/2, ri++) {
-                #if CMPA_XE_ARCH == 1
-                Transpose_8x8(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
-                #else
-                Transpose2DMatrix(rQref.select<REG_N, 1, REG_K/2, 1>(0, k), rQ[ri].format<uint, REG_K/2, REG_N>());
-                #endif
-                rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
-            }
+
+            rQ[ri] = 0;
+            auto gathered = cm_load<uint,
+                                    VectorSize::N1,
+                                    DataSize::U32,
+                                    CacheHint::Cached,
+                                    CacheHint::Cached>(q_gather, gather_offsets, gather_pred);
+            rQ[ri].format<uint>()  = gathered;
+            rQ[ri].format<half>()  = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+        }
         #endif
     }
 
