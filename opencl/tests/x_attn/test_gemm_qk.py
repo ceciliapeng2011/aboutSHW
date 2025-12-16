@@ -36,7 +36,7 @@ SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
-KV_BLOCK_SIZE = 128   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
+KV_BLOCK_SIZE = 256   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
 
 HQ = 32
 HK = 8
