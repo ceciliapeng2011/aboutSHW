@@ -1,5 +1,6 @@
 
 import torch
+import numpy as np
 
 def count_false_percentage(mask):
     B, H, NQ, NL = mask.shape
@@ -133,13 +134,16 @@ def generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, sparse_block_sz
     density = y.sum().item()/y.numel()
     if is_causal:
         density *= 2
-    print(f'density {density}')
+    print(f'density {density}  {true_ratio} {y.sum().item()} {y.numel()}')
     
+    np.savetxt(f'block_mask_{density:.02f}.csv', y.reshape(-1, k_block_num).to(dtype=torch.bool), delimiter=',', fmt='%.0f')
+
     return y, density
 
 # --- Example usage ---
 if __name__ == "__main__":
     num_heads, seq_len, trunk_sz, sparse_block_sz = 2, 4096*2, 4096, 128
+    num_heads, seq_len, trunk_sz, sparse_block_sz = 1, 256*2, 256, 128
     y = generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, sparse_block_sz, 0.25)
     # print(f'{y=}')
 
