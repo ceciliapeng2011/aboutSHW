@@ -4,6 +4,7 @@ import math
 
 import torch
 import functools
+import numpy as np
 
 from clops import cl
 from clops import compare
@@ -220,7 +221,7 @@ class ContinuousBatchKVCacheGenerator:
                         token_start_idx = block_idx * self.block_size
                         token_end_idx = token_start_idx + last_token_idx
                         input_block_per_head = input_data[i][token_start_idx:token_end_idx, h*_head_size:(h+1)*_head_size].reshape(1, 1, -1, _head_size)
-                        input_block_per_head_q = self.__quant_per_token(input_block_per_head, _head_size).reshape(-1)
+                        input_block_per_head_q = self.__quant_block_per_token(input_block_per_head, _head_size, self.block_size).reshape(-1)
 
                         # print()
                         # print(f'head_idx = {h} token_start_idx = {token_start_idx} token_end_idx = {token_end_idx} last_token_idx = {last_token_idx}')
@@ -236,10 +237,28 @@ class ContinuousBatchKVCacheGenerator:
         return cache_data
     
     # quantize a kv block in fashion of per_token
-    def __quant_per_token(self, input_block_per_head, _head_size):
+    # input_block_per_head [1, 1, block_size, head_size]
+    def __quant_block_per_token(self, input_block_per_head, _head_size, block_size):
         blk_num, kv_heads, blksz, *_ = input_block_per_head.shape
-        kv_max = input_block_per_head.amax(dim=-1, keepdim = True).to(dtype=torch.float)
-        kv_min = input_block_per_head.amin(dim=-1, keepdim = True).to(dtype=torch.float)
+        kv_u8, dq_scale, kv_zp = self.quant_per_token(input_block_per_head)
+        if blksz < block_size:
+            kv_pad = torch.zeros(blk_num, kv_heads, (block_size - blksz)*_head_size).to(dtype=torch.uint8)
+            kv_u8 = torch.cat((kv_u8, kv_pad), dim=-1)
+            scale_zp_pad = torch.zeros(blk_num, kv_heads, (block_size - blksz)*2).to(dtype=torch.uint8)
+            dq_scale = torch.cat((dq_scale, scale_zp_pad), dim=-1)
+            kv_zp = torch.cat((kv_zp, scale_zp_pad), dim=-1)
+
+        # print("dq_scale: ", dq_scale)
+        # print("kz_zp: ", kv_zp)
+        return torch.concat((kv_u8, dq_scale, kv_zp), dim=-1)
+    
+    # quantize in fashion of per_token
+    # kv_cache_blocks [num_blocks, num_kv_heads, block_size, head_size]
+    @staticmethod
+    def quant_per_token(kv_cache_blocks):
+        blk_num, kv_heads, *_ = kv_cache_blocks.shape
+        kv_max = kv_cache_blocks.amax(dim=-1, keepdim = True).to(dtype=torch.float)
+        kv_min = kv_cache_blocks.amin(dim=-1, keepdim = True).to(dtype=torch.float)
         qrange = (kv_max - kv_min).to(dtype=torch.float)
 
         U8_MAX = torch.tensor(255.0, dtype=torch.float)
@@ -255,17 +274,17 @@ class ContinuousBatchKVCacheGenerator:
             adjustment = adjustment | (rounded > 255)  # also handle overflow
             return rounded - adjustment.to(rounded.dtype)
 
-        # kv_u8 = torch.round((input_block_per_head*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        kv_u8 = round_to_even((input_block_per_head*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+        # kv_u8 = torch.round((kv_cache_blocks*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
+        kv_u8 = round_to_even((kv_cache_blocks*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
 
         # torch.set_printoptions(precision=6)
-        # print("kv_fp16:\n", input_block_per_head.reshape(blk_num, kv_heads, blksz, k_head_size))
+        # print("kv_fp16:\n", kv_cache_blocks.reshape(blk_num, kv_heads, blksz, k_head_size))
         # print("kv_max:\n", kv_max.reshape(blk_num, kv_heads, -1))
         # print("kv_min:\n", kv_min.reshape(blk_num, kv_heads, -1))
         # print("kv_scale:\n", kv_scale.reshape(blk_num, kv_heads, -1))
         # print("kv_scale_div:\n", kv_scale_div.reshape(blk_num, kv_heads, -1))
         # print("kv_zp:\n", kv_zp.reshape(blk_num, kv_heads, -1))
-        # print("kv_quant_fp16:\n", (input_block_per_head*kv_scale+kv_zp).reshape(blk_num, kv_heads, blksz, k_head_size))
+        # print("kv_quant_fp16:\n", (kv_cache_blocks*kv_scale+kv_zp).reshape(blk_num, kv_heads, blksz, k_head_size))
 
         # print("quant_scale =", (1.0/kv_scale).reshape(blk_num,kv_heads,-1))
         # print("quant_zp    =", kv_zp.reshape(blk_num,kv_heads,-1))
@@ -274,16 +293,10 @@ class ContinuousBatchKVCacheGenerator:
         # kv_scale = ((U8_RANGE)/qrange).to(dtype=torch.half)
         # dq_scale = (kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         kv_zp = kv_zp.to(dtype=torch.half).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-        if blksz < self.block_size:
-            kv_pad = torch.zeros(blk_num, kv_heads, (self.block_size - blksz)*_head_size).to(dtype=torch.uint8)
-            kv_u8 = torch.cat((kv_u8, kv_pad), dim=-1)
-            scale_zp_pad = torch.zeros(blk_num, kv_heads, (self.block_size - blksz)*2).to(dtype=torch.uint8)
-            dq_scale = torch.cat((dq_scale, scale_zp_pad), dim=-1)
-            kv_zp = torch.cat((kv_zp, scale_zp_pad), dim=-1)
 
         # print("dq_scale: ", dq_scale)
         # print("kz_zp: ", kv_zp)
-        return torch.concat((kv_u8, dq_scale, kv_zp), dim=-1)
+        return kv_u8, dq_scale, kv_zp
     
     @staticmethod
     def print_kv_cache_u8(kv_cache_u8, blk_size, kv_head_size, name="key_cache"):
@@ -325,6 +338,85 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
     # else:
     #     print(f'{Colors.BLUE} {key_cache_ref=} {Colors.END}')
     #     print(f'{Colors.BLUE} {value_cache_ref=} {Colors.END}')
+   
+    # opt
+    pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, block_size, enable_kvcache_compress)
+    n_repeats = 20 if check_perf else 1
+    out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices, block_indices_begins, n_repeats)
+
+    if enable_kvcache_compress:
+        out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, block_size * (k_head_size + 4))
+        out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, block_size * (v_head_size + 4))
+        key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, block_size * (k_head_size + 4))
+        value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, block_size * (v_head_size + 4))
+        compare(key_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_key_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
+        compare(key_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+
+        compare(value_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_value_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
+        compare(value_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+    else:
+        compare(key_cache_ref.detach().numpy(), out_key_cache)
+        compare(value_cache_ref.detach().numpy(), out_value_cache)
+    print(f'{Colors.GREEN}kv_cache_update passed{Colors.END}')
+
+# reference impl
+# // # cur_kv_data:     [batch_size_in_tokens, num_kv_heads * head_size]
+# // # kv_cache_data:   [num_blocks, num_heads, block_size, (head_size + 4)]
+def reference_kv_cache_update(kv_cache_data, cur_kv_data, past_lens, subsequence_begins, block_indices, block_indices_begins):
+    batch_size_in_tokens, _ = cur_kv_data.shape
+    num_blocks, num_kv_heads, block_size, adjusted_head_size = kv_cache_data.shape
+    head_size = adjusted_head_size - 4
+    batch_size_in_sequences = subsequence_begins.shape[0] - 1
+
+    kv_cache_data = kv_cache_data.reshape(num_blocks, num_kv_heads, -1)
+
+    for i in range(batch_size_in_sequences):
+        tokens_num = subsequence_begins[i + 1] - subsequence_begins[i]
+        for token_idx in range(tokens_num):
+            cur_block_idx = (past_lens[i] + token_idx) // block_size
+            block_pos = block_indices[block_indices_begins[i] + cur_block_idx]
+
+            token_start_pos = (past_lens[i] + token_idx) % block_size
+            scale_start_pos = block_size*head_size + token_start_pos*2
+            zp_start_pos = block_size*head_size + block_size*2 + token_start_pos*2
+            for h in range(num_kv_heads):
+                cur_kv_row = cur_kv_data[subsequence_begins[i] + token_idx, h*head_size:(h+1)*head_size].reshape(1, 1, 1, head_size)
+                kv_u8, dq_scale, dq_zp = ContinuousBatchKVCacheGenerator.quant_per_token(cur_kv_row)
+                kv_cache_data[block_pos, h, token_start_pos*head_size : (token_start_pos+1)*head_size] = kv_u8.reshape(-1)
+                # print(f"{scale_start_pos=}, {dq_scale.reshape(-1)=}, {kv_cache_data[block_pos, h, scale_start_pos:scale_start_pos+2]}, {token_start_pos=}")
+                kv_cache_data[block_pos, h, scale_start_pos:scale_start_pos+2] = dq_scale.reshape(-1)
+                kv_cache_data[block_pos, h, zp_start_pos:zp_start_pos+2] = dq_zp.reshape(-1)
+    return kv_cache_data.reshape(num_blocks, num_kv_heads, block_size, adjusted_head_size)
+
+def test_ov(pa_node_name):
+    def get_tensor(name, dtype=np.float16):
+        with open(name, 'rb') as f:
+            data = f.read()
+            np_data = np.frombuffer(data, dtype=dtype).copy()
+            return torch.from_numpy(np_data)
+
+    compressed_kvcache = True
+    kv_block_size = 256
+    num_kv_heads, k_head_size, v_head_size = 8, 128, 128
+    base = f"c:\\ceciliapeng\\dump_debug_bin_int4_{pa_node_name}\\"
+
+    key = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src1__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*k_head_size])
+    value = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src2__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*v_head_size])
+
+    key_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_3__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
+    value_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_4__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
+    
+    # o [q_len, num_heads*head_size], k/v cache [num_blks, num_kv_heads, kv_block_size, head_size]
+    print(f'{key_cache.shape = }, {value_cache.shape = }')
+
+    valid_num_blks = key_cache.shape[0] - 1 # genai usually generates one more blocks than required
+    valid_num_blks = 1
+
+    past_lens = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src5__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([1])
+    subsequence_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src6__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+    block_indices = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src7__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([valid_num_blks])
+    block_indices_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src8__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+    print(f'{past_lens=}, {subsequence_begins=}, {block_indices=}, {block_indices_begins=}')        
 
     print(f'{Colors.BLUE} ============ {key_cache.shape=} {key_cache.is_contiguous()=} {Colors.END}')
     print(f'{Colors.BLUE} ============ {value_cache.shape=} {value_cache.is_contiguous()=} {Colors.END}')
@@ -333,32 +425,23 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
     print(f'{Colors.BLUE} ============ {block_indices.shape=} {block_indices.is_contiguous()=} {Colors.END}')
     
     # opt
-    pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, block_size, enable_kvcache_compress)
-    n_repeats = 20 if check_perf else 1
-    out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices.to(torch.int32), block_indices_begins, n_repeats)
+    pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, kv_block_size, compressed_kvcache)
+    out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices, block_indices_begins, 1)
 
-    # if enable_kvcache_compress:
-    #     out_key_cache = torch.tensor(out_key_cache)
-    #     out_value_cache = torch.tensor(out_value_cache)
-    #     print(f'{Colors.BLUE} ============ {out_key_cache.shape=} {out_key_cache.dtype} {Colors.END}')
-    #     print("out_key_cache: value = ", out_key_cache[:,:,:block_size * k_head_size].reshape(num_blocks, num_kv_heads, block_size, k_head_size))
-    #     print("out_key_cache: scale = ", out_key_cache[:,:,block_size * k_head_size : block_size * k_head_size + block_size * 2].reshape(num_blocks, num_kv_heads, 2 * block_size).view(dtype=torch.float16))
-    #     print("out_key_cache: zp = ", out_key_cache[:,:,block_size * k_head_size + block_size * 2 : block_size * k_head_size + block_size * 4].reshape(num_blocks, num_kv_heads, 2 * block_size).view(dtype=torch.float16))
-    #     print("out_value_cache = ", out_value_cache[:,:,:block_size * v_head_size].reshape(num_blocks, num_kv_heads, block_size, v_head_size))
-    #     out_key_cache = out_key_cache.detach().numpy()
-    #     out_value_cache = out_value_cache.detach().numpy()
+    key_cache_ref = reference_kv_cache_update(key_cache.clone(), key.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
+    value_cache_ref = reference_kv_cache_update(value_cache.clone(), value.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
 
-    # print(f"key_cache_ref = \n{key_cache_ref.reshape(num_blocks, num_kv_heads, block_size, k_head_size + 4)}")
-    # print(f"out_key_cache = \n{out_key_cache.reshape(num_blocks, num_kv_heads, block_size, k_head_size + 4)}")
+    if compressed_kvcache:
+        out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4))
+        out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4))
+        key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4))
+        value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4))
 
-    if enable_kvcache_compress:
-        out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8)
-        out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8)
-        # compare(key_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_key_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(key_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+        compare(key_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_key_cache[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
+        compare(key_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,kv_block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
 
-        compare(value_cache_ref[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_value_cache[:,:,:block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(value_cache_ref[:,:,block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+        compare(value_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_value_cache[:,:,:kv_block_size * v_head_size].to(dtype=torch.int).detach().numpy(),1)
+        compare(value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
     else:
         compare(key_cache_ref.detach().numpy(), out_key_cache)
         compare(value_cache_ref.detach().numpy(), out_value_cache)
@@ -369,6 +452,12 @@ if __name__ == "__main__":
     torch.set_printoptions(linewidth=1024)
     
     cl.profiling(True)
+
+    if 0:
+        test_ov("PagedAttentionExtension_40206")
+        # test_ov("PagedAttentionExtension_38747")    
+        import sys
+        sys.exit(0)
     
     for compress_kvcache in [False, True]:
         # test_pa_kv_cache_update([1024, 16, 17], [16, 0, 1])
