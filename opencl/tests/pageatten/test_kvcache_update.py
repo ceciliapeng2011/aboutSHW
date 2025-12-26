@@ -388,7 +388,7 @@ def reference_kv_cache_update(kv_cache_data, cur_kv_data, past_lens, subsequence
                 kv_cache_data[block_pos, h, zp_start_pos:zp_start_pos+2] = dq_zp.reshape(-1)
     return kv_cache_data.reshape(num_blocks, num_kv_heads, block_size, adjusted_head_size)
 
-def test_ov(pa_node_name):
+def test_ov(dump_dir, pa_node_name):
     def get_tensor(name, dtype=np.float16):
         with open(name, 'rb') as f:
             data = f.read()
@@ -398,7 +398,7 @@ def test_ov(pa_node_name):
     compressed_kvcache = True
     kv_block_size = 256
     num_kv_heads, k_head_size, v_head_size = 8, 128, 128
-    base = f"c:\\ceciliapeng\\dump_debug_bin_int4_{pa_node_name}\\"
+    base = f"c:\\ceciliapeng\\{dump_dir}_{pa_node_name}\\"
 
     key = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src1__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*k_head_size])
     value = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src2__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*v_head_size])
@@ -432,16 +432,21 @@ def test_ov(pa_node_name):
     value_cache_ref = reference_kv_cache_update(value_cache.clone(), value.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
 
     if compressed_kvcache:
-        out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4))
-        out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4))
-        key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4))
-        value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4))
+        out_key_cache=torch.tensor(out_key_cache).reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
+        out_value_cache=torch.tensor(out_value_cache).reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
 
-        compare(key_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_key_cache[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(key_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,kv_block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+        key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
+        value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
 
-        compare(value_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.int).detach().numpy(), out_value_cache[:,:,:kv_block_size * v_head_size].to(dtype=torch.int).detach().numpy(),1)
-        compare(value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3)
+        compare(key_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,kv_block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
+        compare(key_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_key_cache[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(),1)
+
+        ref = value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy()
+        opt = out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy()
+        print(f"DEBUG  ref_zp={ref[0, 7, 265]}, ref_scale={ref[0, 7, 9]}")
+        print(f"DEBUG  opt_zp={opt[0, 7, 265]}, ref_scale={opt[0, 7, 9]}")
+        compare(value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
+        compare(value_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_value_cache[:,:,:kv_block_size * v_head_size].to(dtype=torch.uint8).detach().numpy(),1)
     else:
         compare(key_cache_ref.detach().numpy(), out_key_cache)
         compare(value_cache_ref.detach().numpy(), out_value_cache)
@@ -454,8 +459,9 @@ if __name__ == "__main__":
     cl.profiling(True)
 
     if 0:
-        test_ov("PagedAttentionExtension_40206")
-        # test_ov("PagedAttentionExtension_38747")    
+        test_ov("dump_debug_bin_int4", "PagedAttentionExtension_40206")
+        test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38414")
+        test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38747")
         import sys
         sys.exit(0)
     

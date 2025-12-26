@@ -30,13 +30,20 @@ def to_cl(input):
 def to_torch(input):
     return torch.from_numpy(input.numpy())
 
-def compare(ref, opt, atol=0.01, rtol=0.01):
+def compare(ref, opt, atol=0.01, rtol=0.01, check_inf = False):
     if not np.allclose(ref, opt, atol=atol, rtol=rtol):
         pos = np.where(np.isnan(opt))
         if len(pos[0]) > 0:
             print(f'========================================================')
             print(f'pos nan = {len(pos)}x{len(pos[0])} {pos}')
             print(f'opt nan = {opt[pos]}')
+            raise Exception("failed.")
+        
+        pos = np.where(np.isinf(opt))
+        if len(pos[0]) > 0 and check_inf:
+            print(f'========================================================')
+            print(f'pos inf = {len(pos)}x{len(pos[0])} {pos}')
+            print(f'opt inf = {opt[pos]}')
             raise Exception("failed.")
 
         pos = np.where(np.abs(ref - opt) > atol)
