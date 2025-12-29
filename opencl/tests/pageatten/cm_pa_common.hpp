@@ -32,13 +32,14 @@ void pa_lsc_u8(
     int kv_stop,
     int q_len,
     int kv_len,
+#if USE_LSC
     svmptr_t q_base [[type("svmptr_t")]],
+#else
     SurfaceIndex q_gather,
     uint32_t q_gather_offset_bytes,
+#endif
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-    SurfaceIndex v_cache_stateful,
-    uint32_t v_cache_stateful_offset_bytes,
 #if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
@@ -391,13 +392,19 @@ void pa_kernel_lsc_prefetch_f16(
     int kv_stop, //
     int q_len, //q_step
     int kv_len, //not used for now
+#if USE_LSC
     svmptr_t q_base [[type("svmptr_t")]],
+#else
     SurfaceIndex q_gather,
     uint32_t q_gather_offset_bytes,
+#endif
     svmptr_t k_cache_base [[type("svmptr_t")]],
+#if USE_LSC
     svmptr_t v_cache_base [[type("svmptr_t")]],
+    #else
     SurfaceIndex v_cache_stateful,
     uint32_t v_cache_stateful_offset_bytes,
+#endif
 #if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],

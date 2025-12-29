@@ -4,8 +4,12 @@
 
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
+#ifdef CM_HAS_LSC_UNTYPED_2D
     half* query [[type("svmptr_t")]],
+#else
     SurfaceIndex q_gather [[type("buffer_t")]],
+#endif
+#ifdef CM_HAS_LSC_UNTYPED_2D
 #if CMPA_KVCACHE_U8
     int8_t* k_cache [[type("svmptr_t")]],
     int8_t* v_cache [[type("svmptr_t")]],
@@ -13,7 +17,15 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     half* k_cache [[type("svmptr_t")]],
     half* v_cache [[type("svmptr_t")]],
 #endif
+#else
+#if CMPA_KVCACHE_U8
+    int8_t* k_cache [[type("svmptr_t")]],
+    int8_t* v_cache [[type("svmptr_t")]],
+#else
+    half* k_cache [[type("svmptr_t")]],
     SurfaceIndex v_cache_stateful [[type("buffer_t")]],
+#endif
+#endif
     int32_t* past_lens [[type("svmptr_t")]],
     int32_t* block_indices [[type("svmptr_t")]],
     int32_t* block_indices_begins [[type("svmptr_t")]],
@@ -41,7 +53,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 #if CMPA_KVCACHE_U8
     constexpr uint K_SLM_SIZE = (4*kv_step * head_size * sizeof(half));
     constexpr uint V_SLM_SIZE = (4*kv_step * head_size * sizeof(half));
-    constexpr uint Q_SLM_SIZE = 0;//(q_step * head_size * sizeof(half)) * local_size;
+    constexpr uint Q_SLM_SIZE = 0;
 
     cm_slm_init(K_SLM_SIZE + V_SLM_SIZE + Q_SLM_SIZE);
 
@@ -100,7 +112,6 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
         kv_stop = (wg_id + 1) * wg_seq_len + past_q_lens;
         if (kv_stop > kv_seq_len) kv_stop = kv_seq_len;
     }
-    // printf("###########wg:%d.%d  q: %d, +%d   kv: %d, +%d, kvstop:%d\n", wg_id, wg_local_id, q_start_sg, q_len_sg, kv_start, kv_seq_len, kv_stop);
 
     //Q/O[B, L, H, S]
     uint q_offset = (q_start_sg*num_heads + h)*head_size;
@@ -114,13 +125,11 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
         auto q_start_block = q_start_sg/ SPARSE_BLOCK_SIZE;
         block_mask_base = sparse_block_mask + (h * num_q_blocks + q_start_block) * num_k_blocks;
         wg_block_mask_base = sparse_block_mask_wg + (h * cm_group_count(2) + wg_id) * num_k_blocks;
-        // printf("wg:%d.%d  q: %d, +%d   kv: %d, +%d, %d, x-attn: %d, %dx%d, %p, %p\n", wg_id, wg_local_id, q_start_sg, q_len_sg, kv_start, kv_seq_len, kv_stop, q_start_block, num_q_blocks, num_k_blocks, sparse_block_mask, block_mask_base);
     }
  #endif
 
 #if CMPA_KVCACHE_U8
     uint kv_offset = hkv*(head_size+4)*pa_block_sz;
-    uint kv_offset_bytes = kv_offset * sizeof(half);
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
                             slm_V,
@@ -130,13 +139,14 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             kv_stop,
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
+#ifdef CM_HAS_LSC_UNTYPED_2D
                             reinterpret_cast<svmptr_t>(query + q_offset),
+#else
                             q_gather,
                             q_offset_bytes,
+#endif
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-                            v_cache_stateful,
-                            kv_offset_bytes,
 #if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
@@ -154,13 +164,19 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             kv_stop,
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
+#ifdef CM_HAS_LSC_UNTYPED_2D
                             reinterpret_cast<svmptr_t>(query + q_offset),
+#else
                             q_gather,
                             q_offset_bytes,
+#endif
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
+#ifdef CM_HAS_LSC_UNTYPED_2D
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
+#else
                             v_cache_stateful,
                             kv_offset_bytes,
+#endif
 #if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),

@@ -259,9 +259,7 @@ class page_atten_cm:
                 kv_precision = "U8" if self.compressed_kvcache else "F16"
                 print(f"calling cm_page_attention {GWS=} {LWS=} x {n_repeats} times, q:[{q_start}, {q_end}], past_lens:{int(past_lens)}, kv_blk_num:{blk_num}, sparse_block_sz:{self.sparse_block_sz} kv_cache:{kv_precision}")
                 kernel_args = [t_q]
-                kernel_args.append(t_q)
                 kernel_args.extend([t_k, t_v])
-                kernel_args.append(t_v)
                 kernel_args.extend([t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out])
                 if self.sparse_block_sz > 1:
                     t_block_mask = cl.tensor(block_mask_list[trunk_idx].to(torch.bool).detach().numpy())
@@ -626,9 +624,7 @@ def test_ov():
     kv_precision = "U8" if pa_cm.compressed_kvcache else "F16"
     print(f"calling cm_page_attention {GWS=} {LWS=} sparse_block_sz:{pa_cm.sparse_block_sz} kv_cache:{kv_precision}")
     kernel_args = [t_query]
-    kernel_args.append(t_query)
     kernel_args.extend([t_key_cache, t_value_cache])
-    kernel_args.append(t_value_cache)
     kernel_args.extend([t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out])
     if pa_cm.sparse_block_sz > 1:
         t_block_mask = cl.tensor(block_mask.to(torch.bool).detach().numpy())
