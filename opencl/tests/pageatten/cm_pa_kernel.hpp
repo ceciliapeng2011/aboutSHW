@@ -31,6 +31,20 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
+#if CMPA_KVCACHE_U8
+#if SPARSE_BLOCK_SIZE > 1
+    SurfaceIndex sparse_block_mask [[type("buffer_t")]],
+    SurfaceIndex sparse_block_mask_wg [[type("buffer_t")]],
+    int q_len,
+    int num_q_blocks,
+    int num_k_blocks,
+    uint8_t validate_u8
+) {
+#else
+    int q_len
+) {
+#endif
+#else
 #if SPARSE_BLOCK_SIZE > 1
     bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
@@ -41,6 +55,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     bool validate) {
 #else
     int q_len) {
+#endif
 #endif
     constexpr int is_causal = CMFLA_IS_CAUSAL;
     constexpr int num_heads = CMFLA_NUM_HEADS;
@@ -66,57 +81,76 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     auto hkv = h / (num_heads/num_kv_heads);
     auto wg_id = cm_group_id(2); // each work-group handles a sequence
     auto wg_local_id = cm_local_id(2);
-    int local_size = cm_local_size(2);
+    int  local_size  = cm_local_size(2);
 
-    int q_start_sg, kv_start, kv_seq_len, q_len_sg;
-
-    // multiple work-groups are required to split a sequence,
-    // need to figure out which part of query-tokens to process
-    int wg_seq_len = local_size * q_step;
+    // Split query across WGs / SGs
+    int wg_seq_len  = local_size * q_step;
     int past_q_lens = past_lens[0];
-    kv_start = 0;
-    kv_seq_len = q_len + past_q_lens;
-    q_start_sg = (wg_id * local_size + wg_local_id) * q_step;
-    q_len_sg = q_step;
-    if (q_start_sg + q_len_sg > q_len) {
-        q_len_sg = q_len - q_start_sg;
-    }
+    int kv_seq_len  = q_len + past_q_lens;
 
-    // qkv is fused
+    int q_start_sg = (wg_id * local_size + wg_local_id) * q_step;
+    int q_len_sg   = (q_start_sg + q_step > q_len) ? (q_len - q_start_sg) : q_step;
+    if (q_len_sg < 0) q_len_sg = 0;
+
+    // causal => wg-level kv_stop
     int kv_stop = kv_seq_len;
     if constexpr (is_causal) {
-        /*
-        --------------------------------
-        |       |       |       |       |
-        |  00   |       |       |       |
-        |       |       |       |       |
-         --------------------------------
-        |       |       |       |       |
-        |  10   |  11   |       |       |
-        |       |       |       |       |
-        ---------------------------------
-        |       |       |       |       |
-        |  20   |  21   |  22   |       |
-        |       |       |       |       |
-         ---------------------------------
-        |       |       |       |       |
-        |  30   |  31   |   32  |   33  |
-        |       |       |       |       |
-        ---------------------------------
-        each grid can be [q_len_per_trunk, q_len_per_trunk].
-        For each trunk, [q_len_per_trunk, past_q_lens] must be calculated. Such as: `20`,`21`. but for the 22,
-        casual mask optimization can be applied. differnt wgs would has different kv stop.
-        //todo:kv_stop is wg level, should we change to sg level?
-               sglevel would cause sgs in one wg diverge. so leave for now. also one wg has same kvstop makes eaiser for kv copying/loading into SLM/cache.
-    */
         kv_stop = (wg_id + 1) * wg_seq_len + past_q_lens;
         if (kv_stop > kv_seq_len) kv_stop = kv_seq_len;
     }
 
-    //Q/O[B, L, H, S]
-    uint q_offset = (q_start_sg*num_heads + h)*head_size;
-    uint q_offset_bytes = q_offset * sizeof(half);
+    // Q/O offset: [B, L, H, S] flattened
+    // Use 64-bit to avoid overflow for long seq
+    uint64_t q_offset_elems = ((uint64_t)q_start_sg * (uint64_t)num_heads + (uint64_t)h) * (uint64_t)head_size;
+    uint32_t q_offset_bytes = (uint32_t)(q_offset_elems * (uint64_t)sizeof(half));
 
+    
+#if CMPA_KVCACHE_U8
+#if SPARSE_BLOCK_SIZE > 1
+    const bool validate = (validate_u8 != 0);
+    uint32_t block_mask_base_idx = 0;
+    uint32_t wg_block_mask_base_idx = 0;
+
+    if (validate) {
+        const uint32_t q_start_block = (uint32_t)(q_start_sg / SPARSE_BLOCK_SIZE);
+        block_mask_base_idx = (uint32_t)((h * (uint32_t)num_q_blocks + q_start_block) * (uint32_t)num_k_blocks);
+        wg_block_mask_base_idx = (uint32_t)((h * (uint32_t)cm_group_count(2) + (uint32_t)wg_id) * (uint32_t)num_k_blocks);
+    }
+
+    uint32_t block_mask_base_byte_off    = block_mask_base_idx * (uint32_t)sizeof(uint8_t);
+    uint32_t wg_block_mask_base_byte_off = wg_block_mask_base_idx * (uint32_t)sizeof(uint8_t);
+#endif
+    uint64_t kv_offset_elems = (uint64_t)hkv * (uint64_t)(head_size + 4) * (uint64_t)pa_block_sz;
+
+    pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
+        slm_K,
+        slm_V,
+        wg_local_id,
+        local_size,
+        q_start_sg,     // q_start for SG
+        kv_stop,
+        q_len_sg,       // q_step
+        kv_seq_len,     // kv_len
+#if USE_LSC
+        reinterpret_cast<svmptr_t>(query + q_offset_elems),
+#else
+        q_gather,
+        q_offset_bytes,
+#endif
+        reinterpret_cast<svmptr_t>(k_cache + kv_offset_elems),
+        reinterpret_cast<svmptr_t>(v_cache + kv_offset_elems),
+#if SPARSE_BLOCK_SIZE > 1
+        sparse_block_mask,
+        sparse_block_mask_wg,
+        block_mask_base_byte_off,
+        wg_block_mask_base_byte_off,
+        validate_u8,
+#endif
+        reinterpret_cast<svmptr_t>(output + q_offset_elems),
+        past_q_lens,
+        block_indices
+    );
+#else
 #if SPARSE_BLOCK_SIZE > 1
     bool *block_mask_base, *wg_block_mask_base;
     if (validate) {
@@ -127,35 +161,6 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
         wg_block_mask_base = sparse_block_mask_wg + (h * cm_group_count(2) + wg_id) * num_k_blocks;
     }
  #endif
-
-#if CMPA_KVCACHE_U8
-    uint kv_offset = hkv*(head_size+4)*pa_block_sz;
-    pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
-                            slm_K,
-                            slm_V,
-                            wg_local_id,
-                            local_size,
-                            q_start_sg, //q_start for SG,
-                            kv_stop,
-                            q_len_sg, //q_step,
-                            kv_seq_len, //kv_len,
-#ifdef CM_HAS_LSC_UNTYPED_2D
-                            reinterpret_cast<svmptr_t>(query + q_offset),
-#else
-                            q_gather,
-                            q_offset_bytes,
-#endif
-                            reinterpret_cast<svmptr_t>(k_cache + kv_offset),
-                            reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-#if SPARSE_BLOCK_SIZE > 1
-                            reinterpret_cast<svmptr_t>(block_mask_base),
-                            reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            validate,
-#endif
-                            reinterpret_cast<svmptr_t>(output + q_offset),
-                            past_q_lens,
-                            block_indices);
-#else
     uint kv_offset = hkv*head_size*pa_block_sz;
     uint kv_offset_bytes = kv_offset * sizeof(half);
     pa_kernel_lsc_prefetch_f16<is_causal, num_heads, num_kv_heads, head_size, 0, 16>(
@@ -165,7 +170,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
 #ifdef CM_HAS_LSC_UNTYPED_2D
-                            reinterpret_cast<svmptr_t>(query + q_offset),
+                            reinterpret_cast<svmptr_t>(query + q_offset_elems),
 #else
                             q_gather,
                             q_offset_bytes,
@@ -182,7 +187,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
                             validate,
 #endif
-                            reinterpret_cast<svmptr_t>(output + q_offset),
+                            reinterpret_cast<svmptr_t>(output + q_offset_elems),
                             past_q_lens,
                             block_indices);
 #endif
