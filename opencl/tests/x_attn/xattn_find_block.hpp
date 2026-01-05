@@ -55,7 +55,7 @@ extern "C" _GENX_MAIN_ void find_block(
 #endif
     block_mask += (b * HQ + hq) * q_block_pad * k_block_pad;
 
-    const uint slm_size = 32 * 16 * sizeof(ushort);
+    const uint slm_size = NUM_THREADS * 16 * sizeof(ushort);
     cm_slm_init(slm_size);
     auto slm = cm_slm_alloc(slm_size);
 
