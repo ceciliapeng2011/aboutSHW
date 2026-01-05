@@ -12,6 +12,8 @@ from clops import compare
 import os
 from clops.utils import Colors
 
+NUM_THREADS = 32 # choose from 32 or 16
+
 cl.profiling(True)
 
 # kernel
@@ -23,7 +25,7 @@ r'''
 #define ABS(x) (x) < 0 ? -(x) : (x)
 
 _GENX_MAIN_ void sort(svmptr_t src ATTR, svmptr_t sorted_value ATTR, svmptr_t sorted_index ATTR, svmptr_t sort_tmp ATTR, uint n) {
-    const uint slm_size = 32 * 16 * sizeof(ushort);
+    const uint slm_size = NUM_THREADS * 16 * sizeof(ushort);
     cm_slm_init(slm_size);
     auto slm = cm_slm_alloc(slm_size);
 
@@ -38,6 +40,7 @@ src = '\n'.join(src)
 
 jit_option = '-abortonspill -noschedule '
 kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}" -Qxcm_register_file_size=256 -mCM_printregusage -mdump_asm -g2
+                     -DNUM_THREADS={int(NUM_THREADS)}
                     ''')
 
 def test_sort(src:torch.Tensor):
