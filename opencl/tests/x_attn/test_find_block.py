@@ -25,7 +25,8 @@ HQ = 32
 HK = 8
 HEAD_SIZE = 128
 STRIDE = 16
-BLOCK_SIZE = 128
+BLOCK_SIZE = 128 # choose from 128 or 256
+NUM_THREADS = 32 if BLOCK_SIZE == 128 else 16
 THRESH = 0.9
 IS_CAUSAL = 1
 SOFTMAX_TYPE = 'float' # 'half'
@@ -48,6 +49,7 @@ def create_kernels(force_create=False):
                         -DSTRIDE={STRIDE} -DHQ={HQ} -DHK={HK} -DHEAD_SIZE={HEAD_SIZE} 
                         -DBLOCK_SIZE={BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} 
                         -DDEBUG_ACC={FIND_DEBUG_ACC} -DIS_CAUSAL={IS_CAUSAL} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
+                        -DNUM_THREADS={int(NUM_THREADS)}
                         ''')
 
 def cmp_mask(ref_mask_np, cur_mask_np, ref_sum, cur_exp_partial_sum_np):
@@ -295,6 +297,8 @@ def main():
 if __name__ == "__main__":
     torch.manual_seed(3)
     torch.set_printoptions(linewidth=1024)
+    torch.set_printoptions(precision=2, sci_mode=False)
+    np.set_printoptions(precision=2, suppress=True)
 
     cl.profiling(True)
 
