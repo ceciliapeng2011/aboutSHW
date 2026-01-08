@@ -833,15 +833,14 @@ ugemm_pv: [q_step, kv_step] x [kv_step, head_size]
 scale_factor = 1.0/(head_size**0.5)
 
 # each WG processes a partition
-GWS=[seq_num, num_kv_heads, (new_kv_len + kv_partition_size - 1) // kv_partition_size]
+MaxRepeatCount=8
+q_heads_per_kv_head = num_heads // num_kv_heads
+q_head_chunks_per_kv_head = (q_heads_per_kv_head + (MaxRepeatCount - 1)) // MaxRepeatCount
+q_head_chunk_size = num_heads // (num_kv_heads * q_head_chunks_per_kv_head)
+print(f"{num_heads=}, {num_kv_heads=}, {q_head_chunk_size=}, {q_head_chunks_per_kv_head=}")
+GWS=[seq_num, num_kv_heads * q_head_chunks_per_kv_head, (new_kv_len + kv_partition_size - 1) // kv_partition_size]
 WG_SIZE = 1;#max(kv_len // kv_partition_size//2, 1)
 LWS=[1, 1, WG_SIZE]
-
-# GWS=[seq_num, (new_kv_len + kv_partition_size - 1) // kv_partition_size, num_heads]
-# WG_SIZE = 1;#max(kv_len // kv_partition_size//2, 1)
-# LWS=[1, WG_SIZE, num_heads//num_kv_heads]
-# #LWS=[1, 1, WG_SIZE]
-
 print("GWS=", GWS)
 print("LWS=", LWS)
 
@@ -863,7 +862,8 @@ def create_kernels():
     cwd = os.path.dirname(os.path.realpath(__file__))
     print(f"compiling {cwd} ...")
 
-    jit_option = '-abortonspill -noschedule '
+    # jit_option = '-abortonspill -noschedule '
+    jit_option = ''
     kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
                         -mCM_printregusage -mdump_asm -g2
                         -Qxcm_register_file_size=256 -I{cwd}
@@ -875,6 +875,9 @@ def create_kernels():
                         -DKV_CACHE_COMPRESSION={enable_kvcache_compression}
                         -DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}
                         -DXE_ARCH={xe_arch}
+                        -Dq_head_chunks_per_kv_head={int(q_head_chunks_per_kv_head)}
+                        -DQ_RepeatCount={int(q_head_chunk_size)}
+                        -DQ_SLICE_NUM={int(q_head_chunk_size)}
                         -DSCALE_FACTOR={scale_factor}''')
     return kernels
 
