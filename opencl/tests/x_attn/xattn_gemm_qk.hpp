@@ -16,7 +16,6 @@
 
 // namespace KERNEL_NAME {
 #include "estimate.hpp"
-// #include "estimate_BLOCK_WG_K32.hpp"
 
 #define ABS(x) (x) < 0 ? -(x) : (x)
 
