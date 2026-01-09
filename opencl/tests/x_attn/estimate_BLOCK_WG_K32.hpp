@@ -390,8 +390,6 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b0{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
     uint scale_offset0 = offset + KV_BLOCK_SIZE * HEAD_SIZE;
-    lsc::block_2d_desc<uchar, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b0{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
-        0, 0 };
     block_idx = MYMIN(block_idx + 1, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b1{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
@@ -402,7 +400,7 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     block_idx = MYMIN(block_idx, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
     static_assert(BLOCK_WG_N / SG_MN <= KEY_LINES_PER_LOAD, "prefetch lines should be inside one block");
-    lsc::block_2d_desc<uchar, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b1{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
+    lsc::block_2d_desc<uchar, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
 
     // N[:]xK[0:32]                                                     --> 16 * 1 regs
@@ -414,8 +412,6 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     uint offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b0{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
         0, 0 };
-    lsc::block_2d_desc<half, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b0{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
-        0, 0 };
     block_idx = MYMIN(block_idx + 1, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b1{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
@@ -425,7 +421,7 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     block_idx = MYMIN(block_idx, max_block_idx);
     offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE * (uint)sizeof(half));
     static_assert(BLOCK_WG_N / SG_MN <= KEY_LINES_PER_LOAD, "prefetch lines should be inside one block");
-    lsc::block_2d_desc<half, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b1{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
+    lsc::block_2d_desc<half, 1, BLOCK_WG_N / SG_MN, 16> desc_prefetch_b{ key_cache + offset, BLOCK_WG_N / SG_MN - 1, (uint)(K * sizeof(half) - 1), (uint)(K * sizeof(half) - 1),
         0, 0 };
     // 0~2 M[:]xK[0:16] 2~4 K[16:32]                                                     --> 32 * 2 regs
     matrix<half, 2, BLOCK_REG_B> b0;
@@ -502,11 +498,9 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
         #pragma unroll
         for (uint hs = 0; hs < HEAD_SIZE / BLOCK_WG_K; hs++) {
             // prefetch
-            desc_prefetch_b1.set_block_x(desc_prefetch_b1.get_block_x() + 16);
-            desc_prefetch_b0.set_block_x(desc_prefetch_b0.get_block_x() + 16);
+            desc_prefetch_b.set_block_x(desc_prefetch_b.get_block_x() + 16);
             desc_prefetch_a.set_block_x(desc_prefetch_a.get_block_x() + 16);
-            // cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b1);
-            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b0);
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_a);
 
             // load a: M[0:16*4]xK[0:16]
@@ -530,14 +524,12 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
             desc_b1.set_block_x(desc_b1.get_block_x() + 8);
 
             // prefetch
-            desc_prefetch_b1.set_block_x(desc_prefetch_b1.get_block_x() + 16);
-            desc_prefetch_b0.set_block_x(desc_prefetch_b0.get_block_x() + 16);
+            desc_prefetch_b.set_block_x(desc_prefetch_b.get_block_x() + 16);
             if (hs == HEAD_SIZE / BLOCK_WG_K - 1)
                 desc_prefetch_a.set_block_x((STRIDE - 1 - s - 1) * b_adjacent_between_head);
             else
                 desc_prefetch_a.set_block_x(desc_prefetch_a.get_block_x() + 16);
-            // cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b1);
-            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b0);
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_b);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(desc_prefetch_a);
 
             // load a: M[0:16*4]xK[16:32]
