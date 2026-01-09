@@ -295,7 +295,7 @@ CM_INLINE void write_2d(matrix_ref<TSRC, M, N> out, SurfaceIndex base, uint offs
 CM_INLINE void gemm_qk_64x32_xe2(uint id_wg_m, uint id_wg_n, uint hq, uint slm, svmptr_t key_cache ATTR, svmptr_t query ATTR, svmptr_t block_indices ATTR, svmptr_t block_indices_begins ATTR, svmptr_t kq_max_wg ATTR, svmptr_t kq_exp_partial_sum ATTR,
 uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     constexpr int SG_SIZE = 16;
-    constexpr int BLOCK_WG_K = 32;	// same in sg
+    static_assert(BLOCK_WG_K == 32, "Supported BLOCK_WG_K is 32");
 #ifndef BLOCK_SG_M
     #define BLOCK_SG_M  64
     #define BLOCK_SG_N  32
