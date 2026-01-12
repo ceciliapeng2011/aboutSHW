@@ -1,25 +1,18 @@
-
-/*
- * Copyright (c) 2020-2025, Intel Corporation
+/*******************************************************************************
+ * Copyright (c) 2022-2025 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * The above copyright notice and this permission notice shall be included
- * in all copies or substantial portions of the Software.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
- * OTHER DEALINGS IN THE SOFTWARE.
- */
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
 
 #include <cm/cm.h>
 #include <cm/cmtl.h>
@@ -119,7 +112,9 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     half* value_cache [[type("svmptr_t")]],
 #endif
     uint32_t key_pitch,
+    uint32_t key_offset,
     uint32_t value_pitch,
+    uint32_t value_offset,
     uint32_t batch_size_in_sequences) {
     // # key:   [batch_size_in_tokens, num_kv_heads * k_head_size]
     // # value  [batch_size_in_tokens, num_kv_heads * v_head_size]
@@ -135,12 +130,10 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     // # GWS [1, num_heads, wg_count * wg_size]
     // # LWS [1, 1, wg_size]
 
+    static_assert(K_HEAD_SIZE % 16 == 0 && V_HEAD_SIZE % 16 == 0);
+
     const auto head_idx = cm_group_id(1);
     const auto wg_id = cm_group_id(2);
-    //const auto wg_local_id = cm_local_id(2);
-    //const auto local_size = cm_local_size(2);
-
-    static_assert(K_HEAD_SIZE % 16 == 0 && V_HEAD_SIZE % 16 == 0);
 
     // const uint token_idx = wg_id * local_size + wg_local_id;
     const uint token_idx = cm_global_id(2);
@@ -168,7 +161,8 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     {
         uint block_k_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;
-        uint key_in_offset = token_idx * key_pitch + head_idx * K_HEAD_SIZE;
+        uint key_in_offset = token_idx * key_pitch + head_idx * K_HEAD_SIZE + key_offset;
+
         vector<half, K_HEAD_SIZE> key_data;
         load_kvcahe<K_HEAD_SIZE>(key_data, key, key_in_offset * (int)sizeof(half));
 
@@ -181,7 +175,8 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     {
         uint block_v_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint value_out_offset = block_v_base_offset + token_start_pos * V_HEAD_SIZE;
-        uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE;
+        uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE + value_offset;
+
         vector<half, V_HEAD_SIZE> value_data;
         load_kvcahe<V_HEAD_SIZE>(value_data, value, value_in_offset * (int)sizeof(half));
 

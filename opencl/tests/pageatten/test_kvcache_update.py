@@ -61,6 +61,8 @@ class pa_kvcache_update_cm:
         batch_size_in_sequences = len(past_lens)
         key_pitch = key.stride()[0]
         val_pitch = value.stride()[0]
+        key_offset = 0
+        value_offset = 0 
         # print(f"============ {key.shape=} {key.is_contiguous()=}")
         # print(f"============ {value.shape=} {value.is_contiguous()=}")
         # print(f"============ {batch_size_in_tokens=} {batch_size_in_sequences=}")
@@ -92,7 +94,9 @@ class pa_kvcache_update_cm:
             self.kernels.enqueue("pa_kv_cache_update", GWS, LWS, t_key, t_value,
                             t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, 
                             t_key_cache, t_value_cache,
-                            key_pitch, val_pitch, batch_size_in_sequences)
+                            key_pitch, key_offset,
+                            val_pitch, value_offset,
+                            batch_size_in_sequences)
             ns = cl.finish()
             for i, time_opt in enumerate(ns):
                 print(f'(pa_kv_cache_update)TPUT_{i}:[{key.numel()=}]+[{value.numel()=}] {time_opt*1e-3:,.0f} us')
