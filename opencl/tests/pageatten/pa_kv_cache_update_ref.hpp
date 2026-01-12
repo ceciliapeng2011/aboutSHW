@@ -31,6 +31,38 @@
 
 constexpr uint wg_size = WG_SIZE;
 
+template <int HEAD_SIZE>
+CM_INLINE void load_kvcahe(vector_ref<half, HEAD_SIZE> kv_data, const half* kv_ptr [[type("svmptr_t")]], uint offset) {
+    if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
+        kv_data.format<int>() = cm_ptr_load<int, HEAD_SIZE / 2>((int*)kv_ptr, offset);
+    } else if constexpr (HEAD_SIZE == 96) {
+        kv_data.select<64, 1>(0).format<int>() = cm_ptr_load<int, 32>((int*)kv_ptr, offset);
+        kv_data.select<32, 1>(64).format<int>() = cm_ptr_load<int, 16>((int*)kv_ptr, offset + 32 * sizeof(int));
+    } else {
+        // # head_size is restricted to by be divisible by 16 in CM PA/Xattn pipeline.
+        #pragma unroll
+        for(int i = 0; i < HEAD_SIZE / 16; i++) {
+            kv_data.select<16, 1>(16*i).format<int>() = cm_ptr_load<int, 8>((int*)kv_ptr, offset + i * 8 * sizeof(int));
+        }
+    }
+}
+
+template <int HEAD_SIZE>
+CM_INLINE void store_kvcahe(const half* kv_cache [[type("svmptr_t")]], uint offset, vector_ref<half, HEAD_SIZE> kv_data) {
+    if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
+        cm_ptr_store<int, HEAD_SIZE / 2>((int*)kv_cache, offset, kv_data.format<int>());
+    } else if constexpr (HEAD_SIZE == 96) {
+        cm_ptr_store<int, 32>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
+        cm_ptr_store<int, 16>((int*)kv_cache, offset + 32 * sizeof(int), kv_data.select<32, 1>(64).format<int>());
+    } else {
+        // # head_size is restricted to by be divisible by 16 in CM PA/Xattn pipeline.
+        #pragma unroll
+        for(int i = 0; i < HEAD_SIZE / 16; i++) {
+            cm_ptr_store<int, 8>((int*)kv_cache, offset + i * 8 * sizeof(int), kv_data.select<16, 1>(16*i).format<int>());
+        }
+    }
+}
+
 extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     const half* key [[type("svmptr_t")]],
     const half* value [[type("svmptr_t")]],
@@ -120,12 +152,12 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;
         uint key_in_offset = token_idx * key_pitch + head_idx * K_HEAD_SIZE;
         vector<half, K_HEAD_SIZE> key_data;
-        key_data.format<int>() = cm_ptr_load<int, K_HEAD_SIZE / 2>((int*)key, key_in_offset * (int)sizeof(half));
+        load_kvcahe<K_HEAD_SIZE>(key_data, key, key_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
             quantize_and_store(key_data, (uchar*)key_cache, block_k_base_offset, token_start_pos);
         #else
-            cm_ptr_store<int, K_HEAD_SIZE / 2>((int*)key_cache, key_out_offset * (int)sizeof(half), key_data.format<int>());
+        store_kvcahe<K_HEAD_SIZE>(key_cache, key_out_offset * (int)sizeof(half), key_data);
         #endif
     }
     {
@@ -133,12 +165,14 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         uint value_out_offset = block_v_base_offset + token_start_pos * V_HEAD_SIZE;
         uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE;
         vector<half, V_HEAD_SIZE> value_data;
-        value_data.format<int>() = cm_ptr_load<int, V_HEAD_SIZE / 2>((int*)value, value_in_offset * (int)sizeof(half));
+        // value_data.format<int>() = cm_ptr_load<int, V_HEAD_SIZE / 2>((int*)value, value_in_offset * (int)sizeof(half));
+        load_kvcahe<V_HEAD_SIZE>(value_data, value, value_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
             quantize_and_store(value_data, (uchar*)value_cache, block_v_base_offset, token_start_pos);
         #else
-            cm_ptr_store<int, V_HEAD_SIZE / 2>((int*)value_cache, value_out_offset * (int)sizeof(half), value_data.format<int>());
+            // cm_ptr_store<int, V_HEAD_SIZE / 2>((int*)value_cache, value_out_offset * (int)sizeof(half), value_data.format<int>());
+            store_kvcahe<V_HEAD_SIZE>(value_cache, value_out_offset * (int)sizeof(half), value_data);
         #endif
     }
 }

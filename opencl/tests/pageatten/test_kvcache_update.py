@@ -11,7 +11,7 @@ from clops import compare
 from clops.utils import Colors
 
 # "CM_FE_DIR": "c:\\ceciliapeng\\ComputeSDK_Windows_internal_2025_WW41\\compiler\bin"
-os.environ["CM_FE_DIR"] = "c:\\ceciliapeng\\ComputeSDK_Windows_internal_2025_WW41\\compiler\bin"
+# os.environ["CM_FE_DIR"] = "c:\\ceciliapeng\\ComputeSDK_Windows_internal_2025_WW41\\compiler\bin"
 
 class pa_kvcache_update_cm:
     def __init__(self, num_kv_heads, k_head_size, v_head_size, block_size, enable_kvcache_compress):
@@ -25,7 +25,7 @@ class pa_kvcache_update_cm:
 
         src = r'''#include "pa_kv_cache_update_ref.hpp"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
-        print(f"compiling {cwd} {num_kv_heads=} {k_head_size=} {v_head_size=} ...")
+        print(f"compiling {cwd} {num_kv_heads=} {k_head_size=} {v_head_size=} {enable_kvcache_compress=}...")
 
         if enable_kvcache_compress:
             adjusted_k_head_size = k_head_size + 4
@@ -388,69 +388,69 @@ def reference_kv_cache_update(kv_cache_data, cur_kv_data, past_lens, subsequence
                 kv_cache_data[block_pos, h, zp_start_pos:zp_start_pos+2] = dq_zp.reshape(-1)
     return kv_cache_data.reshape(num_blocks, num_kv_heads, block_size, adjusted_head_size)
 
-def test_ov(dump_dir, pa_node_name):
-    def get_tensor(name, dtype=np.float16):
-        with open(name, 'rb') as f:
-            data = f.read()
-            np_data = np.frombuffer(data, dtype=dtype).copy()
-            return torch.from_numpy(np_data)
+# def test_ov(dump_dir, pa_node_name):
+#     def get_tensor(name, dtype=np.float16):
+#         with open(name, 'rb') as f:
+#             data = f.read()
+#             np_data = np.frombuffer(data, dtype=dtype).copy()
+#             return torch.from_numpy(np_data)
 
-    compressed_kvcache = True
-    kv_block_size = 256
-    num_kv_heads, k_head_size, v_head_size = 8, 128, 128
-    base = f"c:\\ceciliapeng\\{dump_dir}_{pa_node_name}\\"
+#     compressed_kvcache = True
+#     kv_block_size = 256
+#     num_kv_heads, k_head_size, v_head_size = 8, 128, 128
+#     base = f"c:\\ceciliapeng\\{dump_dir}_{pa_node_name}\\"
 
-    key = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src1__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*k_head_size])
-    value = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src2__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*v_head_size])
+#     key = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src1__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*k_head_size])
+#     value = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src2__f16__255_1024_1_1__bfyx.bin').reshape([-1, num_kv_heads*v_head_size])
 
-    key_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_3__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
-    value_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_4__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
+#     key_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_3__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
+#     value_cache = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_updated_src_4__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, v_head_size+4])
     
-    # o [q_len, num_heads*head_size], k/v cache [num_blks, num_kv_heads, kv_block_size, head_size]
-    print(f'{key_cache.shape = }, {value_cache.shape = }')
+#     # o [q_len, num_heads*head_size], k/v cache [num_blks, num_kv_heads, kv_block_size, head_size]
+#     print(f'{key_cache.shape = }, {value_cache.shape = }')
 
-    valid_num_blks = key_cache.shape[0] - 1 # genai usually generates one more blocks than required
-    valid_num_blks = 1
+#     valid_num_blks = key_cache.shape[0] - 1 # genai usually generates one more blocks than required
+#     valid_num_blks = 1
 
-    past_lens = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src5__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([1])
-    subsequence_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src6__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
-    block_indices = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src7__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([valid_num_blks])
-    block_indices_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src8__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
-    print(f'{past_lens=}, {subsequence_begins=}, {block_indices=}, {block_indices_begins=}')        
+#     past_lens = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src5__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([1])
+#     subsequence_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src6__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+#     block_indices = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src7__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([valid_num_blks])
+#     block_indices_begins = get_tensor(base + f'program1_network1_0_pagedattentionextension_{pa_node_name}_src8__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+#     print(f'{past_lens=}, {subsequence_begins=}, {block_indices=}, {block_indices_begins=}')        
 
-    print(f'{Colors.BLUE} ============ {key_cache.shape=} {key_cache.is_contiguous()=} {Colors.END}')
-    print(f'{Colors.BLUE} ============ {value_cache.shape=} {value_cache.is_contiguous()=} {Colors.END}')
-    print(f'{Colors.BLUE} ============ {key.shape=} {key.is_contiguous()=} {Colors.END}')
-    print(f'{Colors.BLUE} ============ {value.shape=} {value.is_contiguous()=} {Colors.END}')
-    print(f'{Colors.BLUE} ============ {block_indices.shape=} {block_indices.is_contiguous()=} {Colors.END}')
+#     print(f'{Colors.BLUE} ============ {key_cache.shape=} {key_cache.is_contiguous()=} {Colors.END}')
+#     print(f'{Colors.BLUE} ============ {value_cache.shape=} {value_cache.is_contiguous()=} {Colors.END}')
+#     print(f'{Colors.BLUE} ============ {key.shape=} {key.is_contiguous()=} {Colors.END}')
+#     print(f'{Colors.BLUE} ============ {value.shape=} {value.is_contiguous()=} {Colors.END}')
+#     print(f'{Colors.BLUE} ============ {block_indices.shape=} {block_indices.is_contiguous()=} {Colors.END}')
     
-    # opt
-    pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, kv_block_size, compressed_kvcache)
-    out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices, block_indices_begins, 1)
+#     # opt
+#     pa_cm = pa_kvcache_update_cm.create_instance(num_kv_heads, k_head_size, v_head_size, kv_block_size, compressed_kvcache)
+#     out_key_cache, out_value_cache = pa_cm(key, value, key_cache, value_cache, past_lens, subsequence_begins, block_indices, block_indices_begins, 1)
 
-    key_cache_ref = reference_kv_cache_update(key_cache.clone(), key.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
-    value_cache_ref = reference_kv_cache_update(value_cache.clone(), value.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
+#     key_cache_ref = reference_kv_cache_update(key_cache.clone(), key.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
+#     value_cache_ref = reference_kv_cache_update(value_cache.clone(), value.clone(), past_lens, subsequence_begins, block_indices, block_indices_begins)
 
-    if compressed_kvcache:
-        out_key_cache=torch.tensor(out_key_cache).reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
-        out_value_cache=torch.tensor(out_value_cache).reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
+#     if compressed_kvcache:
+#         out_key_cache=torch.tensor(out_key_cache).reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
+#         out_value_cache=torch.tensor(out_value_cache).reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
 
-        key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
-        value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
+#         key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (k_head_size + 4)).to(dtype=torch.uint8)
+#         value_cache_ref = value_cache_ref.reshape(-1, num_kv_heads, kv_block_size * (v_head_size + 4)).to(dtype=torch.uint8)
 
-        compare(key_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,kv_block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
-        compare(key_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_key_cache[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(),1)
+#         compare(key_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_key_cache[:,:,kv_block_size * k_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
+#         compare(key_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_key_cache[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(),1)
 
-        ref = value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy()
-        opt = out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy()
-        print(f"DEBUG  ref_zp={ref[0, 7, 265]}, ref_scale={ref[0, 7, 9]}")
-        print(f"DEBUG  opt_zp={opt[0, 7, 265]}, ref_scale={opt[0, 7, 9]}")
-        compare(value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
-        compare(value_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_value_cache[:,:,:kv_block_size * v_head_size].to(dtype=torch.uint8).detach().numpy(),1)
-    else:
-        compare(key_cache_ref.detach().numpy(), out_key_cache)
-        compare(value_cache_ref.detach().numpy(), out_value_cache)
-    print(f'{Colors.GREEN}kv_cache_update passed{Colors.END}')
+#         ref = value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy()
+#         opt = out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy()
+#         print(f"DEBUG  ref_zp={ref[0, 7, 265]}, ref_scale={ref[0, 7, 9]}")
+#         print(f"DEBUG  opt_zp={opt[0, 7, 265]}, ref_scale={opt[0, 7, 9]}")
+#         compare(value_cache_ref[:,:,kv_block_size * k_head_size :].view(dtype=torch.half).detach().numpy(), out_value_cache[:,:,kv_block_size * v_head_size : ].view(dtype=torch.half).detach().numpy(),1e-3, 0.01, True)
+#         compare(value_cache_ref[:,:,:kv_block_size * k_head_size].to(dtype=torch.uint8).detach().numpy(), out_value_cache[:,:,:kv_block_size * v_head_size].to(dtype=torch.uint8).detach().numpy(),1)
+#     else:
+#         compare(key_cache_ref.detach().numpy(), out_key_cache)
+#         compare(value_cache_ref.detach().numpy(), out_value_cache)
+#     print(f'{Colors.GREEN}kv_cache_update passed{Colors.END}')
 
 if __name__ == "__main__":
     torch.manual_seed(3)
@@ -458,16 +458,18 @@ if __name__ == "__main__":
     
     cl.profiling(True)
 
-    if 0:
-        test_ov("dump_debug_bin_int4", "PagedAttentionExtension_40206")
-        test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38414")
-        test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38747")
-        import sys
-        sys.exit(0)
+    # if 0:
+    #     test_ov("dump_debug_bin_int4", "PagedAttentionExtension_40206")
+    #     test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38414")
+    #     test_ov("dump_debug_bin_int8", "PagedAttentionExtension_38747")
+    #     import sys
+    #     sys.exit(0)
     
     for compress_kvcache in [False, True]:
         # test_pa_kv_cache_update([1024, 16, 17], [16, 0, 1])
+        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=96, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
         test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=48, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
         # test_pa_kv_cache_update([64*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
         # test_pa_kv_cache_update([128*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
         # test_pa_kv_cache_update([32*1024], [4*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
