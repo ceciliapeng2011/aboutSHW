@@ -47,21 +47,62 @@ CM_INLINE void load_kvcahe(vector_ref<half, HEAD_SIZE> kv_data, const half* kv_p
     }
 }
 
-template <int HEAD_SIZE>
-CM_INLINE void store_kvcahe(const half* kv_cache [[type("svmptr_t")]], uint offset, vector_ref<half, HEAD_SIZE> kv_data) {
-    if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
-        cm_ptr_store<int, HEAD_SIZE / 2>((int*)kv_cache, offset, kv_data.format<int>());
-    } else if constexpr (HEAD_SIZE == 96) {
-        cm_ptr_store<int, 32>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
-        cm_ptr_store<int, 16>((int*)kv_cache, offset + 32 * sizeof(int), kv_data.select<32, 1>(64).format<int>());
+template <typename T, int HEAD_SIZE>
+CM_INLINE void store_kvcahe(const svmptr_t kv_cache [[type("svmptr_t")]], uint offset, vector_ref<T, HEAD_SIZE> kv_data) {
+    if constexpr(std::is_same<T, half>::value) {
+        if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
+            cm_ptr_store<int, HEAD_SIZE / 2>((int*)kv_cache, offset, kv_data.format<int>());
+        } else if constexpr (HEAD_SIZE == 96) {
+            cm_ptr_store<int, 32>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
+            cm_ptr_store<int, 16>((int*)kv_cache, offset + 32 * sizeof(int), kv_data.select<32, 1>(64).format<int>());
+        } else {
+            // # head_size is restricted to by be divisible by 16 in CM PA/Xattn pipeline.
+            #pragma unroll
+            for(int i = 0; i < HEAD_SIZE / 16; i++) {
+                cm_ptr_store<int, 8>((int*)kv_cache, offset + i * 8 * sizeof(int), kv_data.select<16, 1>(16*i).format<int>());
+            }
+        }
     } else {
-        // # head_size is restricted to by be divisible by 16 in CM PA/Xattn pipeline.
-        #pragma unroll
-        for(int i = 0; i < HEAD_SIZE / 16; i++) {
-            cm_ptr_store<int, 8>((int*)kv_cache, offset + i * 8 * sizeof(int), kv_data.select<16, 1>(16*i).format<int>());
+        if constexpr (HEAD_SIZE % 4 == 8 || HEAD_SIZE % 4 == 16 || HEAD_SIZE % 4 == 32 || HEAD_SIZE % 4 == 64) {
+            cm_ptr_store<int, HEAD_SIZE / 4>((int*)kv_cache, offset, kv_data.format<int>());
+        } else if constexpr (HEAD_SIZE == 96) {
+            cm_ptr_store<int, 16>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
+            cm_ptr_store<int, 8>((int*)kv_cache, offset + 16 * sizeof(int), kv_data.select<32, 1>(64).format<int>());
+        } else {
+            // # head_size is restricted to by be divisible by 16 in CM PA/Xattn pipeline.
+            #pragma unroll
+            for(int i = 0; i < HEAD_SIZE / 16; i++) {
+                cm_ptr_store<int, 4>((int*)kv_cache, offset + i * 4 * sizeof(int), kv_data.select<16, 1>(16*i).format<int>());
+            }
         }
     }
 }
+
+#if KV_CACHE_COMPRESSION_PER_TOKEN
+template <int HEAD_SIZE>
+CM_INLINE void quantize_and_store(vector_ref<half, HEAD_SIZE> data, uchar* out, uint out_offset, uint token_pos) {
+        uint scale_offset = out_offset + HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + token_pos * sizeof(half);
+        half max_val = cm_reduced_max<half>(data);
+        half min_val = cm_reduced_min<half>(data);
+        float scale_val = float(0.0);
+        half zp_val = half(0.0);
+        if(max_val == min_val) {
+            scale_val = float(0.0);
+            zp_val = max_val;
+        } else {
+            scale_val = 255.0 / (max_val - min_val);
+            zp_val = (0.0 - min_val) * scale_val;
+        }
+        vector<half, HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
+        vector<uchar, HEAD_SIZE> data_u8 = cm_rnde<uchar, HEAD_SIZE>(dequant_data);
+
+        store_kvcahe<uchar, HEAD_SIZE>(reinterpret_cast<svmptr_t>(out + out_offset + token_pos * HEAD_SIZE), 0, data_u8);
+
+        half *out_scale_zp = (half*)(out + scale_offset);
+        out_scale_zp[0] = (max_val - min_val) / 255.0;
+        out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
+}
+#endif
 
 extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     const half* key [[type("svmptr_t")]],
@@ -99,7 +140,7 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     //const auto wg_local_id = cm_local_id(2);
     //const auto local_size = cm_local_size(2);
 
-    // static_assert(local_size == wg_size);
+    static_assert(K_HEAD_SIZE % 16 == 0 && V_HEAD_SIZE % 16 == 0);
 
     // const uint token_idx = wg_id * local_size + wg_local_id;
     const uint token_idx = cm_global_id(2);
@@ -124,29 +165,6 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
 
     const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
 
-    #if KV_CACHE_COMPRESSION_PER_TOKEN
-    // Assume: K_HEAD_SIZE == K_HEAD_SIZE
-    auto quantize_and_store = [&](vector<half, K_HEAD_SIZE> data, uchar* out, uint out_offset, uint token_pos) {
-            uint scale_offset = out_offset + K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + token_pos * sizeof(half);
-            half max_val = cm_reduced_max<half>(data);
-            half min_val = cm_reduced_min<half>(data);
-            float scale_val = float(0.0);
-            half zp_val = half(0.0);
-            if(max_val == min_val) {
-                scale_val = float(0.0);
-                zp_val = max_val;
-            } else {
-                scale_val = 255.0 / (max_val - min_val);
-                zp_val = (0.0 - min_val) * scale_val;
-            }
-            vector<half, K_HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
-            vector<uchar, K_HEAD_SIZE> data_u8 = cm_rnde<uchar, K_HEAD_SIZE>(dequant_data);
-            cm_ptr_store<uint32_t, K_HEAD_SIZE / 4>((uint32_t*)(out + out_offset + token_pos * K_HEAD_SIZE), 0, data_u8.format<uint32_t>());
-            half *out_scale_zp = (half*)(out + scale_offset);
-            out_scale_zp[0] = (max_val - min_val) / 255.0;
-            out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
-    };
-    #endif
     {
         uint block_k_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;
@@ -155,9 +173,9 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         load_kvcahe<K_HEAD_SIZE>(key_data, key, key_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
-            quantize_and_store(key_data, (uchar*)key_cache, block_k_base_offset, token_start_pos);
+            quantize_and_store<K_HEAD_SIZE>(key_data, (uchar*)key_cache, block_k_base_offset, token_start_pos);
         #else
-        store_kvcahe<K_HEAD_SIZE>(key_cache, key_out_offset * (int)sizeof(half), key_data);
+            store_kvcahe<half, K_HEAD_SIZE>(reinterpret_cast<svmptr_t>(key_cache), key_out_offset * (int)sizeof(half), key_data);
         #endif
     }
     {
@@ -165,14 +183,12 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         uint value_out_offset = block_v_base_offset + token_start_pos * V_HEAD_SIZE;
         uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE;
         vector<half, V_HEAD_SIZE> value_data;
-        // value_data.format<int>() = cm_ptr_load<int, V_HEAD_SIZE / 2>((int*)value, value_in_offset * (int)sizeof(half));
         load_kvcahe<V_HEAD_SIZE>(value_data, value, value_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
-            quantize_and_store(value_data, (uchar*)value_cache, block_v_base_offset, token_start_pos);
+            quantize_and_store<V_HEAD_SIZE>(value_data, (uchar*)value_cache, block_v_base_offset, token_start_pos);
         #else
-            // cm_ptr_store<int, V_HEAD_SIZE / 2>((int*)value_cache, value_out_offset * (int)sizeof(half), value_data.format<int>());
-            store_kvcahe<V_HEAD_SIZE>(value_cache, value_out_offset * (int)sizeof(half), value_data);
+            store_kvcahe<half, V_HEAD_SIZE>(reinterpret_cast<svmptr_t>(value_cache), value_out_offset * (int)sizeof(half), value_data);
         #endif
     }
 }
