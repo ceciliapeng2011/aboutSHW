@@ -1,3 +1,18 @@
+/*******************************************************************************
+ * Copyright (c) 2018-2026 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
 
 #include "cm_pa_common.hpp"
 
@@ -22,14 +37,13 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
     bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
     int q_len,
     int num_q_blocks,
     int num_k_blocks,
-    // validate sparse atten process
-    bool validate) {
+    int SPARSE_BLOCK_SIZE) {
 #else
     int q_len) {
 #endif
@@ -108,16 +122,13 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     //Q/O[B, L, H, S]
     uint q_offset = (q_start_sg*num_heads + h)*head_size;
 
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
     bool *block_mask_base, *wg_block_mask_base;
-    if (validate) {
-        //# sparse_block_mask [num_heads, num_q_blocks, num_k_blocks]
-        //# sparse_block_mask_wg [num_heads, wg_count_along_query, num_k_blocks]
-        auto q_start_block = q_start_sg/ SPARSE_BLOCK_SIZE;
-        block_mask_base = sparse_block_mask + (h * num_q_blocks + q_start_block) * num_k_blocks;
-        wg_block_mask_base = sparse_block_mask_wg + (h * cm_group_count(2) + wg_id) * num_k_blocks;
-        // printf("wg:%d.%d  q: %d, +%d   kv: %d, +%d, %d, x-attn: %d, %dx%d, %p, %p\n", wg_id, wg_local_id, q_start_sg, q_len_sg, kv_start, kv_seq_len, kv_stop, q_start_block, num_q_blocks, num_k_blocks, sparse_block_mask, block_mask_base);
-    }
+    //# sparse_block_mask [num_heads, num_q_blocks, num_k_blocks]
+    //# sparse_block_mask_wg [num_heads, wg_count_along_query, num_k_blocks]
+    auto q_start_block = q_start_sg/ SPARSE_BLOCK_SIZE;
+    block_mask_base = sparse_block_mask + (h * num_q_blocks + q_start_block) * num_k_blocks;
+    wg_block_mask_base = sparse_block_mask_wg + (h * cm_group_count(2) + wg_id) * num_k_blocks;
  #endif
 
 #if CMPA_KVCACHE_U8
@@ -134,10 +145,10 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(query + q_offset),
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            validate,
+                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
@@ -153,10 +164,10 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(query + q_offset),
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            validate,
+                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,

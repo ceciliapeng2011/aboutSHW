@@ -83,6 +83,7 @@ class page_atten_cm:
         self.trunk_sz = trunk_sz
         self.sparse_block_sz = sparse_block_sz
         self.compressed_kvcache = compressed_kvcache
+        is_block_sparse = True if sparse_block_sz > 1 else False
 
         src1 = r'''#include "cm_pa_kernel.hpp"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
@@ -97,7 +98,7 @@ class page_atten_cm:
                       f" -DCMFLA_SCALE_FACTOR={scale_factor}"
                       f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
                       f" -DCMPA_BLOCK_SZ={self.block_sz}"
-                      f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
+                      f" -DIS_BLOCK_SPARSE={int(is_block_sparse)}"
                       f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
                       f" -mdump_asm -g2")
                      )
@@ -256,7 +257,7 @@ class page_atten_cm:
                     t_block_mask = cl.tensor(block_mask_list[trunk_idx].to(torch.bool).detach().numpy())
                     t_block_mask_in_wg  = cl.tensor(block_mask_in_wg_list[trunk_idx].to(torch.bool).detach().numpy())
                     validate = True
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2], validate)
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2], self.sparse_block_sz)
                 else:
                     self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
                 output[q_start:q_end] = torch.from_numpy(t_out.numpy())
@@ -649,7 +650,7 @@ def test_ov():
     if pa_cm.sparse_block_sz > 1:
         t_block_mask = cl.tensor(block_mask.to(torch.bool).detach().numpy())
         t_block_mask_in_wg  = cl.tensor(block_mask_in_wg.to(torch.bool).detach().numpy())
-        pa_cm.kernels.enqueue("cm_page_attention", GWS, LWS, t_query, t_key_cache, t_value_cache, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2], False)
+        pa_cm.kernels.enqueue("cm_page_attention", GWS, LWS, t_query, t_key_cache, t_value_cache, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2], pa_cm.sparse_block_sz)
     else:
         pa_cm.kernels.enqueue("cm_page_attention", GWS, LWS, t_query, t_key_cache, t_value_cache, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
     latency = cl.finish()
@@ -733,7 +734,7 @@ if __name__ == "__main__":
                                 test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, sparse_ratio=sparse_ratio, check_acc=True)
 
     # perf for sparse X attention.
-    if 1:
+    if 0:
         seq_len = 32*1024
         block_sz = 256
         trunk_sz=seq_len
@@ -746,8 +747,8 @@ if __name__ == "__main__":
         # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=0.8, check_acc=False)
 
     # perf for sparse X attention, with QWen3 8K case
-    if 0:
-        for sparse_block_sz in [128]:
+    if 1:
+        for sparse_block_sz in [128, 256]:
             for density in [100.0, 0.8, 0.5, 0.25, 0.1]:
                 # seq_len, block_sz, blocks_per_trunk= 8*1024, 256, 16*2
                 seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128

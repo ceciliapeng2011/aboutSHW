@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2022-2025 Intel Corporation
+ * Copyright (c) 2018-2026 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,10 +29,10 @@ void pa_lsc_u8(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
-    bool validate,
+    int SPARSE_BLOCK_SIZE,
 #endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
@@ -77,7 +77,7 @@ void pa_lsc_u8(
     int slm_buff_id_write = 0;
     int slm_buff_id_read = 0;
 
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
     auto skip_compute = [&](int kv_pos) {
         auto kv_start_block = kv_pos / SPARSE_BLOCK_SIZE;
         bool sparse_mask = *(reinterpret_cast<bool*>(sparse_mask_base) + kv_start_block);
@@ -93,12 +93,10 @@ void pa_lsc_u8(
 
     auto load_slm_KV = [&](int kv_pos) {
         if (kv_pos < kv_stop) {
-#if SPARSE_BLOCK_SIZE > 1
-            if (validate) {
-                if (skip_load(kv_pos)) {
-                    slm_buff_id_write++;
-                    return;
-                }
+#if IS_BLOCK_SPARSE
+            if (SPARSE_BLOCK_SIZE > 1 && skip_load(kv_pos)) {
+                slm_buff_id_write++;
+                return;
             }
 #endif
             auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
@@ -203,13 +201,11 @@ void pa_lsc_u8(
         load_slm_KV(kv_pos + kv_step*2);
 
 
-#if SPARSE_BLOCK_SIZE > 1
-        if (validate) {
-            if (skip_compute(kv_pos)) {
-                if constexpr (use_causal_mask)
-                    causal_left -= kv_step;
-                continue;
-            }
+#if IS_BLOCK_SPARSE
+        if (SPARSE_BLOCK_SIZE > 1 && skip_compute(kv_pos)) {
+            if constexpr (use_causal_mask)
+                causal_left -= kv_step;
+            continue;
         }
 #endif
         {
@@ -279,10 +275,10 @@ void pa_kernel_lsc_prefetch_f16(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if SPARSE_BLOCK_SIZE > 1
+#if IS_BLOCK_SPARSE
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
-    bool validate,
+    int SPARSE_BLOCK_SIZE,
 #endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
@@ -346,8 +342,8 @@ void pa_kernel_lsc_prefetch_f16(
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
-#if SPARSE_BLOCK_SIZE > 1
-            if (validate)
+#if IS_BLOCK_SPARSE
+            if (SPARSE_BLOCK_SIZE > 1)
             {
                 auto kv_start_block = kv_pos/ SPARSE_BLOCK_SIZE;
                 bool sparse_mask = *(reinterpret_cast<bool*>(sparse_mask_base) + kv_start_block);
@@ -362,6 +358,7 @@ void pa_kernel_lsc_prefetch_f16(
             b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
             b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
             if ((kv_pos + kv_step) > kv_stop) {
                 auto valid_rows = kv_stop - kv_pos;
                 for (int r = valid_rows; r < kv_step; r++)
@@ -420,6 +417,7 @@ void pa_kernel_lsc_prefetch_f16(
                 matrix<half, REG_K/2, REG_N*2> Vmat;
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
                 cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
                 if ((kv_pos + kv_step) > kv_stop) {
                     uint valid_rows = kv_stop - kv_pos;
                     uint valid_rows_vnni = (valid_rows+1)/2;
@@ -446,13 +444,14 @@ void pa_kernel_lsc_prefetch_f16(
 
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
                 cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                 // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
                 if ((kv_pos + kv_step) > kv_stop) {
                     uint valid_rows = kv_stop - kv_pos;
                     uint valid_rows_vnni = (valid_rows+1)/2;
                     for (int r = valid_rows_vnni; r < kv_step / 2; r++)
                         Vmat.row(r) = 0.f;
                     if (valid_rows % 2 == 1)
-                            Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
                 }
                 //# compensate cur_O
                 //  matrix <float, head_size/REG_K*2, REG_M*REG_N> rO;
