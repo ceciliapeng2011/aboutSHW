@@ -635,7 +635,7 @@ void pa_kernel_lsc_prefetch_f16(
                 Vmat.row(r).select<REG_N*VALUE_TILE_NUM, 2>(1) = Vmat_tmp.row(r*2+1);
             }
             #endif
-
+            #if USE_LSC
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
             if ((kv_pos + kv_step) > kv_stop) {
                 uint valid_rows = kv_stop - kv_pos;
@@ -645,6 +645,7 @@ void pa_kernel_lsc_prefetch_f16(
                 if (valid_rows % 2 == 1)
                     Vmat.row(valid_rows_vnni-1).select<REG_N, 2>(1) = 0.f;
             }
+            #endif
 
             if (kv_pos == 0) {
                 #pragma unroll
