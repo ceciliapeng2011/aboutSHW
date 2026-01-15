@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2022-2025 Intel Corporation
+ * Copyright (c) 2018-2026 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@
 constexpr uint wg_size = WG_SIZE;
 
 template <int HEAD_SIZE>
-CM_INLINE void load_kvcahe(vector_ref<half, HEAD_SIZE> kv_data, const half* kv_ptr [[type("svmptr_t")]], uint offset) {
-    if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
+CM_INLINE void load_kvcache(vector_ref<half, HEAD_SIZE> kv_data, const half* kv_ptr [[type("svmptr_t")]], uint offset) {
+    if constexpr (HEAD_SIZE == 16 || HEAD_SIZE == 32 || HEAD_SIZE == 64 || HEAD_SIZE == 128) {
         kv_data.format<int>() = cm_ptr_load<int, HEAD_SIZE / 2>((int*)kv_ptr, offset);
     } else if constexpr (HEAD_SIZE == 96) {
         kv_data.select<64, 1>(0).format<int>() = cm_ptr_load<int, 32>((int*)kv_ptr, offset);
@@ -41,9 +41,9 @@ CM_INLINE void load_kvcahe(vector_ref<half, HEAD_SIZE> kv_data, const half* kv_p
 }
 
 template <typename T, int HEAD_SIZE>
-CM_INLINE void store_kvcahe(const svmptr_t kv_cache [[type("svmptr_t")]], uint offset, vector_ref<T, HEAD_SIZE> kv_data) {
+CM_INLINE void store_kvcache(const svmptr_t kv_cache [[type("svmptr_t")]], uint offset, vector_ref<T, HEAD_SIZE> kv_data) {
     if constexpr(std::is_same<T, half>::value) {
-        if constexpr (HEAD_SIZE % 2 == 8 || HEAD_SIZE % 2 == 16 || HEAD_SIZE % 2 == 32 || HEAD_SIZE % 2 == 64) {
+        if constexpr (HEAD_SIZE == 16 || HEAD_SIZE == 32 || HEAD_SIZE == 64 || HEAD_SIZE == 128) {
             cm_ptr_store<int, HEAD_SIZE / 2>((int*)kv_cache, offset, kv_data.format<int>());
         } else if constexpr (HEAD_SIZE == 96) {
             cm_ptr_store<int, 32>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
@@ -56,7 +56,7 @@ CM_INLINE void store_kvcahe(const svmptr_t kv_cache [[type("svmptr_t")]], uint o
             }
         }
     } else {
-        if constexpr (HEAD_SIZE % 4 == 8 || HEAD_SIZE % 4 == 16 || HEAD_SIZE % 4 == 32 || HEAD_SIZE % 4 == 64) {
+        if constexpr (HEAD_SIZE == 32 || HEAD_SIZE == 64 || HEAD_SIZE == 128 || HEAD_SIZE == 256) {
             cm_ptr_store<int, HEAD_SIZE / 4>((int*)kv_cache, offset, kv_data.format<int>());
         } else if constexpr (HEAD_SIZE == 96) {
             cm_ptr_store<int, 16>((int*)kv_cache, offset, kv_data.select<64, 1>(0).format<int>());
@@ -89,7 +89,7 @@ CM_INLINE void quantize_and_store(vector_ref<half, HEAD_SIZE> data, uchar* out, 
         vector<half, HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
         vector<uchar, HEAD_SIZE> data_u8 = cm_rnde<uchar, HEAD_SIZE>(dequant_data);
 
-        store_kvcahe<uchar, HEAD_SIZE>(reinterpret_cast<svmptr_t>(out + out_offset + token_pos * HEAD_SIZE), 0, data_u8);
+        store_kvcache<uchar, HEAD_SIZE>(reinterpret_cast<svmptr_t>(out + out_offset + token_pos * HEAD_SIZE), 0, data_u8);
 
         half *out_scale_zp = (half*)(out + scale_offset);
         out_scale_zp[0] = (max_val - min_val) / 255.0;
@@ -135,7 +135,6 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     const auto head_idx = cm_group_id(1);
     const auto wg_id = cm_group_id(2);
 
-    // const uint token_idx = wg_id * local_size + wg_local_id;
     const uint token_idx = cm_global_id(2);
 
     // token_idx -> subsequence_idx
@@ -150,12 +149,9 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     // printf("wg:%d.%d, token_idx: %d, subsequence_idx: %d\n", wg_id, wg_local_id, token_idx, subsequence_idx);
 
     const uint subsequence_begin_idx = subsequence_begins[subsequence_idx];
-
     const uint past_len = past_lens[subsequence_idx];
-
     const uint current_block_idx = (past_len + token_idx - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
     const uint token_start_pos = (past_len + token_idx - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
-
     const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
 
     {
@@ -164,12 +160,12 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         uint key_in_offset = token_idx * key_pitch + head_idx * K_HEAD_SIZE + key_offset;
 
         vector<half, K_HEAD_SIZE> key_data;
-        load_kvcahe<K_HEAD_SIZE>(key_data, key, key_in_offset * (int)sizeof(half));
+        load_kvcache<K_HEAD_SIZE>(key_data, key, key_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
             quantize_and_store<K_HEAD_SIZE>(key_data, (uchar*)key_cache, block_k_base_offset, token_start_pos);
         #else
-            store_kvcahe<half, K_HEAD_SIZE>(reinterpret_cast<svmptr_t>(key_cache), key_out_offset * (int)sizeof(half), key_data);
+            store_kvcache<half, K_HEAD_SIZE>(reinterpret_cast<svmptr_t>(key_cache), key_out_offset * (int)sizeof(half), key_data);
         #endif
     }
     {
@@ -178,12 +174,12 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
         uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE + value_offset;
 
         vector<half, V_HEAD_SIZE> value_data;
-        load_kvcahe<V_HEAD_SIZE>(value_data, value, value_in_offset * (int)sizeof(half));
+        load_kvcache<V_HEAD_SIZE>(value_data, value, value_in_offset * (int)sizeof(half));
 
         #if KV_CACHE_COMPRESSION_PER_TOKEN
             quantize_and_store<V_HEAD_SIZE>(value_data, (uchar*)value_cache, block_v_base_offset, token_start_pos);
         #else
-            store_kvcahe<half, V_HEAD_SIZE>(reinterpret_cast<svmptr_t>(value_cache), value_out_offset * (int)sizeof(half), value_data);
+            store_kvcache<half, V_HEAD_SIZE>(reinterpret_cast<svmptr_t>(value_cache), value_out_offset * (int)sizeof(half), value_data);
         #endif
     }
 }
