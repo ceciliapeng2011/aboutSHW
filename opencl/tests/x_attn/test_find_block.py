@@ -65,7 +65,7 @@ def cmp_mask(ref_mask_np, cur_mask_np, ref_sum, cur_exp_partial_sum_np):
             for idx in range(diff_idx_t.shape[0]):
                 if torch.all(diff_idx_t[idx][:-1] == repeated_row):
                     pos = diff_idx_t[idx].tolist()
-                    vals.append(ref_sum[*pos])
+                    vals.append(ref_sum[pos])
                     full_pos.append(pos)
                     idxes.append(idx)
             if torch.allclose(torch.tensor(vals, dtype=vals[0].dtype), vals[0], atol=0.01):
