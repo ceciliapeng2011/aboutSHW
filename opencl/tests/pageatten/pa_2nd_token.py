@@ -20,6 +20,13 @@ parser.add_argument('-ql', "--q-len", type=int, default=1)
 parser.add_argument('-kvl', "--kv-len", type=int, default=32769)
 parser.add_argument('-hs', "--head-size", type=int, default=128)
 parser.add_argument('-rkv', "--reset_kv_cache", type=int, default=1)
+parser.add_argument("--enable-kvcache-compression", type=int, default=0)
+parser.add_argument(
+    "--kv-cache-quant-mode",
+    type=str,
+    default=os.environ.get("KV_CACHE_QUANT_MODE", "by_token"),
+)
+parser.add_argument("--q-dist", type=str, default="random")
 parser.add_argument('-v', "--verbose", type=int, default=-1)
 args = parser.parse_args()
 print(args)
@@ -42,9 +49,8 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 0
-kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
-# kv_cache_quantization_mode = "by_channel"
+enable_kvcache_compression = args.enable_kvcache_compression
+kv_cache_quantization_mode = args.kv_cache_quant_mode
 
 def _validate_quant_mode(mode: str) -> str:
     mode = mode.strip().lower()
@@ -82,7 +88,12 @@ low = -127
 high = 128
 act_dtype = torch.float16
 new_kv_len = (kv_len + kv_block_size - 1) // kv_block_size * kv_block_size
-q = torch.randint(low, high, [batch, q_len, num_heads, head_size]).to(dtype=act_dtype)/high
+if args.q_dist == "random":
+    q = torch.randint(low, high, [batch, q_len, num_heads, head_size]).to(dtype=act_dtype) / high
+elif args.q_dist == "ones":
+    q = torch.ones([batch, q_len, num_heads, head_size], dtype=act_dtype)
+else:
+    raise ValueError(f"Unsupported q distribution: {args.q_dist}")
 k = torch.randint(low, high, [batch, new_kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 v = torch.randint(low, high, [batch, new_kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 
@@ -887,9 +898,6 @@ src1 = r'''
 
 #pyeval f"#define CLEAN_UNUSED_KVCACHE {enable_clean_unused_kvcache}"
 
-#pyeval f"#define KV_CACHE_COMPRESSION {enable_kvcache_compression}"
-#pyeval f"#define KV_CACHE_COMPRESSION_BY_TOKEN {kvcache_quantization_by_token}"
-
 // #define KV_CACHE_COMPRESSION 0
 
 // xe-1:8, xe-2:16
@@ -1269,7 +1277,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                     }
                     #if KV_CACHE_COMPRESSION_BY_TOKEN
                     matrix<half, REG_N, REG_K> KtNormal = temp;
-                    KtNormal = KtNormal - temp_scale;
+                    KtNormal = KtNormal - temp_zp;
                     KtNormal = cm_mul<half>(KtNormal, temp_scale);
                     #else
                     vector<half, REG_K> temp_scale, temp_zp;
@@ -2132,7 +2140,12 @@ if enable_kvcache_compression and False:
 # f"-cmc -mdump_asm -g2 "
 cwd = os.path.dirname(os.path.realpath(__file__))
 print("compiling ...")
-cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -Qxcm_jit_option='-abortonspill' -mdump_asm -g2 -I{cwd}")
+cm_kernels = cl.kernels(
+    pyeval(src1),
+    f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -Qxcm_jit_option='-abortonspill' "
+    f"-mdump_asm -g2 -I{cwd} -DKV_CACHE_COMPRESSION={enable_kvcache_compression} "
+    f"-DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}",
+)
 # cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -mdump_asm -g2 -I{cwd}")
 print("first call ...")
 # cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, q_len, kv_len, t_q, t_k, t_v, t_out, t_lse)
