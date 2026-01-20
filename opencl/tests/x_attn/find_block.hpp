@@ -71,7 +71,6 @@ CM_INLINE void find(uint slm, int m_block,
     , svmptr_t kq_sum
 #endif
 ) {
-<<<<<<< arlh_dev
 #ifndef BLOCK_SHARE_MAX
     #define BLOCK_SG_M  64
     #define BLOCK_SG_N  32
@@ -84,10 +83,7 @@ CM_INLINE void find(uint slm, int m_block,
     #define BLOCK_SHARE_MAX 256
 #endif
 
-    const int TOKEN_IN_BLOCK = (BLOCK_SIZE / STRIDE); //8
-=======
     constexpr int TOKEN_IN_BLOCK = (BLOCK_SIZE / STRIDE);   // 8 -> 16
->>>>>>> main
     int m = m_block * TOKEN_IN_BLOCK;
     vector<SOFTMAX_TYPE, TOKEN_IN_BLOCK> max_m;
 
@@ -97,11 +93,7 @@ CM_INLINE void find(uint slm, int m_block,
     kq_max_wg += m * (int)sizeof(SOFTMAX_TYPE);
     constexpr SOFTMAX_TYPE log2e = 1.4426950408889634f;
     matrix<float, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX> sum_m = 0;
-<<<<<<< arlh_dev
-    matrix<SOFTMAX_TYPE, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX> data;  //8x16
-=======
     matrix<SOFTMAX_TYPE, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX> data;   // (8, 32) -> (16, 16)
->>>>>>> main
     int m_start = MYMIN(m, q_stride);
     int m_end = MYMIN(m_start + TOKEN_SHARE_MAX, q_stride);
     int valid_m = m_end - m_start;
@@ -116,24 +108,18 @@ CM_INLINE void find(uint slm, int m_block,
         }
         return;
     }
-<<<<<<< arlh_dev
     #ifdef CM_HAS_LSC_UNTYPED_2D
+    #if BLOCK_SIZE == 128
     lsc::block_2d_desc<SOFTMAX_TYPE, 1, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX / (sizeof(SOFTMAX_TYPE) / sizeof(half))> desc_sum{ kq_exp_partial_sum, (uint)valid_m - 1, (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1),
         0, 0 };
+    #else
+    lsc::block_2d_desc<SOFTMAX_TYPE, 1, TOKEN_IN_BLOCK / 2, TOKEN_SHARE_MAX> desc_sum{ kq_exp_partial_sum, (uint)valid_m - 1, (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1),
+        0, 0 };
+    #endif
     #else
     const uint pitch_sum = k_block_pad * sizeof(SOFTMAX_TYPE);
     uint off_sum = 0;// m * k_block_pad * (int)sizeof(SOFTMAX_TYPE);
     #endif
-
-=======
-#if BLOCK_SIZE == 128
-    lsc::block_2d_desc<SOFTMAX_TYPE, 1, TOKEN_IN_BLOCK, TOKEN_SHARE_MAX / (sizeof(SOFTMAX_TYPE) / sizeof(half))> desc_sum{ kq_exp_partial_sum, (uint)valid_m - 1, (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1),
-        0, 0 };
-#else
-    lsc::block_2d_desc<SOFTMAX_TYPE, 1, TOKEN_IN_BLOCK / 2, TOKEN_SHARE_MAX> desc_sum{ kq_exp_partial_sum, (uint)valid_m - 1, (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1), (uint)(k_block_pad * sizeof(SOFTMAX_TYPE) - 1),
-        0, 0 };
-#endif
->>>>>>> main
     {
         // find max: (k_block_pad / TOKEN_SHARE_MAX) * q_stride_pad
         max_m = SOFTMAX_TYPE{-60000};
@@ -153,13 +139,8 @@ CM_INLINE void find(uint slm, int m_block,
     for (int j = 0, idx = 0; j < k_block_pad; j += TOKEN_SHARE_MAX, idx++) {
         vector<SOFTMAX_TYPE, TOKEN_IN_BLOCK> max_m_in_group;
         max_m_in_group.format<int>() = cm_ptr_load<int, TOKEN_IN_BLOCK / (sizeof(int) / sizeof(SOFTMAX_TYPE))>((int*)kq_max_wg, q_stride_pad * idx * (int)sizeof(SOFTMAX_TYPE));
-<<<<<<< arlh_dev
 #ifdef CM_HAS_LSC_UNTYPED_2D
-#if CUR_TYPE == IS_float
-=======
 #if CUR_TYPE == IS_float && BLOCK_SIZE == 128
-        // 2x(8, 16) -> (8, 32)
->>>>>>> main
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached,  0, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>(), desc_sum);
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 16, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>(), desc_sum);
 #elif CUR_TYPE == IS_float && BLOCK_SIZE == 256
@@ -179,12 +160,8 @@ CM_INLINE void find(uint slm, int m_block,
                 sum_m.row(i) += data.row(i);
             }
         }
-<<<<<<< arlh_dev
 #ifdef CM_HAS_LSC_UNTYPED_2D
-#if CUR_TYPE == IS_float
-=======
 #if CUR_TYPE == IS_float && BLOCK_SIZE == 128
->>>>>>> main
         cm_store<CacheHint::Uncached, CacheHint::WriteBack,  0, 0>(desc_sum, data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>());
         cm_store<CacheHint::Uncached, CacheHint::WriteBack, 16, 0>(desc_sum, data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>());
 #elif CUR_TYPE == IS_float && BLOCK_SIZE == 256
@@ -193,7 +170,6 @@ CM_INLINE void find(uint slm, int m_block,
 #else
         cm_store(desc_sum, data.format<SOFTMAX_TYPE>());
 #endif
-<<<<<<< arlh_dev
 #else
 //xe1
         cm_store_2d(data, kq_exp_partial_sum, off_sum, pitch_sum, valid_m);
@@ -203,9 +179,6 @@ CM_INLINE void find(uint slm, int m_block,
 #else
         off_sum += TOKEN_SHARE_MAX * sizeof(SOFTMAX_TYPE);
 #endif
-=======
-        desc_sum.set_block_x(desc_sum.get_block_x() + TOKEN_SHARE_MAX);  // k_block_in_group? 32 ->16
->>>>>>> main
     }
 
     // exp/sum
@@ -229,12 +202,8 @@ CM_INLINE void find(uint slm, int m_block,
 #endif
     vector<uchar, TOKEN_SHARE_MAX> zero = 0;
     for (int j = 0; j < k_block_pad; j += TOKEN_SHARE_MAX) {
-<<<<<<< arlh_dev
 #ifdef CM_HAS_LSC_UNTYPED_2D
-#if CUR_TYPE == IS_float
-=======
 #if CUR_TYPE == IS_float && BLOCK_SIZE == 128
->>>>>>> main
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached,  0, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, 0).format<SOFTMAX_TYPE>(), desc_sum);
         cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 16, 0>(data.select<TOKEN_IN_BLOCK, 1, TOKEN_SHARE_MAX / 2, 1>(0, TOKEN_SHARE_MAX / 2).format<SOFTMAX_TYPE>(), desc_sum);
 #elif CUR_TYPE == IS_float && BLOCK_SIZE == 256

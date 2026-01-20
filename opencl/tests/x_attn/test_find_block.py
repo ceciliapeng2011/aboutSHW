@@ -27,58 +27,6 @@ SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
-<<<<<<< arlh_dev
-
-HQ = 32
-HK = 8
-HEAD_SIZE = 128
-STRIDE = 16
-BLOCK_SIZE = 128
-THRESH = 0.9
-IS_CAUSAL = 1
-SOFTMAX_TYPE = 'float' # 'half'
-
-FIND_DEBUG_ACC = 0 # only acc test needed
-
-kernels = None
-def create_kernels(force_create=False):
-    global kernels
-    if kernels and not force_create: return
-
-    src = r'''#include "xattn_find_block.hpp"'''
-    cwd = os.path.dirname(os.path.realpath(__file__))
-    print(f"compiling {cwd} ...")
-
-    jit_option = '-abortonspill -noschedule '
-    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
-                        -mCM_printregusage -mdump_asm -g2
-                        -Qxcm_register_file_size=256 -I{cwd}
-                        -DSTRIDE={STRIDE} -DHQ={HQ} -DHK={HK} -DHEAD_SIZE={HEAD_SIZE} 
-                        -DBLOCK_SIZE={BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} 
-                        -DDEBUG_ACC={FIND_DEBUG_ACC} -DIS_CAUSAL={IS_CAUSAL} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                        ''')
-
-def cmp_mask(ref_mask_np, cur_mask_np, ref_sum, cur_exp_partial_sum_np):
-    sum_per_token_in_block = BLOCK_SIZE // STRIDE
-    diff_idx = np.where(ref_mask_np != cur_mask_np)
-    if diff_idx[0].shape[0]:
-        # case 1: if 2+ values are very close, anyone selected is valid although its index is different
-        diff_idx_t = torch.tensor(np.array(diff_idx)).transpose(0, 1)
-        unique_rows, counts_rows = torch.unique(diff_idx_t[:,:-1], dim=0, return_counts=True)
-        idxes = []
-        repeated_rows = unique_rows[counts_rows > 1]
-        for repeated_row in repeated_rows:
-            vals = []
-            full_pos = []
-            for idx in range(diff_idx_t.shape[0]):
-                if torch.all(diff_idx_t[idx][:-1] == repeated_row):
-                    pos = diff_idx_t[idx].tolist()
-                    vals.append(ref_sum[pos])
-                    full_pos.append(pos)
-                    idxes.append(idx)
-            if torch.allclose(torch.tensor(vals, dtype=vals[0].dtype), vals[0], atol=0.01):
-                print(f'{Colors.YELLOW}similar float detected:{Colors.END} idx={full_pos}, vals={vals}')
-=======
 KV_BLOCK_SIZE = 256
 
 class xattn_find_block:
@@ -151,7 +99,7 @@ class xattn_find_block:
                 for idx in range(diff_idx_t.shape[0]):
                     if torch.all(diff_idx_t[idx][:-1] == repeated_row):
                         pos = diff_idx_t[idx].tolist()
-                        vals.append(ref_sum[*pos])
+                        vals.append(ref_sum[pos])
                         full_pos.append(pos)
                         idxes.append(idx)
                 if torch.allclose(torch.tensor(vals, dtype=vals[0].dtype), vals[0], atol=0.01):
@@ -193,7 +141,6 @@ class xattn_find_block:
             # case 2: if accum is very close to thresh, it should be a minor float error
             if np.allclose(error_accum, cur_thresh, rtol=0.01, atol=0.01):
                 print(f'{Colors.YELLOW}minor float error detected:{Colors.END} idx={diff_idx}, accum={error_accum}, thresh={cur_thresh}')
->>>>>>> main
             else:
                 print(f'{Colors.RED}mask is not same:{Colors.END} idx={diff_idx}, accum={error_accum}, thresh={cur_thresh}')
                 raise Exception('mask is not same')
