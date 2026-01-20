@@ -153,33 +153,6 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     const uint current_block_idx = (past_len + token_idx - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
     const uint token_start_pos = (past_len + token_idx - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
     const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
-
-<<<<<<< arlh_dev
-    #if KV_CACHE_COMPRESSION_PER_TOKEN
-    // Assume: K_HEAD_SIZE == K_HEAD_SIZE
-    auto quantize_and_store = [&](vector<half, K_HEAD_SIZE> data, uchar* out, uint out_offset, uint token_pos) {
-            uint scale_offset = out_offset + K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + token_pos * sizeof(half);
-            half max_val = cm_reduced_max<half>(data);
-            half min_val = cm_reduced_min<half>(data);
-            half scale_val = half(0.0);
-            half zp_val = half(0.0);
-            if(max_val == min_val) {
-                scale_val = half(0.0);
-                zp_val = max_val;
-            } else {
-                scale_val = half(255.0) / (max_val - min_val);
-                zp_val = (half(0.0) - min_val) * scale_val;
-            }
-            vector<half, K_HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
-            vector<uchar, K_HEAD_SIZE> data_u8 = cm_rnde<uchar, K_HEAD_SIZE>(dequant_data);
-            cm_ptr_store<uint32_t, K_HEAD_SIZE / 4>((uint32_t*)(out + out_offset + token_pos * K_HEAD_SIZE), 0, data_u8.format<uint32_t>());
-            half *out_scale_zp = (half*)(out + scale_offset);
-            out_scale_zp[0] = (max_val - min_val) / half(255.0);
-            out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
-    };
-    #endif
-=======
->>>>>>> main
     {
         uint block_k_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;
