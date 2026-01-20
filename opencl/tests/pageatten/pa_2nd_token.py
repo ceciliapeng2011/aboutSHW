@@ -116,7 +116,6 @@ k_partition_block_num = kv_len//8192
 if k_partition_block_num < 1:
     k_partition_block_num = 1
 k_partition_block_num = 1  # test cm_sdpa_2nd
-# k_partition_block_num = 0.5  # test cm_sdpa_2nd_half_block, now output is wrong for enable_kvcache_compression
 kv_partition_size = int(kv_block_size * k_partition_block_num)
 
 print("kv_step:", kv_step)
@@ -126,23 +125,7 @@ print("kv_partition_size:", kv_partition_size)
 new_kv_len = (kv_len + kv_block_size - 1) // kv_block_size * kv_block_size
 kv_partition_num = (new_kv_len + kv_partition_size - 1) // kv_partition_size
 total_partition_num = kv_partition_num * num_heads
-# lse_num = batch * kv_partition_num
-
-# assert((kv_len//kv_partition_size)%(kv_partition_size//kv_step)==0)
-# assert(kv_len%kv_partition_size == 0)
 assert(kv_partition_size % kv_step == 0)
-
-# # test code
-# q = torch.arange(0, q_len* num_heads * head_size, dtype=act_dtype).reshape(batch, q_len, num_heads, head_size)/10000.0
-# k = torch.arange(0, kv_len* num_kv_heads * head_size, dtype=act_dtype).reshape(batch, kv_len, num_kv_heads, head_size)/10000.0
-# v = torch.arange(0, kv_len* num_kv_heads * head_size, dtype=act_dtype).reshape(batch, kv_len, num_kv_heads, head_size)/10000.0
-
-# print("v.shape:", v.shape, v.dtype)
-# for i in range(batch):
-#     for j in range(kv_len):
-#         for kk in range(num_kv_heads):
-#             for h in range(head_size):
-#                 v[i][j][kk][h] = (h + j*head_size)/100.0
 
 # random attnmask
 attention_mask = torch.full([batch, 1, q_len, kv_len], torch.finfo(act_dtype).min).to(dtype=act_dtype)
@@ -165,16 +148,11 @@ block_indices =  torch.randperm(total_blk_num).to(torch.int32)
 # print("block_indices:", block_indices)
 
 subsequence_begins=torch.tensor([0, seq_num]).to(torch.int32)
-gws_subseq_mapping=torch.tensor([0]).to(torch.int32)
 
 # BLHS=>BHLS
 q = q.transpose(1,2)
 k = k.transpose(1,2)
 v = v.transpose(1,2)
-
-#q[:,:,:,:] = q[:,:,2,:]
-#attention_mask[:,:,:,:] = attention_mask[:,:,2,:]
-
 print("q:", q.shape, q.dtype)
 print("k:", k.shape, k.dtype)
 print("v:", v.shape, v.dtype)
@@ -836,17 +814,6 @@ print(f"final v shape: {v.shape}")
 #print("block_indices:", block_indices)
 #print("blocked k:", k)
 
-def pyeval(src):
-    result_src = ""
-    for line in src.splitlines():
-        if line.startswith("#pyeval"):
-            new_line = eval(line[8:])
-            result_src += new_line + "\n"
-            # print(f"[pyeval] {new_line}")
-        else:
-            result_src += line + "\n"
-    return result_src
-
 '''
 ugemm_qk: [q_step, head_size] x [head_size, kv_step]
 ugemm_kq: [kv_step, head_size] x [head_size, q_step]
@@ -855,16 +822,15 @@ ugemm_pv: [q_step, kv_step] x [kv_step, head_size]
 
 scale_factor = 1.0/(head_size**0.5)
 
-# each WG processes a partition
-GWS=[seq_num, num_kv_heads, (new_kv_len + kv_partition_size - 1) // kv_partition_size]
+# each WG processes a partition, and a chunk of q_head
+MaxRepeatCount=8
+q_heads_per_kv_head = num_heads // num_kv_heads
+q_head_chunks_per_kv_head = (q_heads_per_kv_head + (MaxRepeatCount - 1)) // MaxRepeatCount
+q_head_chunk_size = num_heads // (num_kv_heads * q_head_chunks_per_kv_head)
+print(f"{num_heads=}, {num_kv_heads=}, {q_head_chunk_size=}, {q_head_chunks_per_kv_head=}")
+GWS=[seq_num, num_kv_heads * q_head_chunks_per_kv_head, (new_kv_len + kv_partition_size - 1) // kv_partition_size]
 WG_SIZE = 1;#max(kv_len // kv_partition_size//2, 1)
 LWS=[1, 1, WG_SIZE]
-
-# GWS=[seq_num, (new_kv_len + kv_partition_size - 1) // kv_partition_size, num_heads]
-# WG_SIZE = 1;#max(kv_len // kv_partition_size//2, 1)
-# LWS=[1, WG_SIZE, num_heads//num_kv_heads]
-# #LWS=[1, 1, WG_SIZE]
-
 print("GWS=", GWS)
 print("LWS=", LWS)
 
@@ -880,6 +846,7 @@ use GRF to store temp Input rQ instead of SLM, this allows more Work-Groups to b
 '''
 #========================================================================
 
+<<<<<<< arlh_dev
 src1 = r'''
 //# CM kernel for flash attn, reference
 
@@ -2108,6 +2075,31 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
         cm_svm_block_write<half, REDUCE_SPLIT_SIZE>((svmptr_t)(output + output_offset), out_mat.format<half>());
     }
 '''
+=======
+def create_kernels():
+    # kernel
+    src = r'''#include "pa_single_token.cm"'''
+    cwd = os.path.dirname(os.path.realpath(__file__))
+    print(f"compiling {cwd} ...")
+
+    # jit_option = '-abortonspill -noschedule '
+    jit_option = ''
+    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
+                        -mCM_printregusage -mdump_asm -g2
+                        -Qxcm_register_file_size=256 -I{cwd}
+                        -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
+                        -DQ_STEP={q_step} -DKV_STEP={kv_step}
+                        -DWG_SIZE={WG_SIZE} -DKV_BLOCK_SIZE={kv_block_size}
+                        -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
+                        -DCLEAN_UNUSED_KVCACHE={enable_clean_unused_kvcache}
+                        -DKV_CACHE_COMPRESSION={enable_kvcache_compression}
+                        -DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}
+                        -DXE_ARCH={xe_arch}
+                        -DQ_head_chunks_per_kv_head={int(q_head_chunks_per_kv_head)}
+                        -DQ_head_chunk_size={int(q_head_chunk_size)}
+                        -DSCALE_FACTOR={scale_factor}''')
+    return kernels
+>>>>>>> main
 
 cl.profiling(True)
 
@@ -2118,7 +2110,6 @@ t_past_lens = cl.tensor(past_lens.detach().numpy())
 t_block_indices = cl.tensor(block_indices.detach().numpy())
 t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
 t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
-t_gws_subseq_mapping = cl.tensor(gws_subseq_mapping.detach().numpy())
 t_out = cl.tensor([batch, num_heads, kv_partition_num, head_size], np.dtype(np.float32))
 t_out_final = cl.tensor([batch, 1, num_heads, head_size], np.dtype(np.float16))
 t_lse = cl.tensor([batch, num_heads, kv_partition_num], np.dtype(np.float32))
@@ -2140,6 +2131,7 @@ if enable_kvcache_compression and False:
 # f"-cmc -mdump_asm -g2 "
 cwd = os.path.dirname(os.path.realpath(__file__))
 print("compiling ...")
+<<<<<<< arlh_dev
 cm_kernels = cl.kernels(
     pyeval(src1),
     f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -Qxcm_jit_option='-abortonspill' "
@@ -2147,17 +2139,14 @@ cm_kernels = cl.kernels(
     f"-DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}",
 )
 # cm_kernels = cl.kernels(pyeval(src1), f"-cmc -Qxcm_register_file_size=256 -mCM_printregusage -mdump_asm -g2 -I{cwd}")
-print("first call ...")
-# cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, q_len, kv_len, t_q, t_k, t_v, t_out, t_lse)
+=======
+cm_kernels = create_kernels()
 
-if kv_partition_size * 2 == kv_block_size:
-    cm_kernels.enqueue("cm_sdpa_2nd_half_block", GWS, LWS, t_q, t_k, t_v,
+>>>>>>> main
+print("first call ...")
+cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, t_q, t_k, t_v,
                        t_past_lens, t_block_indices, t_block_indices_begins,
-                       t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
-else:
-    cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS, t_q, t_k, t_v,
-                       t_past_lens, t_block_indices, t_block_indices_begins,
-                       t_subsequence_begins,t_out, t_lse, t_gws_subseq_mapping, q_len)
+                       t_subsequence_begins,t_out, t_lse, q_len)
 
 # np.save("bmg_out", t_out.numpy())
 
@@ -2208,23 +2197,13 @@ while len(all_layers) < loop_cnt and mem_size < 8e9:
 
 for i in range(loop_cnt):
     j  = i % len(all_layers)
-    if kv_partition_size * 2 == kv_block_size:
-        cm_kernels.enqueue("cm_sdpa_2nd_half_block", GWS, LWS,
-                           all_layers[j][0],
-                           all_layers[j][1],
-                           all_layers[j][2],
-                           t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
-                           all_layers[j][3],
-                           t_lse, t_gws_subseq_mapping, q_len)
-    else:
-        cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS,
-                           all_layers[j][0],
-                           all_layers[j][1],
-                           all_layers[j][2],
-                           t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
-                           all_layers[j][3],
-                           t_lse, t_gws_subseq_mapping, q_len)
-
+    cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS,
+                        all_layers[j][0],
+                        all_layers[j][1],
+                        all_layers[j][2],
+                        t_past_lens, t_block_indices, t_block_indices_begins,t_subsequence_begins,
+                        all_layers[j][3],
+                        t_lse, q_len)
     cm_kernels.enqueue("cm_sdpa_2nd_reduce", GWS_2, LWS_2, all_layers[j][3],all_layers[j][4], t_lse, kv_partition_num)
 
 latency = cl.finish()

@@ -3,6 +3,8 @@ import os
 import torch
 import numpy as np
 
+import functools
+
 from clops import cl
 from clops import compare
 from clops.utils import Colors
@@ -14,6 +16,7 @@ def div_up(a, b):
 def rnd_up(a, b):
     return (a + b - 1) // b * b
 
+<<<<<<< arlh_dev
 #  determine Xe1/Xe2
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
@@ -32,12 +35,21 @@ print(f'{CM_GRF_WIDTH=}')
 kernel_name = 'gemm_qk'
 BLOCK_SG_M = 32 #64 xe2
 BLOCK_SG_N = 16
+=======
+THRESH = 0.9 # useless in gemmQK actually
+SOFTMAX_TYPE = 'float' # 'half'
+STRIDE = 16
+
+BLOCK_SG_M = 64
+BLOCK_SG_N = 32
+>>>>>>> main
 SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
 KV_BLOCK_SIZE = 256   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
 
+<<<<<<< arlh_dev
 HQ = 32
 HK = 8
 HEAD_SIZE = 128
@@ -112,20 +124,130 @@ def quant_i8(k:torch.Tensor):
     k_i8_4d[:, :, :, (KV_BLOCK_SIZE * (HEAD_SIZE + 2)) : ] = zp.to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.int8)
 
     return k_i8, k
+=======
+class xattn_gemmQK:
+    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
+        BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
+
+        if kvcache_compressed:
+            self.HEAD_SIZE_KEY = head_size + 2 * 2
+        else:
+            self.HEAD_SIZE_KEY = head_size
+
+        # loop order walks HQ first and the step is WALK_HQ, 1 means not walk HQ, 2 means walks 2 heads first. Valid value: 1, 2, 4...
+        self.WALK_HQ = 2 if num_heads != num_kv_heads else 1
+        
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.xattn_block_size = xattn_block_size
+        self.is_causal = is_causal
+        self.kvcache_compressed = kvcache_compressed
+
+        INV_S = 1 / torch.sqrt(torch.tensor([head_size], dtype=torch.float32)) / STRIDE
+        INV_S = int(INV_S.view(dtype=torch.uint32))
+
+        src = r'''#include "xattn_gemm_qk.hpp"'''
+        cwd = os.path.dirname(os.path.realpath(__file__))
+        print(f"compiling {cwd} ...")
+
+        jit_option = '-abortonspill -noschedule '
+        self.kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
+                            -mCM_printregusage -mdump_asm -g2
+                            -Qxcm_register_file_size=256 -I{cwd}
+                            -DSTRIDE={STRIDE} -DHQ={num_heads} -DHK={num_kv_heads} -DHEAD_SIZE={head_size} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
+                            -DBLOCK_SIZE={int(xattn_block_size)} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={self.WALK_HQ}
+                            -DIS_CAUSAL={int(is_causal)} -DUSE_INT8={int(kvcache_compressed)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
+                            -DBLOCK_WG_K={int(BLOCK_WG_K)}
+                            ''')
+        
+    def __call__(self, t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, n_repeats = 1):
+        batch = 1
+        q_stride_pad = rnd_up(M, BLOCK_WG_M)
+        # [1, 32, 64, 256]
+        softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+        N_kq_groups = div_up(N, BLOCK_WG_N)
+        t_kq_max_wg = cl.tensor(np.ones([batch, self.num_heads, N_kq_groups, q_stride_pad], softmax_type))
+        # [1, 32, 256, 64 * 16]
+        sum_per_token_in_block = self.xattn_block_size // STRIDE
+        k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
+        k_block_pad = k_block_in_group * N_kq_groups
+        t_kq_exp_partial_sum = cl.tensor(np.ones([batch, self.num_heads, q_stride_pad, k_block_pad], softmax_type))
+
+        # loop N first:[0, 1], loop M first:[0, 0]; block M first[slice_no, slice(>0)], block N first[slice_no, slice(<0)]
+        #default linear
+        slice_no = 0
+        block_m = M // BLOCK_WG_M
+        block_n = N // BLOCK_WG_N
+        devinfo = cl.dev_info()
+        eu_xecore = 8
+        xecores = devinfo["CL_DEVICE_MAX_COMPUTE_UNITS"] // eu_xecore
+        slice_no = 0
+        slice = 0
+        print(f'{xecores=} {block_m=} {block_n=} {slice=} {slice_no=}')
+
+        global_size = [N_kq_groups * (q_stride_pad // BLOCK_WG_M) * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
+
+        cl.finish()
+        # gemm
+        for i in range(n_repeats):
+            self.kernels.enqueue('gemm_qk', global_size, [SG_N, SG_M, 1], t_key_cache, t_query, t_block_indices, t_block_indices_begins,
+                                 t_kq_max_wg, t_kq_exp_partial_sum, M, N, K, K * self.num_heads * 2, slice_no, slice, q_start_strided)
+        latency = cl.finish()
+        return latency, t_kq_max_wg, t_kq_exp_partial_sum
+        
+
+    @staticmethod
+    @functools.cache
+    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
+        return xattn_gemmQK(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
+
+    def quant_i8(self, k:torch.Tensor):
+        HEAD_SIZE = self.head_size
+        B, Hk, Lk, S = k.shape
+        k_pad = torch.zeros([B, Hk, rnd_up(Lk, KV_BLOCK_SIZE), HEAD_SIZE], dtype=k.dtype)
+        k_pad[:, :, :Lk,:] = k
+
+        B, Hk, Lk, S = k_pad.shape
+        k_i8 = torch.zeros([B, Hk, Lk, self.HEAD_SIZE_KEY], dtype=torch.uint8)
+        k_i8_4d = k_i8.reshape([B, Hk, -1, KV_BLOCK_SIZE * self.HEAD_SIZE_KEY])
+        if 0:
+            max = torch.max(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
+            min = torch.min(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
+            diff_value = torch.masked_fill(max - min, max == min, 0.001)
+            scale = 255/ diff_value
+            zp = -min * scale
+            quanted = k_pad * scale + zp
+            quanted = quanted.clamp(0, 255)
+            scale = 1.0 / scale
+        else:
+            scale = torch.randint(-1, 3, [B, Hk, Lk, 1], dtype=torch.float16)
+            zp = torch.randint(0, 3, [B, Hk, Lk, 1], dtype=torch.float16)
+            quanted = torch.randint(0, 3, [B, Hk, Lk, S], dtype=torch.float16)
+            k_pad = (quanted - zp) * scale
+            k = k_pad[:, :, :k.shape[2], :]
+            k_pad[:,:,k.shape[2]:,:] = 0
+        # weights
+        k_i8_4d[:, :, :, :KV_BLOCK_SIZE * HEAD_SIZE] = torch.reshape(quanted, [B, Hk, Lk // KV_BLOCK_SIZE, -1])
+        # scale
+        k_i8_4d[:, :, :, KV_BLOCK_SIZE * HEAD_SIZE : (KV_BLOCK_SIZE * (HEAD_SIZE + 2))] = (scale).to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.uint8)
+        # zp
+        k_i8_4d[:, :, :, (KV_BLOCK_SIZE * (HEAD_SIZE + 2)) : ] = zp.to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.int8)
+
+        return k_i8, k
+>>>>>>> main
 
 # q: [B, Hq, L_q, S]
 # k: [B, Hk, L_k, S]
-def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0, threshold=0.9, stride=16, causal=True, perf=True):
-    create_kernels()
-
+def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, causal=True, perf=True):
     B, Hq, Lq, S = q.shape
     _, Hk, Lk, _ = k.shape
-    Lk = Lk // stride * stride
-    M = Lq // stride                  # will slient drop the tails which is less than `stride`
-    N = Lk // stride
-    K = stride * S
+    Lk = Lk // STRIDE * STRIDE
+    M = Lq // STRIDE                  # will slient drop the tails which is less than `STRIDE`
+    N = Lk // STRIDE
+    K = STRIDE * S
 
-    k = k[:,:,:Lk,:]                  # will slient drop the tails which is less than `stride`
+    k = k[:,:,:Lk,:]                  # will slient drop the tails which is less than `STRIDE`
 
     # k -> key_cache blocked layout
     block_indices_begins = torch.zeros(B + 1).to(torch.int32)
@@ -139,14 +261,16 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
     # t_past_lens = cl.tensor(past_lens.to(torch.int32).detach().numpy())                   # M_kq has already been calculated
     t_block_indices_begins = cl.tensor(block_indices_begins.to(torch.int32).detach().numpy())
     # t_subsequence_begins = cl.tensor(subsequence_begins.to(torch.int32).detach().numpy()) # N_kq has already been calculated
+    
+    xattn_cm = xattn_gemmQK.create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, causal, kvcache_compressed)
 
-    if USE_INT8:
-        k_pad, k = quant_i8(k)
-        key_cache = k_pad.reshape([B, Hk, -1, KV_BLOCK_SIZE, HEAD_SIZE_KEY]).permute(0, 2, 1, 3, 4)
+    if kvcache_compressed:
+        k_pad, k = xattn_cm.quant_i8(k)
+        key_cache = k_pad.reshape([B, Hk, -1, KV_BLOCK_SIZE, xattn_cm.HEAD_SIZE_KEY]).permute(0, 2, 1, 3, 4)
     else:
-        k_pad = torch.zeros([B, Hk, (Lk + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE * KV_BLOCK_SIZE, HEAD_SIZE], dtype=k.dtype)
+        k_pad = torch.zeros([B, Hk, (Lk + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE * KV_BLOCK_SIZE, head_size], dtype=k.dtype)
         k_pad[:, :, :Lk,:] = k
-        key_cache = k_pad.reshape([B, Hk, -1, KV_BLOCK_SIZE, HEAD_SIZE]).permute(0, 2, 1, 3, 4)
+        key_cache = k_pad.reshape([B, Hk, -1, KV_BLOCK_SIZE, head_size]).permute(0, 2, 1, 3, 4)
     key_cache = key_cache[:,perm_idx,:,:,:].contiguous()
     t_key_cache = cl.tensor(key_cache.detach().numpy())
 
@@ -157,6 +281,7 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
     q_3d_with_padding[:, :, : Hq * S] = q_3d
     t_query = cl.tensor(q_3d_with_padding.detach().numpy())
 
+<<<<<<< arlh_dev
     q_stride_pad = rnd_up(M, BLOCK_WG_M)
     # [1, 32, 64, 256]
     softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
@@ -187,10 +312,15 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
                         t_kq_max_wg, t_kq_exp_partial_sum,
                         M, N, K, query_stride, slice_no, slice, q_start_strided)
     cl.finish()
+=======
+    n_repeats = 100 if perf else 1
+    ns, t_kq_max_wg, t_kq_exp_partial_sum = xattn_cm(t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, n_repeats)
+>>>>>>> main
 
     if not perf:
         # [1, 32, 256], [1, 32, 64, 256], [1, 32, 256, 64 * 16], A_sum:[1, 32, 32, 64 * 16]
-        kq_max_ref, kq_5d_max_ret_ref, kq_exp_partial_sum_ret_ref, _ = get_gemm_ref(q, k, block_size=block_size, q_start_strided=q_start_strided, S=stride, threshold=threshold, causal=causal, wg_k=BLOCK_WG_N, wg_q=BLOCK_WG_M)
+        kq_max_ref, kq_5d_max_ret_ref, kq_exp_partial_sum_ret_ref, _ = get_gemm_ref(q, k, q_start_strided=q_start_strided, block_size = xattn_block_size,
+                                                                                    S=STRIDE, threshold=THRESH, causal=causal, wg_k=BLOCK_WG_N, wg_q=BLOCK_WG_M)
         kq_5d_max_ret_ref_np = kq_5d_max_ret_ref.detach().numpy()[..., :M]
         t_kq_max_wg_np = t_kq_max_wg.numpy()[..., :M]
         # print(f'{kq_5d_max_ret_ref_np=}, {t_kq_max_wg_np=}')
@@ -202,6 +332,7 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
         print(f'{Colors.GREEN}gemm:exp_partial passed{Colors.END}')
     else:
         flops = B * Hq * M * N * K * 2
+<<<<<<< arlh_dev
         for i in range(0, 100):
             kernels.enqueue(kernel_name, global_size, [SG_N, SG_M, 1],
                             t_key_cache, t_query, t_block_indices, t_block_indices_begins,
@@ -210,19 +341,15 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, block_size=128, q_start_strided=0,
             ns = cl.finish()
             for i, time_opt in enumerate(ns):
                 print(f'(GEMM)TPUT_{i}:{flops/time_opt:,.0f} GFLOPS, BW:{(M*K+K*N+M*N)*2/time_opt:,.0f} GB/s {time_opt*1e-3:,.0f} us')
+=======
+        for i, time_opt in enumerate(ns):
+            print(f'(GEMM)TPUT_{i}:{flops/time_opt:,.0f} GFLOPS, BW:{(M*K+K*N+M*N)*2/time_opt:,.0f} GB/s {time_opt*1e-3:,.0f} us')
+>>>>>>> main
 
     return t_kq_max_wg, t_kq_exp_partial_sum
 
-def test_func():
-    global FIND_DEBUG_ACC
-    FIND_DEBUG_ACC = 1
-    create_kernels(True)
-
-    q_head = HQ
-    k_head = HK
-    dim = HEAD_SIZE
-    block_size = BLOCK_SIZE
-    stride = STRIDE
+def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
+    dim = head_size
     sizes = [
         # (128, 128, '1wg'),
         (128 * STRIDE, 128 * STRIDE, '2k'),
@@ -250,21 +377,26 @@ def test_func():
     ]
     for q_len, k_len, prompt in sizes:
         assert q_len // STRIDE >= 1, "there should be at least 1 row for gemm"
-        print(f'{Colors.BLUE}test gemm("{prompt}") query: [{q_len}, {dim}*{stride}] key:[{k_len}, {dim}*{stride}]...{Colors.END}')
+        print(f'{Colors.BLUE}test gemm("{prompt}") query: [{q_len}, {dim}*{STRIDE}] key:[{k_len}, {dim}*{STRIDE}] xattn_block_size:{xattn_block_size} ...{Colors.END}')
 
+<<<<<<< arlh_dev
         q = torch.randint(-2, 4, size=[1, q_head, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
         # q = torch.arange(1*q_head*q_len*dim).reshape(1, q_head, q_len, dim).to(dtype=torch.float16)
         k = torch.randint(-2, 4, size=[1, k_head, k_len, dim], dtype=torch.int16).to(dtype=torch.float16)
         # k = torch.arange(1*k_head*k_len*dim).reshape(1, k_head, k_len, dim).to(dtype=torch.float16)
+=======
+        q = torch.randint(-2, 4, size=[1, num_heads, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
+        k = torch.randint(-2, 4, size=[1, num_kv_heads, k_len, dim], dtype=torch.int16).to(dtype=torch.float16)
+>>>>>>> main
 
-        if IS_CAUSAL:
-            q_start_strided = k_len // stride - q_len // stride
+        if is_causal:
+            q_start_strided = k_len // STRIDE - q_len // STRIDE
             assert q_start_strided >= 0, "length of key cache must be greater or equal than query"
         else:
             q_start_strided = 0
-        test_gemm(q, k, block_size=block_size, q_start_strided=q_start_strided, threshold=THRESH, stride=stride, causal=IS_CAUSAL, perf=False)
+        test_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=False)
 
-def test_perf():
+def test_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     # 106 T/s:
     # bsz = 1
     # q_head = 1
@@ -272,35 +404,24 @@ def test_perf():
     # q_len = 1024*16*2
     # k_len = 1024*128
     # dim = 128
-    # block_size = 128
-    # stride = 16
-    global FIND_DEBUG_ACC
-    FIND_DEBUG_ACC = 0
-    create_kernels(True)
+    # xattn_block_size = 128
+    # STRIDE = 16
 
-    # 84 T/s:
-    bsz = 1 # must be 1(gemm_qk does not support batch which M,N may be vary for each batch)
-    q_head = HQ
-    k_head = HK
-    dim = HEAD_SIZE
-    block_size = BLOCK_SIZE
-    stride = STRIDE
+    q_len = 1024*4*1  # if q_len=1024*4*2 ==> 95 T/s
+    k_len = 1024*128
 
-    Q_LEN = 1024*4*1  # if q_len=1024*4*2 ==> 95 T/s
-    K_LEN = 1024*128
-    q_len = Q_LEN
-    k_len = K_LEN
+    assert (q_len // STRIDE) >= 128 and (k_len // STRIDE) >= 128, "minimum block size should be 128*128"
 
-    assert (q_len // stride) >= 128 and (k_len // stride) >= 128, "minimum block size should be 128*128"
+    q = torch.randint(-2, 4, size=[1, num_heads, q_len, head_size], dtype=torch.int16).to(dtype=torch.float16)
+    k = torch.randint(-2, 4, size=[1, num_kv_heads, k_len, head_size], dtype=torch.int16).to(dtype=torch.float16)
+    q_start_strided=k_len // STRIDE - q_len // STRIDE
 
-    q = torch.randint(-2, 4, size=[bsz, q_head, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
-    k = torch.randint(-2, 4, size=[bsz, k_head, k_len, dim], dtype=torch.int16).to(dtype=torch.float16)
-
-    test_gemm(q, k, block_size=block_size, q_start_strided=k_len // stride - q_len // stride, threshold=THRESH, stride=stride, causal=IS_CAUSAL)
+    test_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=True)
 
 def main():
-    test_func()
-    test_perf()
+    for xattn_block_size in [128, 256]:
+        test_func(xattn_block_size)
+        test_perf(xattn_block_size)
 
 if __name__ == "__main__":
     torch.manual_seed(3)
