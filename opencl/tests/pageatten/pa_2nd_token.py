@@ -7,6 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
+from enum import Enum
+
+class TestMode(Enum):
+    NO_QUANT = 0
+    QUANT_BY_TOKEN = 1
+    QUANT_BY_CHANNEL = 2
+
 
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
@@ -21,6 +28,8 @@ parser.add_argument('-kvl', "--kv-len", type=int, default=32769)
 parser.add_argument('-hs', "--head-size", type=int, default=128)
 parser.add_argument('-rkv', "--reset_kv_cache", type=int, default=1)
 parser.add_argument('-v', "--verbose", type=int, default=-1)
+parser.add_argument('-m', "--mode", type=int, default=0, required=True, help="0:NO quant, 1: quant by token, 2: quant by channel")
+parser.add_argument('-sgs', "--sub_group_size", type=int, default=256, required=False, help="sub group size for by channel mode")
 args = parser.parse_args()
 print(args)
 
@@ -41,24 +50,30 @@ enable_gqa = num_heads > num_kv_heads
 
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
+kv_cache_quantization_mode = args.mode
+by_channel_sub_group_size = args.sub_group_size
+enable_kvcache_compression = 0
+if kv_cache_quantization_mode != TestMode.NO_QUANT.value:
+    enable_kvcache_compression = 1
 
-enable_kvcache_compression = 1
-kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
-#kv_cache_quantization_mode = "by_token"
-#kv_cache_quantization_mode = "by_channel"
-kv_cache_quantization_mode = "by_channel_group"
-
-def _validate_quant_mode(mode: str) -> str:
-    mode = mode.strip().lower()
-    if mode not in {"by_token", "by_channel", "by_channel_group"}:
+def _get_mode_str(mode: TestMode) -> str:
+    if mode == TestMode.NO_QUANT.value:
+        return "no_quant"
+    elif mode == TestMode.QUANT_BY_TOKEN.value:
+        return "by_token"
+    elif mode == TestMode.QUANT_BY_CHANNEL.value:
+        return "by_channel"
+    else:
         raise ValueError(f"Unsupported kv-cache quantization mode: {mode}")
+
+def _validate_quant_mode(mode: TestMode) -> TestMode:
+    _get_mode_str(mode)
     return mode
 
 kv_cache_quantization_mode = _validate_quant_mode(kv_cache_quantization_mode)
-kvcache_quantization_by_token = int(kv_cache_quantization_mode == "by_token")
-kvcache_quantization_by_channel = int(kv_cache_quantization_mode == "by_channel")
-kvcache_quantization_by_channel_group = int(kv_cache_quantization_mode == "by_channel_group")
-print(f"{kv_cache_quantization_mode=}, {kvcache_quantization_by_token=}, {kvcache_quantization_by_channel_group=}, {kvcache_quantization_by_channel=}")
+kvcache_quantization_by_token = int(kv_cache_quantization_mode == TestMode.QUANT_BY_TOKEN.value)
+kvcache_quantization_by_channel = int(kv_cache_quantization_mode == TestMode.QUANT_BY_CHANNEL.value)
+print(f"kv_cache_quantization_mode=" + _get_mode_str(kv_cache_quantization_mode))
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -821,8 +836,6 @@ if enable_clean_unused_kvcache:
     print("before blocking v:", v.shape, v.dtype)
     if kvcache_quantization_by_token:
         k.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
-    elif kvcache_quantization_by_channel_group:
-        k.view(torch.uint16)[0,kv_len:,:,:] = 0
     elif kvcache_quantization_by_channel:
         k.view(torch.uint16)[0,kv_len:,:,:] = 0
     else:
@@ -845,10 +858,8 @@ if enable_kvcache_compression:
     print("k = ", k.shape)
     if kvcache_quantization_by_token:
         k = quan_per_token(k)
-    elif kvcache_quantization_by_channel_group:
-        k = quan_per_channel_subgroup(k)
     elif kvcache_quantization_by_channel:
-        k = quan_per_channel(k)
+        k = quan_per_channel_subgroup(k, by_channel_sub_group_size)
 
     # current only support by channel and by channel_group on K, V still use by token
     v = quan_per_token(v)
@@ -859,10 +870,8 @@ if enable_kvcache_compression:
     if enable_dequant_check:
         if kvcache_quantization_by_token:
             k_dequan = dequant_per_token(k, head_size, kv_block_size)
-        elif kvcache_quantization_by_channel_group:
-            k_dequan = dequant_per_channel_subgroup(k, head_size, kv_block_size)
         elif kvcache_quantization_by_channel:
-            k_dequan = dequant_per_channel(k, head_size, kv_block_size)
+            k_dequan = dequant_per_channel_subgroup(k, head_size, kv_block_size, by_channel_sub_group_size)
         v_dequan = dequant_per_token(v, head_size, kv_block_size)
         #print("de-quant = ", k_dequan.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size)[0,0,0:10,0])
         #print("org = ", k_origin.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size)[0,0,0:10,0])
@@ -955,7 +964,7 @@ def create_kernels():
 
     # jit_option = '-abortonspill -noschedule '
     jit_option = ''
-    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
+    compile_args = f'''-cmc -Qxcm_jit_option="{jit_option}"
                         -mCM_printregusage -mdump_asm -g2
                         -Qxcm_register_file_size=256 -I{cwd}
                         -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
@@ -965,12 +974,15 @@ def create_kernels():
                         -DCLEAN_UNUSED_KVCACHE={enable_clean_unused_kvcache}
                         -DKV_CACHE_COMPRESSION={enable_kvcache_compression}
                         -DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}
-                        -DKV_CACHE_COMPRESSION_BY_CHANNEL_SUBGROUP={kvcache_quantization_by_channel_group}
                         -DKV_CACHE_COMPRESSION_BY_CHANNEL={kvcache_quantization_by_channel}
+                        -DSUB_GROUP_SIZE={by_channel_sub_group_size}
                         -DXE_ARCH={xe_arch}
                         -DQ_head_chunks_per_kv_head={int(q_head_chunks_per_kv_head)}
                         -DQ_head_chunk_size={int(q_head_chunk_size)}
-                        -DSCALE_FACTOR={scale_factor}''')
+                        -DSCALE_FACTOR={scale_factor}
+                    '''
+    print(compile_args)
+    kernels = cl.kernels(src, compile_args)
     return kernels
 
 cl.profiling(True)
