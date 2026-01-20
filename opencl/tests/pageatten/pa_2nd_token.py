@@ -44,17 +44,21 @@ kv_block_size = 256
 
 enable_kvcache_compression = 1
 kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
-kv_cache_quantization_mode = "by_channel"
+#kv_cache_quantization_mode = "by_token"
+#kv_cache_quantization_mode = "by_channel"
+kv_cache_quantization_mode = "by_channel_group"
 
 def _validate_quant_mode(mode: str) -> str:
     mode = mode.strip().lower()
-    if mode not in {"by_token", "by_channel"}:
+    if mode not in {"by_token", "by_channel", "by_channel_group"}:
         raise ValueError(f"Unsupported kv-cache quantization mode: {mode}")
     return mode
 
 kv_cache_quantization_mode = _validate_quant_mode(kv_cache_quantization_mode)
 kvcache_quantization_by_token = int(kv_cache_quantization_mode == "by_token")
-print(f"{kv_cache_quantization_mode=}, {kvcache_quantization_by_token=}")
+kvcache_quantization_by_channel = int(kv_cache_quantization_mode == "by_channel")
+kvcache_quantization_by_channel_group = int(kv_cache_quantization_mode == "by_channel_group")
+print(f"{kv_cache_quantization_mode=}, {kvcache_quantization_by_token=}, {kvcache_quantization_by_channel_group=}, {kvcache_quantization_by_channel=}")
 
 enable_clean_unused_kvcache = args.reset_kv_cache
 
@@ -180,10 +184,11 @@ def check_close(input, other, atol=1e-3, rtol=1e-3):
         not_close_indices = torch.where(~close_check) # Invert the close check to find failures
         print(f"Not close indices: {not_close_indices}")
         print(f"    ref_tensor: {input[not_close_indices]}")
-        print(f"    res_tensor: {other[not_close_indices]}")
+        print(f"    other: {other[not_close_indices]}")
         assert 0
 
 check_close(ref, org, atol=1e-3, rtol=1e-2)
+print("ref == org passed !")
 
 # [batch, seq-len, heads, size] BLHS
 print("ref:", ref.shape, ref.dtype)
@@ -476,7 +481,6 @@ def get_flash3(query, key, value, attention_mask):
                 cur_sum = 0.0
                 for j in range(i, i1, kv_partition_size):
                     j1 = min(j + kv_partition_size, kv_len)
-
                     if (j == args.verbose): enable_vprint = True
                     # compute in local SRAM
                     # Step8: On chip, compute S(_𝑗)𝑖= Q𝑖K𝑇 𝑗∈ R𝐵𝑟 ×𝐵𝑐.
@@ -575,7 +579,7 @@ print("new_kv_len = ", new_kv_len)
 q = q.transpose(1,2)
 k = k.transpose(1,2)
 v = v.transpose(1,2)
-
+print("=========================================start to test different flash =============================")
 if args.impl == 0:
     f0 = get_flash3(q,k,v,attention_mask)
     check_close(org, f0, atol=1e-2, rtol=1e-3)
@@ -595,6 +599,8 @@ check_close(ref, org, atol=1e-3, rtol=1e-2)
 print("org of get_flash3 passed !")
 check_close(org, org2, atol=1e-3, rtol=1e-2)
 
+#sys.exit(0)
+print("=========================================start to test quant=============================")
 print()
 print("GPU cm kernels for flash attn2:")
 
@@ -716,11 +722,109 @@ def dequant_per_channel(kv, head_size, blk_size):
 
     return kv_dequant
 
+def quan_per_channel_subgroup(kv: torch.Tensor, subgroup_size: int = 16):
+    """
+    kv: [blk_num, kv_heads, KV_BLOCK_SIZE(=256), HEAD_SIZE] (float16)
+    return: packed uint8 layout
+      [u8 payload: 256*HEAD_SIZE] + [scale: groups*HEAD_SIZE*half] + [zp: groups*HEAD_SIZE*half]
+      per block, per head
+    """
+    assert kv.dtype in (torch.float16, torch.bfloat16) or kv.dtype == torch.float32
+    blk_num, kv_heads, blk_sz, head_size = kv.shape
+    assert blk_sz % subgroup_size == 0, "KV_BLOCK_SIZE must be divisible by subgroup_size"
+    groups = blk_sz // subgroup_size  # 256/16=16
+
+    INTMIN, INTMAX = 0.0, 255.0
+    INTRANGE = INTMAX - INTMIN
+
+    # 输出缓冲：按 [blk_num, kv_heads, payload + scales + zps] 拼接
+    payload_u8   = torch.empty((blk_num, kv_heads, blk_sz, head_size), dtype=torch.uint8, device=kv.device)
+    scale_groups = torch.zeros((blk_num, kv_heads, groups, head_size), dtype=torch.float16, device=kv.device)
+    zp_groups    = torch.empty((blk_num, kv_heads, groups, head_size), dtype=torch.float16, device=kv.device)
+
+    # 遍历每个 sub-group（沿 token 维度），按 channel 统计 min/max
+    for g in range(groups):
+        s = g * subgroup_size
+        e = s + subgroup_size
+        kv_slice = kv[:, :, s:e, :]  # [blk_num, kv_heads, subgroup(16), head_size]
+
+        # by-channel：在 subgroup 的 token 维内对每个 channel 统计
+        kv_max = kv_slice.amax(dim=2, keepdim=False)  # [blk_num, kv_heads, head_size]
+        kv_min = kv_slice.amin(dim=2, keepdim=False)
+
+        qrange = kv_max - kv_min  # [blk_num, kv_heads, head_size]
+
+        # 避免 qrange=0 的除零
+        scale = torch.zeros_like(qrange, dtype=torch.float16)
+        mask  = qrange != 0
+        scale[mask] = (INTRANGE / qrange[mask]).to(torch.float16)
+        zp    = ((0.0 - kv_min) * scale + INTMIN).to(torch.float16)
+
+        # 量化 payload（subgroup 的 16 行）
+        u8 = torch.round(kv_slice * scale.unsqueeze(2) + zp.unsqueeze(2)).clamp_(INTMIN, INTMAX).to(torch.uint8)
+        payload_u8[:, :, s:e, :] = u8  # 回填到整块 payload 中
+
+        # 保存当前 group 的 dq_scale/zp
+        dq_scale = torch.zeros_like(scale, dtype=torch.float16)
+        dq_scale[mask] = (1.0 / scale[mask]).to(torch.float16)
+        scale_groups[:, :, g, :] = dq_scale
+        zp_groups[:, :, g, :]    = zp
+
+    # 拼接（注意 half->u8 的 view 在 kernel 里不需要；按裸字节写入即可）
+    # 我们保持为 torch 的 dtype，最终由 .view(torch.uint8) / .numpy() 再拼装为线性字节流
+    packed = torch.cat([
+        payload_u8.reshape(blk_num, kv_heads, -1).to(torch.uint8),
+        scale_groups.reshape(blk_num, kv_heads, -1).contiguous().view(torch.uint8),
+        zp_groups.reshape(blk_num, kv_heads, -1).contiguous().view(torch.uint8)
+    ], dim=-1)
+
+    return packed.contiguous()
+
+
+
+def dequant_per_channel_subgroup(packed: torch.Tensor, head_size: int, blk_size: int = 256, subgroup_size: int = 16):
+    """
+    packed: [blk_num, kv_heads, payload_u8 + scales(bytes) + zps(bytes)] (uint8)
+    return: dequantized fp16 tensor with shape [blk_num, kv_heads, blk_size, head_size]
+    """
+    blk_num, kv_heads, total_u8 = packed.shape
+    groups = blk_size // subgroup_size
+    payload_bytes = blk_size * head_size          # u8 count
+    scale_bytes   = groups * head_size * 2        # half
+    zp_bytes      = groups * head_size * 2
+
+    payload = packed[:, :, :payload_bytes].to(torch.uint8).reshape(blk_num, kv_heads, blk_size, head_size)
+    scales  = packed[:, :, payload_bytes: payload_bytes + scale_bytes].contiguous().view(torch.float16).reshape(blk_num, kv_heads, groups, head_size)
+    zps     = packed[:, :, payload_bytes + scale_bytes:].contiguous().view(torch.float16).reshape(blk_num, kv_heads, groups, head_size)
+
+    out = torch.empty((blk_num, kv_heads, blk_size, head_size), dtype=torch.float16, device=packed.device)
+    for g in range(groups):
+        s, e = g * subgroup_size, (g + 1) * subgroup_size
+        # 当前 group 的 scale/zp: [blk_num, kv_heads, head_size]
+        scale_g = scales[:, :, g, :]
+        zp_g    = zps[:, :, g, :]
+        # 反量化当前 16 行
+        out[:, :, s:e, :] = (payload[:, :, s:e, :].to(torch.float16) - zp_g.unsqueeze(2)) * scale_g.unsqueeze(2)
+    '''
+    for m in range(blk_num):
+        for n in range(kv_heads):
+            for i in range(head_size):
+                for g in range(groups):
+                    s, e = g * subgroup_size, (g + 1) * subgroup_size
+                    out[m,n,s:e,i] = (payload[m,n,s:e,i].to(dtype=torch.float16) - zps[m,n,g,i].to(dtype=torch.float16)) * scales[m,n,g,i].to(dtype=torch.float16)
+    '''
+    return out
+
+
 if enable_clean_unused_kvcache:
     print("before blocking k:", k.shape, k.dtype)
     print("before blocking v:", v.shape, v.dtype)
     if kvcache_quantization_by_token:
         k.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
+    elif kvcache_quantization_by_channel_group:
+        k.view(torch.uint16)[0,kv_len:,:,:] = 0
+    elif kvcache_quantization_by_channel:
+        k.view(torch.uint16)[0,kv_len:,:,:] = 0
     else:
         k.view(torch.uint16)[0,kv_len:,:,:] = 0
     v.view(torch.uint16)[0,kv_len:,:,:] = 0xFE00
@@ -741,8 +845,12 @@ if enable_kvcache_compression:
     print("k = ", k.shape)
     if kvcache_quantization_by_token:
         k = quan_per_token(k)
-    else:
+    elif kvcache_quantization_by_channel_group:
+        k = quan_per_channel_subgroup(k)
+    elif kvcache_quantization_by_channel:
         k = quan_per_channel(k)
+
+    # current only support by channel and by channel_group on K, V still use by token
     v = quan_per_token(v)
     print(f"quant k shape: {k.shape}, dtype={k.dtype}")
     print(f"quant v shape: {v.shape}, dtype={v.dtype}")
@@ -751,12 +859,16 @@ if enable_kvcache_compression:
     if enable_dequant_check:
         if kvcache_quantization_by_token:
             k_dequan = dequant_per_token(k, head_size, kv_block_size)
-        else:
+        elif kvcache_quantization_by_channel_group:
+            k_dequan = dequant_per_channel_subgroup(k, head_size, kv_block_size)
+        elif kvcache_quantization_by_channel:
             k_dequan = dequant_per_channel(k, head_size, kv_block_size)
         v_dequan = dequant_per_token(v, head_size, kv_block_size)
-        # print("de-quant = ", k_dequan.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size))
-        # print("diff = ", (k_dequan - k_origin).abs())
-        # print("k_dequan = ", k_dequan.shape)
+        #print("de-quant = ", k_dequan.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size)[0,0,0:10,0])
+        #print("org = ", k_origin.reshape(total_blk_num, num_kv_heads, kv_block_size, head_size)[0,0,0:10,0])
+        #print("k_dequan = ", k_dequan.shape)
+        #print("diff = ", (k_dequan - k_origin).abs()[0,0,:,0])
+        #check_close(k_origin, k_dequan, atol=1e-3, rtol=1e-2)
 
         q_input = q.transpose(1,2).contiguous()
         k_input = k_dequan.transpose(1,2).reshape(batch, new_kv_len, num_kv_heads, head_size).transpose(1,2).contiguous()
@@ -853,6 +965,8 @@ def create_kernels():
                         -DCLEAN_UNUSED_KVCACHE={enable_clean_unused_kvcache}
                         -DKV_CACHE_COMPRESSION={enable_kvcache_compression}
                         -DKV_CACHE_COMPRESSION_BY_TOKEN={kvcache_quantization_by_token}
+                        -DKV_CACHE_COMPRESSION_BY_CHANNEL_SUBGROUP={kvcache_quantization_by_channel_group}
+                        -DKV_CACHE_COMPRESSION_BY_CHANNEL={kvcache_quantization_by_channel}
                         -DXE_ARCH={xe_arch}
                         -DQ_head_chunks_per_kv_head={int(q_head_chunks_per_kv_head)}
                         -DQ_head_chunk_size={int(q_head_chunk_size)}
