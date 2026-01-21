@@ -72,6 +72,10 @@ def ALIGN_UP(x, y):
 
 def DIV_UP(x, y):
     return (x + y -1) // y
+
+
+DUMP_ENQUEUE_ARGUMENTS = True
+
 class page_atten_cm:
     def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal = True, sparse_block_sz = 128):
         self.num_heads = num_heads
@@ -374,12 +378,12 @@ def check_close(input, other, atol=1e-2, rtol=1e-2):
     atol_max = (((input - other).abs()) - 1e-5*other.abs()).max()
     print(f"[check_close] rtol_max: {rtol_max}")
     print(f"[check_close] atol_max: {atol_max}")
-    if not torch.allclose(input, other, atol=atol, rtol=rtol):
+    if not torch.allclose(input, other, atol=atol, rtol=rtol, equal_nan=True):
         close_check = torch.isclose(input, other, atol=atol, rtol=rtol)
         not_close_indices = torch.where(~close_check) # Invert the close check to find failures
         print(f"Not close indices: {not_close_indices}")
-        # print(f"    input_tensor: {input[not_close_indices]}")
-        # print(f"    other_tensor: {other[not_close_indices]}")
+        print(f"    input_tensor: {input[not_close_indices]}")
+        print(f"    other_tensor: {other[not_close_indices]}")
         assert 0
 
 def count_false_percentage(mask):
@@ -548,15 +552,15 @@ def test_ov():
         print(f'checked {files_checked} files')
         return is_tril & files_checked > 0
 
-    compressed_kvcache = True
-    xattn_thresh = 100
-    sparse_block_sz, kv_block_size, trunk_sz = 128, 256, 4096 # trunk_sz no use
-    num_heads, num_kv_heads, head_size = 64, 8, 128
-    base = 'c:\\ceciliapeng\\dump_debug_bin_int8_PagedAttentionExtension_38747\\'
+    compressed_kvcache = False
+    xattn_thresh = 0.9
+    sparse_block_sz, kv_block_size, trunk_sz = 256, 256, 4096 # trunk_sz no use
+    num_heads, num_kv_heads, head_size = 32, 8, 128
+    base = '/home/ceciliapeng/dump_debug_binary/'
 
-    query = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_src0__f16__255_8192_1_1__bfyx.bin').reshape([255, num_heads*head_size])
-    key_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_updated_src_3__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4])
-    value_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_updated_src_4__i8__1_8_256_132__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4])
+    query = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src0__f16__612_4096_1_1__bfyx.bin').reshape([612, num_heads*head_size])
+    key_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_3__f16__3_8_256_128__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4 if compressed_kvcache else head_size])
+    value_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_4__f16__3_8_256_128__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4 if compressed_kvcache else head_size])
     # low = -1
     # high = 2
     # act_dtype = torch.float16
@@ -566,7 +570,7 @@ def test_ov():
 
     q_len = query.shape[0]
     valid_num_blks = key_cache.shape[0] - 1 # genai usually generates one more blocks than required
-    valid_num_blks = 1
+    valid_num_blks = key_cache.shape[0]
     q_block_pad = (q_len + sparse_block_sz - 1) // sparse_block_sz
 
     # check scale and zp of last head
@@ -598,19 +602,20 @@ def test_ov():
         check_sanity(key_cache_zps)
         check_sanity(value_cache_zps)
 
-    show_scales_zp()
+    if compressed_kvcache:
+        show_scales_zp()
 
-    block_mask  = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_intermediates_4__boolean__4096_1_1_1__bfyx.bin', dtype=np.int8).reshape([num_heads, q_block_pad, -1])
-    block_mask_in_wg  = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_intermediates_5__boolean__2048_1_1_1__bfyx.bin', dtype=np.int8).reshape([num_heads, -1, block_mask.shape[-1]])
-    # for i in range(num_heads):
-    #     print(f'{i}:{block_mask[i,:,:2]=}')
-    block_mask = torch.ones(block_mask.shape, dtype=torch.bool)
-    block_mask_in_wg = torch.ones(block_mask_in_wg.shape, dtype=torch.bool)
+    block_mask  = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_intermediates_4__boolean__1536_1_1_1__bfyx.bin', dtype=np.int8).reshape([num_heads, q_block_pad, -1])
+    block_mask_in_wg  = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_intermediates_5__boolean__1536_1_1_1__bfyx.bin', dtype=np.int8).reshape([num_heads, -1, block_mask.shape[-1]])
+    for i in range(num_heads):
+        print(f'{i}:{block_mask[i,:,:]}')
+    # block_mask = torch.ones(block_mask.shape, dtype=torch.bool)
+    # block_mask_in_wg = torch.ones(block_mask_in_wg.shape, dtype=torch.bool)
 
-    past_lens = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_src5__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([1])
-    subsequence_begins = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_src6__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
-    block_indices = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_src7__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([valid_num_blks])
-    block_indices_begins = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_src8__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+    past_lens = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src5__i32__1_1_1_1__bfyx.bin', dtype=np.int32).reshape([1])
+    subsequence_begins = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src6__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
+    block_indices = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src7__i32__3_1_1_1__bfyx.bin', dtype=np.int32).reshape([valid_num_blks])
+    block_indices_begins = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src8__i32__2_1_1_1__bfyx.bin', dtype=np.int32).reshape([2])
 
     print(f'{past_lens=}, {subsequence_begins=}, {block_indices=}, {block_indices_begins=}')
 
@@ -619,7 +624,7 @@ def test_ov():
         full_dense = check_tril_all(base, "_intermediates_4__boolean__4096_1_1_1__bfyx.bin", block_mask.shape)
         assert(full_dense, "SHOULD be full dense if XAttn thresh larger than 1.0")
 
-    ov_out = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_38747_dst0__f16__255_8192_1_1__bfyx.bin').reshape([q_len, num_heads*head_size])
+    ov_out = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_dst0__f16__612_4096_1_1__bfyx.bin').reshape([q_len, num_heads*head_size])
 
     # q [q_len, num_heads*head_size], k/v cache [num_blks, num_kv_heads, kv_block_size, head_size]
     print(f'{query.shape = }, {key_cache.shape = }, {value_cache.shape = },  {ov_out.shape = }')
@@ -637,6 +642,9 @@ def test_ov():
     t_subsequence_begins = cl.tensor(subsequence_begins.to(torch.int32).detach().numpy())
 
     output = torch.zeros(q_len, num_heads*head_size).to(torch.float16)
+    output = ov_out.clone()
+    # has_inf_or_nan = (torch.isinf(output) | torch.isnan(output)).any()
+    # print("output: Contains inf or nan:", has_inf_or_nan)
     t_out = cl.tensor(output.detach().numpy())
 
     wg_size = 16
@@ -650,6 +658,28 @@ def test_ov():
     if pa_cm.sparse_block_sz > 1:
         t_block_mask = cl.tensor(block_mask.to(torch.bool).detach().numpy())
         t_block_mask_in_wg  = cl.tensor(block_mask_in_wg.to(torch.bool).detach().numpy())
+        if DUMP_ENQUEUE_ARGUMENTS:
+            LABEL_WIDTH = 32
+            cltensors = [
+                ("t_query",                t_query),
+                ("t_key_cache",            t_key_cache),
+                ("t_value_cache",          t_value_cache),
+                ("t_past_lens",            t_past_lens),
+                ("t_block_indices",        t_block_indices),
+                ("t_block_indices_begins", t_block_indices_begins),
+                ("t_subsequence_begins",   t_subsequence_begins),
+                ("t_out",                  t_out),
+                ("t_block_mask",           t_block_mask),
+                ("t_block_mask_in_wg",     t_block_mask_in_wg),
+            ]
+            lines = [(name, value.numel * value.dtype.itemsize) for name, value in cltensors]
+            print("cm_page_attention size of memories:")
+            for name, value in lines:
+                print(f"  {name:<{LABEL_WIDTH}} {value}")
+            print("\ncm_page_attention scalers:")
+            print(f"  q_len:{q_len:<10}  mask_W:{t_block_mask.shape[1]:<10}  "
+                f"mask_H:{t_block_mask.shape[2]:<10}  block_sz:{pa_cm.sparse_block_sz}")
+
         pa_cm.kernels.enqueue("cm_page_attention", GWS, LWS, t_query, t_key_cache, t_value_cache, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2], pa_cm.sparse_block_sz)
     else:
         pa_cm.kernels.enqueue("cm_page_attention", GWS, LWS, t_query, t_key_cache, t_value_cache, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
@@ -662,8 +692,9 @@ def test_ov():
     # print(f"{ut_out[0, -1, :] = }")
 
     has_inf_or_nan = (torch.isinf(ut_out) | torch.isnan(ut_out)).any()
-    print("Contains inf or nan:", has_inf_or_nan)
-
+    print("ut_out: Contains inf or nan:", has_inf_or_nan)
+    has_inf_or_nan = (torch.isinf(ov_out) | torch.isnan(ov_out)).any()
+    print("ov_out: Contains inf or nan:", has_inf_or_nan)
     check_close(ut_out, ov_out)
     sys.exit(0)
 
