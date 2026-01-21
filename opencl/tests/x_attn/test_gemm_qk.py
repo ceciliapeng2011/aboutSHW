@@ -16,6 +16,8 @@ def div_up(a, b):
 def rnd_up(a, b):
     return (a + b - 1) // b * b
 
+DUMP_ENQUEUE_ARGUMENTS = True
+
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
@@ -64,7 +66,7 @@ class xattn_gemmQK:
                             -DBLOCK_WG_K={int(BLOCK_WG_K)}
                             ''')
         
-    def __call__(self, t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, n_repeats = 1):
+    def __call__(self, t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, query_stride, n_repeats = 1):
         batch = 1
         q_stride_pad = rnd_up(M, BLOCK_WG_M)
         # [1, 32, 64, 256]
@@ -89,13 +91,34 @@ class xattn_gemmQK:
         slice = 0
         print(f'{xecores=} {block_m=} {block_n=} {slice=} {slice_no=}')
 
-        global_size = [N_kq_groups * (q_stride_pad // BLOCK_WG_M) * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
+        GWS = [N_kq_groups * (q_stride_pad // BLOCK_WG_M) * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
+        LWS = [SG_N, SG_M, 1]
+        print(f"calling CM_gemm_qk {GWS=} {LWS=} ...")
+
+        if DUMP_ENQUEUE_ARGUMENTS:
+            LABEL_WIDTH = 32
+            cltensors = [
+                ("t_key_cache",            t_key_cache),
+                ("t_query",                t_query),
+                ("t_block_indices",        t_block_indices),
+                ("t_block_indices_begins", t_block_indices_begins),
+                ("t_kq_max_wg",            t_kq_max_wg),
+                ("t_kq_exp_partial_sum",   t_kq_exp_partial_sum),
+            ]
+            lines = [(name, value.numel * value.dtype.itemsize) for name, value in cltensors]
+            print("gemm_qk size of memories:")
+            for name, value in lines:
+                print(f"  {name:<{LABEL_WIDTH}} {value}")
+            print("\gemm_qk scalers:")
+            print(f"  M:{M:<10}  N:{N:<10}  "
+                f"mask_H:{K:<10}  query_stride:{query_stride:<10}  "
+                f"q_start_strided:{q_start_strided:<10} ")
 
         cl.finish()
         # gemm
         for i in range(n_repeats):
-            self.kernels.enqueue('gemm_qk', global_size, [SG_N, SG_M, 1], t_key_cache, t_query, t_block_indices, t_block_indices_begins,
-                                 t_kq_max_wg, t_kq_exp_partial_sum, M, N, K, K * self.num_heads * 2, slice_no, slice, q_start_strided)
+            self.kernels.enqueue('gemm_qk', GWS, LWS, t_key_cache, t_query, t_block_indices, t_block_indices_begins,
+                                 t_kq_max_wg, t_kq_exp_partial_sum, M, N, K, query_stride, slice_no, slice, q_start_strided)
         latency = cl.finish()
         return latency, t_kq_max_wg, t_kq_exp_partial_sum
         
@@ -182,9 +205,10 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
     q_3d_with_padding = torch.zeros([B, Lq, Hq * S * 2], dtype=q_3d.dtype)
     q_3d_with_padding[:, :, : Hq * S] = q_3d
     t_query = cl.tensor(q_3d_with_padding.detach().numpy())
+    query_stride = K * num_heads * 2
 
     n_repeats = 100 if perf else 1
-    ns, t_kq_max_wg, t_kq_exp_partial_sum = xattn_cm(t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, n_repeats)
+    ns, t_kq_max_wg, t_kq_exp_partial_sum = xattn_cm(t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, query_stride, n_repeats)
 
     if not perf:
         # [1, 32, 256], [1, 32, 64, 256], [1, 32, 256, 64 * 16], A_sum:[1, 32, 32, 64 * 16]
@@ -208,6 +232,8 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
 def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     dim = head_size
     sizes = [
+        # real cases
+        (612, 612, '612'),
         # normal case
         (512 * STRIDE, 512 * STRIDE, '8k'),
         (256 * STRIDE, 256 * STRIDE, 'normal+causal start == 0'),           # normal case:causal start == 0

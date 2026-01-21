@@ -259,7 +259,8 @@ def xattn_estimate(
         )
     else:
         pad_query_states = query_states
-        
+
+    print(f'{chunk_size=}, {q_len=}, {k_len=}')
     print(f'{pad_query_states.shape=} {pad_key_states.shape=}')
     print(f'{q_num_to_pad=} {k_num_to_pad=}')
 

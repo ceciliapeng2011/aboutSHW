@@ -17,6 +17,7 @@ def rnd_up(a, b):
     return (a + b - 1) // b * b
 
 FIND_DEBUG_ACC = 1
+DUMP_ENQUEUE_ARGUMENTS = 1
 
 SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
@@ -67,15 +68,39 @@ class xattn_find_block:
         
         t_kq_sum = cl.tensor(np.zeros([batch, num_heads, q_block_input, k_block_pad], dtype=np.float16))
         
-        # mask shape: [rnd_up(q_stride, WG_M) / 8, rnd_up(k_stride, WG_N) / 8]
-        t_mask = cl.tensor(np.ones([batch, self.num_heads, q_block_pad, k_block_pad], np.int8) * 100)
+        # mask shape: [div_up(q_len, xattn_block_size), rnd_up(k_stride, WG_N) / sum_per_n_token_in_block]
+        t_mask = cl.tensor(np.zeros([batch, self.num_heads, q_block_pad, k_block_pad], np.int8))
         params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, q_len, q_stride, q_stride_pad, q_block_pad, k_block_pad, k_block-q_block, xattn_thresh]
         if FIND_DEBUG_ACC:
             params += [t_kq_sum]
 
+        GWS = [q_block_pad, num_heads, batch]
+        LWS = [1, 1, 1]
+        print(f"calling CM_find_blocks {GWS=} {LWS=} ...")
+
+        if DUMP_ENQUEUE_ARGUMENTS:
+            LABEL_WIDTH = 32
+            cltensors = [
+                ("t_kq_max_wg",            t_kq_max_wg),
+                ("t_kq_exp_partial_sum",   t_kq_exp_partial_sum),
+                ("t_mask",                 t_mask),
+            ]
+            if FIND_DEBUG_ACC:
+                cltensors += [("t_kq_sum",               t_kq_sum)]
+            lines = [(name, value.numel * value.dtype.itemsize) for name, value in cltensors]
+
+            print("find_blocks size of memories:")
+            for name, value in lines:
+                print(f"  {name:<{LABEL_WIDTH}} {value}")
+            print("\find_blocks scalers:")
+            print(f"  q_len:{q_len:<10}  q_stride:{q_stride:<10}  q_stride_pad:{q_stride_pad:<10}"
+                f"q_block_pad:{q_block_pad:<10}  k_block_pad:{k_block_pad:<10} "
+                f"causal_start_index:{k_block-q_block:<10} "
+                f"xattn_thresh:{xattn_thresh:<10} ")
+
         cl.finish()
         for i in range(n_repeats):
-            self.kernels.enqueue("find_block", [q_block_pad, num_heads, batch], [1, 1, 1], *params)
+            self.kernels.enqueue("find_block", GWS, LWS, *params)
         latency = cl.finish()
         return latency, t_mask, t_kq_sum
 
@@ -234,6 +259,8 @@ def test_find(num_heads, num_kv_heads, head_size, xattn_block_size, xattn_thresh
 def test_func(xattn_block_size, xattn_thresh, HQ = 32, HK = 8, HEAD_SIZE = 128, is_causal = True):   
     dim = HEAD_SIZE
     sizes = [
+        # real cases
+        (612, 612, '612'),
         # normal case
         (512 * STRIDE, 512 * STRIDE, '8k'),
         (256 * STRIDE, 256 * STRIDE, 'normal+causal start == 0'),           # normal case:causal start == 0
