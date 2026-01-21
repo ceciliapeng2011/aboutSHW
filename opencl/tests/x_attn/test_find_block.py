@@ -99,7 +99,7 @@ class xattn_find_block:
                 for idx in range(diff_idx_t.shape[0]):
                     if torch.all(diff_idx_t[idx][:-1] == repeated_row):
                         pos = diff_idx_t[idx].tolist()
-                        vals.append(ref_sum[*pos])
+                        vals.append(ref_sum[pos])
                         full_pos.append(pos)
                         idxes.append(idx)
                 if torch.allclose(torch.tensor(vals, dtype=vals[0].dtype), vals[0], atol=0.01):

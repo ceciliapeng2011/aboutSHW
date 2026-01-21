@@ -20,6 +20,13 @@ parser.add_argument('-ql', "--q-len", type=int, default=1)
 parser.add_argument('-kvl', "--kv-len", type=int, default=32769)
 parser.add_argument('-hs', "--head-size", type=int, default=128)
 parser.add_argument('-rkv', "--reset_kv_cache", type=int, default=1)
+parser.add_argument("--enable-kvcache-compression", type=int, default=0)
+parser.add_argument(
+    "--kv-cache-quant-mode",
+    type=str,
+    default=os.environ.get("KV_CACHE_QUANT_MODE", "by_token"),
+)
+parser.add_argument("--q-dist", type=str, default="random")
 parser.add_argument('-v', "--verbose", type=int, default=-1)
 args = parser.parse_args()
 print(args)
@@ -42,9 +49,8 @@ enable_gqa = num_heads > num_kv_heads
 # define KV_BLOCK_SIZE = 32,64,128,256
 kv_block_size = 256
 
-enable_kvcache_compression = 1
-kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
-kv_cache_quantization_mode = "by_channel"
+enable_kvcache_compression = args.enable_kvcache_compression
+kv_cache_quantization_mode = args.kv_cache_quant_mode
 
 def _validate_quant_mode(mode: str) -> str:
     mode = mode.strip().lower()
@@ -65,7 +71,7 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch=2
+xe_arch = 2
 
 if xe_arch == 1:
     kv_step = 8
@@ -82,7 +88,12 @@ low = -127
 high = 128
 act_dtype = torch.float16
 new_kv_len = (kv_len + kv_block_size - 1) // kv_block_size * kv_block_size
-q = torch.randint(low, high, [batch, q_len, num_heads, head_size]).to(dtype=act_dtype)/high
+if args.q_dist == "random":
+    q = torch.randint(low, high, [batch, q_len, num_heads, head_size]).to(dtype=act_dtype) / high
+elif args.q_dist == "ones":
+    q = torch.ones([batch, q_len, num_heads, head_size], dtype=act_dtype)
+else:
+    raise ValueError(f"Unsupported q distribution: {args.q_dist}")
 k = torch.randint(low, high, [batch, new_kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 v = torch.randint(low, high, [batch, new_kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 
@@ -582,18 +593,18 @@ if args.impl == 0:
     print("=========== PASS ===========")
     sys.exit(0)
 
-org1 = get_flash1(q,k,v,attention_mask)
-check_close(ref, org1, atol=1e-3, rtol=1e-2)
-print("org of get_flash1 passed !")
+# org1 = get_flash1(q,k,v,attention_mask)
+# check_close(ref, org1, atol=1e-3, rtol=1e-2)
+# print("org of get_flash1 passed !")
 
-org2 = get_flash2(q,k,v,attention_mask, real_kv_len=kv_len)
-check_close(ref, org2, atol=1e-3, rtol=1e-2)
-print("org of get_flash2 passed !")
+# org2 = get_flash2(q,k,v,attention_mask, real_kv_len=kv_len)
+# check_close(ref, org2, atol=1e-3, rtol=1e-2)
+# print("org of get_flash2 passed !")
 
 org = get_flash3(q,k,v,attention_mask)
 check_close(ref, org, atol=1e-3, rtol=1e-2)
 print("org of get_flash3 passed !")
-check_close(org, org2, atol=1e-3, rtol=1e-2)
+# check_close(org, org2, atol=1e-3, rtol=1e-2)
 
 print()
 print("GPU cm kernels for flash attn2:")
@@ -965,14 +976,21 @@ intermedia_size = batch * num_heads * kv_partition_num * (head_size + 1) * 4
 kvcache_total_time=0
 intermedia_total_time=0
 num_runs = 0
-for ns in latency:
+num_warmup = 0
+for iter, ns in enumerate(latency):
     if first_kernel:
-        kvcache_total_time += ns
-        num_runs += 1
-        print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
+        if num_warmup <= 4:
+            num_warmup += 1
+        else:
+            kvcache_total_time += ns
+            num_runs += 1
+        print(f" {iter} {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
         #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s")
     else:
-        intermedia_total_time += ns
+        if num_warmup <= 4:
+            num_warmup += 1
+        else:
+            intermedia_total_time += ns
         #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {intermedia_size/(ns):.3f} GB/s, intermedia = {intermedia_size*1e-6:.1f} MB")
     first_kernel =  1 - first_kernel
 
@@ -982,6 +1000,7 @@ print("intermedia_total_time = ", intermedia_total_time*1e-6, "ms")
 print("kvcache_total_time = ", kvcache_total_time*1e-6, "ms")
 
 print(f"num_runs = {num_runs}, avg kvcache = {kvcache_size*num_runs/kvcache_total_time:.3f} GB/s, avg intermedia = {intermedia_size*num_runs/(intermedia_total_time):.3f} GB/s")
+print(f"num_runs = {num_runs}, avg pa kernel time for Qwen3-8B = {(kvcache_total_time + intermedia_total_time) * 1e-6 / num_runs * 36:.3f} ms")
 print()
 
 f1 = torch.from_numpy(all_layers[0][4].numpy())

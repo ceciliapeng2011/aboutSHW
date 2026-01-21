@@ -153,7 +153,6 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
     const uint current_block_idx = (past_len + token_idx - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
     const uint token_start_pos = (past_len + token_idx - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
     const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
-
     {
         uint block_k_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;

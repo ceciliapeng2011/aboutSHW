@@ -195,3 +195,92 @@ hardware roofline: `2.9G*20eu*8*32*4*2=118T/s`, current hits about 85%/89%, the 
 ### intel-gpu-tools
 - record: `xe-perf-recorder --metric ComputeBasic`
 - decode: `xe-perf-reader xe_perf.record -c all`
+
+
+
+# Porting to Xe1
+
+## Statefull block load/store/prefetch
+Hardware will return 0 for the out-of-bound bytes.
+```
+template <typename T, int NElts, DataSize DS = DataSize::Default,
+          CacheHint L1H = CacheHint::Default,
+          CacheHint L2H = CacheHint::Default>
+vector<RetTy, NElts> cm_load(SurfaceIndex Idx, unsigned Offset);
+
+cm_prefetch
+```
+
+## Stateless block load/store/prefetch
+Hardware will return 0 for the out-of-bound bytes.
+```
+template <typename T, int NElts, DataSize DS = DataSize::Default,
+          CacheHint L1H = CacheHint::Default,
+          CacheHint L2H = CacheHint::Default>
+vector<RetTy, NElts> cm_ptr_load(const T *const Ptr, unsigned Offset);
+
+cm_ptr_prefetch
+```
+
+## charpter4.19 Shared Virtual Memory (SVM)
+
+Return 0 if out of boundary. The larger N is, performance improves. (Mannually verified on DG2.)
+
+```
+cm_svm_block_read(svmptr_t v_Addr, vector_ref<TYPE, N> v_Src);
+```
+
+## clang/lib/Headers/cm/include/cm/cm_pointer.h
+
+HW hangs when trying to read memory out of boundary. (Mannually verified on LNL.)
+
+```
+template <typename T0, int N, int M>
+CM_NODEBUG CM_INLINE void
+cm_ptr_block_read(const T0 *const addr,
+                  matrix_ref<details::remove_address_space_t<T0>, N, M> dst)
+```
+
+
+# The following load methods are not applicable to Xe1.
+
+## Untyped 2D block load/store/prefetch
+target-dependent and only available when CM_HAS_LSC_UNTYPED_2D macro is defined.
+```
+template <typename T, int Width, int Height = 1, int NumBlocks = 1,
+          bool Transposed = false, bool Transformed = false,
+          CacheHint L1H = CacheHint::Default,
+          CacheHint L2H = CacheHint::Default,
+vector<T, N> cm_ptr_load(T *Ptr, unsigned SurfaceWidth, unsigned SurfaceHeight,
+                         unsigned SurfacePitch, int X, int Y);
+
+cm_ptr_prefetch
+```
+
+## Untyped descriptor based 2D block load/store/prefetch
+target-dependent and only available when CM_HAS_LSC_UNTYPED_2D macro is defined.
+```
+template <lsc::LoadOp Op = lsc::LoadOp::Normal,
+          CacheHint L1H = CacheHint::Default,
+          CacheHint L2H = CacheHint::Default,
+          int OffsetX = 0, int OffsetY = 0>
+void cm_load(details::Block2DRefTy<T, BlockH, BlockW, NBlocks, Op> Res,
+            const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc,
+            int16_t Pred = 1);
+
+cm_prefetch
+```
+
+## Typed load/store/prefetch
+target-dependent and only available when CM_HAS_LSC_TYPED macro is defined.
+```
+cm_load4_typed
+cm_prefetch4_typed
+```
+
+## Typed 2D block load/store
+target-dependent and only available when CM_HAS_LSC_TYPED_2D macro is defined.
+```
+cm_load(SurfaceIndex Idx, int X, int Y, matrix_ref<T, Height, Width> Data);
+cm_prefetch(SurfaceIndex Idx, int X, int Y);
+```

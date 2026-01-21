@@ -16,12 +16,17 @@ def div_up(a, b):
 def rnd_up(a, b):
     return (a + b - 1) // b * b
 
+xe_arch = 2
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
-
 BLOCK_SG_M = 64
 BLOCK_SG_N = 32
+
+if xe_arch == 1:
+    BLOCK_SG_M = 32
+    BLOCK_SG_N = 16
+
 SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
