@@ -16,115 +16,23 @@ def div_up(a, b):
 def rnd_up(a, b):
     return (a + b - 1) // b * b
 
-<<<<<<< arlh_dev
-#  determine Xe1/Xe2
-def get_cm_grf_width():
-    cm_kernels = cl.kernels(r'''
-    extern "C" _GENX_MAIN_ void cm_get_grf_width(int * info [[type("svmptr_t")]]) {
-        info[0] = CM_GRF_WIDTH;
-    }''', f"-cmc")
-    t_info = cl.tensor([2], np.dtype(np.int32))
-    cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
-    return t_info.numpy()[0]
-
-CM_GRF_WIDTH = get_cm_grf_width()
-print(f'{CM_GRF_WIDTH=}')
-
-# gemmQK
-
-kernel_name = 'gemm_qk'
-BLOCK_SG_M = 32 #64 xe2
-BLOCK_SG_N = 16
-=======
+xe_arch = 2
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
-
 BLOCK_SG_M = 64
 BLOCK_SG_N = 32
->>>>>>> main
+
+if xe_arch == 1:
+    BLOCK_SG_M = 32
+    BLOCK_SG_N = 16
+
 SG_M = 4
 SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
-KV_BLOCK_SIZE = 256   # should BLOCK_WG_N be dividable by KV_BLOCK_SIZE?
+KV_BLOCK_SIZE = 256
 
-<<<<<<< arlh_dev
-HQ = 32
-HK = 8
-HEAD_SIZE = 128
-STRIDE = 16
-BLOCK_SIZE = 128
-THRESH = 1.0
-IS_CAUSAL = 0
-USE_INT8 = 0
-if USE_INT8:
-    HEAD_SIZE_KEY = HEAD_SIZE + 2 * 2
-else:
-    HEAD_SIZE_KEY = HEAD_SIZE
-
-# loop order walks HQ first and the step is WALK_HQ, 1 means not walk HQ, 2 means walks 2 heads first. Valid value: 1, 2, 4...
-WALK_HQ = 2 if HQ != HK else 1
-SOFTMAX_TYPE = 'float' # 'half'
-
-FIND_DEBUG_ACC = 0 # only acc test needed
-
-INV_S = 1 / torch.sqrt(torch.tensor([HEAD_SIZE], dtype=torch.float32)) / STRIDE
-INV_S = int(INV_S.view(dtype=torch.uint32))
-
-kernels = None
-def create_kernels(force_create=False):
-    global kernels
-    if kernels and not force_create: return
-
-    src = r'''#include "xattn_gemm_qk.hpp"'''
-    cwd = os.path.dirname(os.path.realpath(__file__))
-    print(f"compiling {cwd} ...")
-
-    # jit_option = '-abortonspill -noschedule '
-    jit_option = ' '
-    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
-                        -mCM_printregusage -mdump_asm -g2
-                        -Qxcm_register_file_size=256 -I{cwd}
-                        -DSTRIDE={STRIDE} -DHQ={HQ} -DHK={HK} -DHEAD_SIZE={HEAD_SIZE} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
-                        -DBLOCK_SIZE={BLOCK_SIZE} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={WALK_HQ}
-                        -DIS_CAUSAL={IS_CAUSAL} -DUSE_INT8={USE_INT8} -DHEAD_SIZE_KEY={HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                        -DDEBUG_ACC={FIND_DEBUG_ACC}
-                        ''')
-
-def quant_i8(k:torch.Tensor):
-    B, Hk, Lk, S = k.shape
-    k_pad = torch.zeros([B, Hk, rnd_up(Lk, KV_BLOCK_SIZE), HEAD_SIZE], dtype=k.dtype)
-    k_pad[:, :, :Lk,:] = k
-
-    B, Hk, Lk, S = k_pad.shape
-    k_i8 = torch.zeros([B, Hk, Lk, HEAD_SIZE_KEY], dtype=torch.uint8)
-    k_i8_4d = k_i8.reshape([B, Hk, -1, KV_BLOCK_SIZE * HEAD_SIZE_KEY])
-    if 0:
-        max = torch.max(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
-        min = torch.min(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
-        diff_value = torch.masked_fill(max - min, max == min, 0.001)
-        scale = 255/ diff_value
-        zp = -min * scale
-        quanted = k_pad * scale + zp
-        quanted = quanted.clamp(0, 255)
-        scale = 1.0 / scale
-    else:
-        scale = torch.randint(-1, 3, [B, Hk, Lk, 1], dtype=torch.float16)
-        zp = torch.randint(0, 3, [B, Hk, Lk, 1], dtype=torch.float16)
-        quanted = torch.randint(0, 3, [B, Hk, Lk, S], dtype=torch.float16)
-        k_pad = (quanted - zp) * scale
-        k = k_pad[:, :, :k.shape[2], :]
-        k_pad[:,:,k.shape[2]:,:] = 0
-    # weights
-    k_i8_4d[:, :, :, :KV_BLOCK_SIZE * HEAD_SIZE] = torch.reshape(quanted, [B, Hk, Lk // KV_BLOCK_SIZE, -1])
-    # scale
-    k_i8_4d[:, :, :, KV_BLOCK_SIZE * HEAD_SIZE : (KV_BLOCK_SIZE * (HEAD_SIZE + 2))] = (scale).to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.uint8)
-    # zp
-    k_i8_4d[:, :, :, (KV_BLOCK_SIZE * (HEAD_SIZE + 2)) : ] = zp.to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.int8)
-
-    return k_i8, k
-=======
 class xattn_gemmQK:
     def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
         BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
@@ -235,7 +143,6 @@ class xattn_gemmQK:
         k_i8_4d[:, :, :, (KV_BLOCK_SIZE * (HEAD_SIZE + 2)) : ] = zp.to(torch.float16).reshape([B, Hk, Lk // KV_BLOCK_SIZE, -1]).view(dtype=torch.int8)
 
         return k_i8, k
->>>>>>> main
 
 # q: [B, Hq, L_q, S]
 # k: [B, Hk, L_k, S]
@@ -281,41 +188,8 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
     q_3d_with_padding[:, :, : Hq * S] = q_3d
     t_query = cl.tensor(q_3d_with_padding.detach().numpy())
 
-<<<<<<< arlh_dev
-    q_stride_pad = rnd_up(M, BLOCK_WG_M)
-    # [1, 32, 64, 256]
-    softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
-    N_kq_groups = div_up(N, BLOCK_WG_N)
-    t_kq_max_wg = cl.tensor(np.ones([B, Hq, N_kq_groups, q_stride_pad], softmax_type))
-    print(f'{hex(t_kq_max_wg.addr)=}, {t_kq_max_wg.strides=}')
-    # [1, 32, 256, 64 * 16]
-    sum_per_token_in_block = block_size // stride
-    k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
-    k_block_pad = k_block_in_group * N_kq_groups
-    t_kq_exp_partial_sum = cl.tensor(np.ones([B, Hq, q_stride_pad, k_block_pad], softmax_type))
-    print(f'{hex(t_kq_exp_partial_sum.addr)=}, {t_kq_exp_partial_sum.strides=}')
-
-    # loop N first:[0, 1], loop M first:[0, 0]; block M first[slice_no, slice(>0)], block N first[slice_no, slice(<0)]
-    #default linear
-    slice_no = 0
-    slice = 0
-    print(f'{slice=} {slice_no=}')
-    query_stride = K * HQ * 2   # i.e. (stride * S) * HQ * 2
-    M_kq_groups = q_stride_pad // BLOCK_WG_M
-
-    global_size = [N_kq_groups * M_kq_groups * SG_N * WALK_HQ, SG_M, Hq // WALK_HQ]
-
-    # gemm warmup
-    for i in range(1):
-        kernels.enqueue(kernel_name, global_size, [SG_N, SG_M, 1],
-                        t_key_cache, t_query, t_block_indices, t_block_indices_begins,
-                        t_kq_max_wg, t_kq_exp_partial_sum,
-                        M, N, K, query_stride, slice_no, slice, q_start_strided)
-    cl.finish()
-=======
     n_repeats = 100 if perf else 1
     ns, t_kq_max_wg, t_kq_exp_partial_sum = xattn_cm(t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, n_repeats)
->>>>>>> main
 
     if not perf:
         # [1, 32, 256], [1, 32, 64, 256], [1, 32, 256, 64 * 16], A_sum:[1, 32, 32, 64 * 16]
@@ -323,7 +197,6 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
                                                                                     S=STRIDE, threshold=THRESH, causal=causal, wg_k=BLOCK_WG_N, wg_q=BLOCK_WG_M)
         kq_5d_max_ret_ref_np = kq_5d_max_ret_ref.detach().numpy()[..., :M]
         t_kq_max_wg_np = t_kq_max_wg.numpy()[..., :M]
-        # print(f'{kq_5d_max_ret_ref_np=}, {t_kq_max_wg_np=}')
         compare(kq_5d_max_ret_ref_np, t_kq_max_wg_np)
         print(f'{Colors.GREEN}gemm:max_wg passed{Colors.END}')
         kq_exp_partial_sum_ret_ref_np = kq_exp_partial_sum_ret_ref.detach().numpy()[:,:,:M,:]
@@ -332,28 +205,14 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
         print(f'{Colors.GREEN}gemm:exp_partial passed{Colors.END}')
     else:
         flops = B * Hq * M * N * K * 2
-<<<<<<< arlh_dev
-        for i in range(0, 100):
-            kernels.enqueue(kernel_name, global_size, [SG_N, SG_M, 1],
-                            t_key_cache, t_query, t_block_indices, t_block_indices_begins,
-                            t_kq_max_wg, t_kq_exp_partial_sum,
-                            M, N, K, query_stride, slice_no, slice, q_start_strided)
-            ns = cl.finish()
-            for i, time_opt in enumerate(ns):
-                print(f'(GEMM)TPUT_{i}:{flops/time_opt:,.0f} GFLOPS, BW:{(M*K+K*N+M*N)*2/time_opt:,.0f} GB/s {time_opt*1e-3:,.0f} us')
-=======
         for i, time_opt in enumerate(ns):
             print(f'(GEMM)TPUT_{i}:{flops/time_opt:,.0f} GFLOPS, BW:{(M*K+K*N+M*N)*2/time_opt:,.0f} GB/s {time_opt*1e-3:,.0f} us')
->>>>>>> main
 
     return t_kq_max_wg, t_kq_exp_partial_sum
 
 def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     dim = head_size
     sizes = [
-        # (128, 128, '1wg'),
-        (128 * STRIDE, 128 * STRIDE, '2k'),
-        (256 * STRIDE, 256 * STRIDE, '4k'),
         # normal case
         (512 * STRIDE, 512 * STRIDE, '8k'),
         (256 * STRIDE, 256 * STRIDE, 'normal+causal start == 0'),           # normal case:causal start == 0
@@ -379,15 +238,8 @@ def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 12
         assert q_len // STRIDE >= 1, "there should be at least 1 row for gemm"
         print(f'{Colors.BLUE}test gemm("{prompt}") query: [{q_len}, {dim}*{STRIDE}] key:[{k_len}, {dim}*{STRIDE}] xattn_block_size:{xattn_block_size} ...{Colors.END}')
 
-<<<<<<< arlh_dev
-        q = torch.randint(-2, 4, size=[1, q_head, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
-        # q = torch.arange(1*q_head*q_len*dim).reshape(1, q_head, q_len, dim).to(dtype=torch.float16)
-        k = torch.randint(-2, 4, size=[1, k_head, k_len, dim], dtype=torch.int16).to(dtype=torch.float16)
-        # k = torch.arange(1*k_head*k_len*dim).reshape(1, k_head, k_len, dim).to(dtype=torch.float16)
-=======
         q = torch.randint(-2, 4, size=[1, num_heads, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
         k = torch.randint(-2, 4, size=[1, num_kv_heads, k_len, dim], dtype=torch.int16).to(dtype=torch.float16)
->>>>>>> main
 
         if is_causal:
             q_start_strided = k_len // STRIDE - q_len // STRIDE
