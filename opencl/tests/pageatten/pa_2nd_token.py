@@ -83,7 +83,7 @@ def get_tensor(name, dtype=np.float16):
         np_data = np.frombuffer(data, dtype=dtype).copy()
         return torch.from_numpy(np_data)
 
-#xe_arch: 1: xe, 2: xe2
+# xe_arch: 1: xe, 2: xe2
 xe_arch=2
 
 if xe_arch == 1:
@@ -91,10 +91,10 @@ if xe_arch == 1:
 else:
     kv_step = 16
 
-# dpas number for each split_len
+# Number of dpas for each split_len
 # split_subblock_num = kv_partition_size // kv_step
 
-# reduce step size
+# Reduce step size
 reduce_split_step = 8
 
 low = -127
@@ -752,41 +752,41 @@ def quan_per_channel_subgroup(kv: torch.Tensor, subgroup_size: int = 16):
     INTMIN, INTMAX = 0.0, 255.0
     INTRANGE = INTMAX - INTMIN
 
-    # 输出缓冲：按 [blk_num, kv_heads, payload + scales + zps] 拼接
+    # Output buffer: concatenate as [blk_num, kv_heads, payload + scales + zps]
     payload_u8   = torch.empty((blk_num, kv_heads, blk_sz, head_size), dtype=torch.uint8, device=kv.device)
     scale_groups = torch.zeros((blk_num, kv_heads, groups, head_size), dtype=torch.float16, device=kv.device)
     zp_groups    = torch.empty((blk_num, kv_heads, groups, head_size), dtype=torch.float16, device=kv.device)
 
-    # 遍历每个 sub-group（沿 token 维度），按 channel 统计 min/max
+    # Traverse each sub-group (along the token dimension), calculate min/max per channel
     for g in range(groups):
         s = g * subgroup_size
         e = s + subgroup_size
         kv_slice = kv[:, :, s:e, :]  # [blk_num, kv_heads, subgroup(16), head_size]
 
-        # by-channel：在 subgroup 的 token 维内对每个 channel 统计
+        # by-channel: calculate per channel within the token dimension of the subgroup
         kv_max = kv_slice.amax(dim=2, keepdim=False)  # [blk_num, kv_heads, head_size]
         kv_min = kv_slice.amin(dim=2, keepdim=False)
 
         qrange = kv_max - kv_min  # [blk_num, kv_heads, head_size]
 
-        # 避免 qrange=0 的除零
+        # Avoid division by zero when qrange=0
         scale = torch.zeros_like(qrange, dtype=torch.float16)
         mask  = qrange != 0
         scale[mask] = (INTRANGE / qrange[mask]).to(torch.float16)
         zp    = ((0.0 - kv_min) * scale + INTMIN).to(torch.float16)
 
-        # 量化 payload（subgroup 的 16 行）
+        # Quantize payload (16 rows of the subgroup)
         u8 = torch.round(kv_slice * scale.unsqueeze(2) + zp.unsqueeze(2)).clamp_(INTMIN, INTMAX).to(torch.uint8)
-        payload_u8[:, :, s:e, :] = u8  # 回填到整块 payload 中
+        payload_u8[:, :, s:e, :] = u8  # Fill back into the entire payload block
 
-        # 保存当前 group 的 dq_scale/zp
+        # Save dq_scale/zp for the current group
         dq_scale = torch.zeros_like(scale, dtype=torch.float16)
         dq_scale[mask] = (1.0 / scale[mask]).to(torch.float16)
         scale_groups[:, :, g, :] = dq_scale
         zp_groups[:, :, g, :]    = zp
 
-    # 拼接（注意 half->u8 的 view 在 kernel 里不需要；按裸字节写入即可）
-    # 我们保持为 torch 的 dtype，最终由 .view(torch.uint8) / .numpy() 再拼装为线性字节流
+    # Concatenate (note: half->u8 view is not needed in the kernel; write as raw bytes)
+    # We keep torch dtype, finally use .view(torch.uint8) / .numpy() to assemble as linear byte stream
     packed = torch.cat([
         payload_u8.reshape(blk_num, kv_heads, -1).to(torch.uint8),
         scale_groups.reshape(blk_num, kv_heads, -1).contiguous().view(torch.uint8),
@@ -815,10 +815,10 @@ def dequant_per_channel_subgroup(packed: torch.Tensor, head_size: int, blk_size:
     out = torch.empty((blk_num, kv_heads, blk_size, head_size), dtype=torch.float16, device=packed.device)
     for g in range(groups):
         s, e = g * subgroup_size, (g + 1) * subgroup_size
-        # 当前 group 的 scale/zp: [blk_num, kv_heads, head_size]
+        # Current group's scale/zp: [blk_num, kv_heads, head_size]
         scale_g = scales[:, :, g, :]
         zp_g    = zps[:, :, g, :]
-        # 反量化当前 16 行
+        # Dequantize the current 16 rows
         out[:, :, s:e, :] = (payload[:, :, s:e, :].to(torch.float16) - zp_g.unsqueeze(2)) * scale_g.unsqueeze(2)
     '''
     for m in range(blk_num):
