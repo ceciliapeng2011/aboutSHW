@@ -78,17 +78,15 @@ void pa_lsc_u8(
     int slm_buff_id_read = 0;
 
 #if IS_BLOCK_SPARSE
-    auto skip_compute = [&](int kv_pos) {
-        auto kv_start_block = kv_pos / SPARSE_BLOCK_SIZE;
-        bool sparse_mask = *(reinterpret_cast<bool*>(sparse_mask_base) + kv_start_block);
+    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
-        return !sparse_mask;
+    auto skip_by = [&](const bool* base, int kv_pos) -> bool {
+        if (sb_shift < 0) return false;
+        return !base[(uint)kv_pos >> sb_shift];
     };
-    auto skip_load = [&](int kv_pos) {
-        auto kv_start_block = kv_pos / SPARSE_BLOCK_SIZE;
-        bool sparse_mask = *(reinterpret_cast<bool*>(wg_sparse_mask_base) + kv_start_block);
-        return !sparse_mask;
-    };
+
+    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
+    auto skip_load    = [&](int kv_pos) { return skip_by((const bool*)wg_sparse_mask_base, kv_pos); };
 #endif
 
     auto load_slm_KV = [&](int kv_pos) {
@@ -300,6 +298,16 @@ void pa_kernel_lsc_prefetch_f16(
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
 
+#if IS_BLOCK_SPARSE
+    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
+    auto skip_by = [&](const bool* base, int kv_pos) -> bool {
+        if (sb_shift < 0) return false;
+        return !base[(uint)kv_pos >> sb_shift];
+    };
+
+    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
+#endif
+
     auto q_tokens_left = q_len;// - q_start;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
@@ -343,16 +351,10 @@ void pa_kernel_lsc_prefetch_f16(
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
 #if IS_BLOCK_SPARSE
-            if (SPARSE_BLOCK_SIZE > 1)
-            {
-                auto kv_start_block = kv_pos/ SPARSE_BLOCK_SIZE;
-                bool sparse_mask = *(reinterpret_cast<bool*>(sparse_mask_base) + kv_start_block);
-                if (!sparse_mask) {
-                    if constexpr (use_causal_mask) {
-                        causal_left -= kv_step;
-                    }
-                    continue;
-                }
+            if (SPARSE_BLOCK_SIZE > 1 && skip_compute(kv_pos)) {
+                if constexpr (use_causal_mask)
+                    causal_left -= kv_step;
+                continue;
             }
 #endif
             b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
