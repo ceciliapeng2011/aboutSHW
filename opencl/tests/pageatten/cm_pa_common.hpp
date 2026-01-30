@@ -14,8 +14,10 @@
  * limitations under the License.
  *******************************************************************************/
 #include "cm_attention_common.hpp"
-
+#define CMPA_KVCACHE_U8 1
 #if CMPA_KVCACHE_U8
+
+
 
 template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_q_fused = 0>
 void pa_lsc_u8(
@@ -40,8 +42,10 @@ void pa_lsc_u8(
     int32_t* block_indices [[type("svmptr_t")]]) {
 
     constexpr uint o_pitch = (num_heads * head_size * sizeof(half));
-    constexpr uint q_pitch = is_q_fused ? ((num_heads + num_kv_heads*2) * head_size * sizeof(half)) : o_pitch;
-    //[block_num, kv_heads, block_size, head_size]
+    constexpr uint q_pitch = is_q_fused
+        ? ((num_heads + num_kv_heads * 2) * head_size * sizeof(half))
+        : o_pitch;
+
     constexpr uint kv_pitch = head_size * sizeof(uint8_t);
 
     vector<float, q_step> cur_max;
@@ -51,8 +55,8 @@ void pa_lsc_u8(
     cur_sum = 0;
 
     constexpr int num_P_tiles = REG_N / REG_M;
-    matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
-    matrix<float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
+    matrix<half, head_size / REG_K, REG_K * REG_N> rQ;
+    matrix<float, head_size / REG_N * num_P_tiles, REG_M * REG_N> rO;
 
     auto q_tokens_left = q_len;
     static_assert(q_step == REG_N);
@@ -61,8 +65,9 @@ void pa_lsc_u8(
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
 
+    // ---- Load Q (unchanged) ----
     if (q_tokens_left > 0) {
-        lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dQ(
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(
             reinterpret_cast<uint*>(q_base),
             q_tokens_left - 1,
             head_size * sizeof(half) - 1,
@@ -70,16 +75,16 @@ void pa_lsc_u8(
             0, 0);
 
         #pragma unroll
-        for (int k = 0, ri = 0; k < head_size/2; k += REG_K/2, ri++) {
+        for (int k = 0, ri = 0; k < head_size / 2; k += REG_K / 2, ri++) {
             cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
             rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
         }
     }
 
     lsc::block_2d_desc<uint8_t, 1, kv_step, REG_K> b2dK(
-        k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+        k_cache_base, CMPA_BLOCK_SZ - 1, head_size * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
     lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(
-        v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+        v_cache_base, CMPA_BLOCK_SZ - 1, head_size * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
 
     constexpr int quan_blk_stride =
         CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE + 4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
@@ -91,7 +96,6 @@ void pa_lsc_u8(
     int slm_buff_id_read  = 0;
 
 #if IS_BLOCK_SPARSE
-    // SPARSE_BLOCK_SIZE is runtime but in your case is 256 → sb_shift = 8.
     const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
@@ -99,94 +103,103 @@ void pa_lsc_u8(
         return !base[(uint)kv_pos >> sb_shift];
     };
 
-    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
-    auto skip_load    = [&](int kv_pos) { return skip_by((const bool*)wg_sparse_mask_base, kv_pos); };
+    auto skip_load = [&](int kv_pos) -> bool {
+        return skip_by((const bool*)wg_sparse_mask_base, kv_pos);
+    };
 #endif
 
-    auto load_slm_KV = [&](int kv_pos) {
-        if (kv_pos < kv_stop) {
-#if IS_BLOCK_SPARSE
-            if (SPARSE_BLOCK_SIZE > 1 && skip_load(kv_pos)) {
-                slm_buff_id_write++;
-                return;
-            }
-#endif
-            auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
-            uint32_t dscale_offset =
-                cur_block_id * quan_blk_stride +
-                CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
-                (kv_pos % CMPA_BLOCK_SZ) * sizeof(half);
+    // ============================================================
+    // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
+    // ============================================================
+    auto load_slm_KV_active = [&](int kv_pos, int blk_end) {
 
-            uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
+        // Only load KV that will be consumed inside this active block.
+        if (kv_pos >= blk_end) return;
+        if (kv_pos >= kv_stop) return;
 
-            vector<half, kv_step> dscale;
-            vector<half, kv_step> zp;
-            int kv_left = (kv_stop - kv_pos) > kv_step ? kv_step : (kv_stop - kv_pos);
+        // Ring slot for this load
+        uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
 
-            slm_buff_id_write++;
+        // kv_left for tail within kv_stop
+        int kv_left = (kv_stop - kv_pos) > kv_step ? kv_step : (kv_stop - kv_pos);
 
-            if (wg_local_id < local_size/2) {
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset), dscale);
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
+        // Determine quantization block id for this kv_pos (CMPA_BLOCK_SZ == 256)
+        auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
+        uint32_t dscale_offset =
+            cur_block_id * quan_blk_stride +
+            CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
+            (kv_pos % CMPA_BLOCK_SZ) * sizeof(half);
 
-                matrix<half, kv_step, REG_K> kmat;
-                auto quanKmat = kmat.format<half, 2, kv_step * REG_K/2>()[1].format<uint8_t, kv_step, REG_K>();
+        // Advance write id exactly when we actually stage data
+        slm_buff_id_write++;
 
-                b2dK.set_base_ptr(reinterpret_cast<uint8_t*>(k_cache_base + cur_block_id * quan_blk_stride));
-                b2dK.set_block_y(kv_pos % CMPA_BLOCK_SZ);
+        vector<half, kv_step> dscale;
+        vector<half, kv_step> zp;
 
-                for (int k = REG_K * wg_local_id; k < head_size; k += REG_K * (local_size/2)) {
-                    cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+        if (wg_local_id < local_size / 2) {
+            // ---- Load K scales / zps ----
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset), dscale);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
 
-                    #pragma unroll
-                    for (int r = 0; r < kv_step; r++) {
-                        kmat[r] = quanKmat[r] - zp[r];
-                        kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
-                    }
+            matrix<half, kv_step, REG_K> kmat;
+            auto quanKmat =
+                kmat.format<half, 2, kv_step * REG_K / 2>()[1].format<uint8_t, kv_step, REG_K>();
 
-                    for (int r = kv_step - 1; r >= kv_left; r--) kmat[r] = 0;
+            b2dK.set_base_ptr(reinterpret_cast<uint8_t*>(k_cache_base + cur_block_id * quan_blk_stride));
+            b2dK.set_block_y(kv_pos % CMPA_BLOCK_SZ);
 
-                    cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
-                }
-            } else {
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset), dscale);
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
-
-                matrix<half, REG_K/2, REG_N*2> VmatVNNI;
-                matrix<half, REG_K, REG_N> Vmat;
-                auto quanVmat = Vmat.format<half, 2, REG_K * REG_N/2>().row(1).format<uint8_t, REG_K, REG_N>();
-
-                b2dV.set_base_ptr(reinterpret_cast<uint8_t*>(v_cache_base + cur_block_id * quan_blk_stride));
-                b2dV.set_block_y(kv_pos % CMPA_BLOCK_SZ);
+            for (int k = REG_K * wg_local_id; k < head_size; k += REG_K * (local_size / 2)) {
+                cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
 
                 #pragma unroll
-                for (int k = REG_N * (wg_local_id - (local_size/2)); k < head_size; k += REG_N * (local_size/2)) {
-                    cm_load<lsc::Normal>(quanVmat.format<uint8_t>(), b2dV.set_block_x(k));
-
-                    #pragma unroll
-                    for (int r = 0; r < kv_step; r++) {
-                        Vmat[r] = quanVmat[r] - zp[r];
-                        Vmat[r] = cm_mul<half>(Vmat[r], dscale[r]);
-                    }
-
-                    for (int r = kv_step - 1; r >= kv_left; r--) Vmat[r] = 0;
-
-                    prepackAsVNNIWidth2(Vmat, VmatVNNI);
-                    cm_slm_block_write(slm_V, slm_offset + k * REG_K * sizeof(half), VmatVNNI.format<half>());
+                for (int r = 0; r < kv_step; r++) {
+                    kmat[r] = quanKmat[r] - zp[r];
+                    kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
                 }
+
+                for (int r = kv_step - 1; r >= kv_left; r--) kmat[r] = 0;
+
+                cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
+            }
+        } else {
+            // ---- Load V scales / zps ----
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset), dscale);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
+
+            matrix<half, REG_K / 2, REG_N * 2> VmatVNNI;
+            matrix<half, REG_K, REG_N> Vmat;
+            auto quanVmat =
+                Vmat.format<half, 2, REG_K * REG_N / 2>().row(1).format<uint8_t, REG_K, REG_N>();
+
+            b2dV.set_base_ptr(reinterpret_cast<uint8_t*>(v_cache_base + cur_block_id * quan_blk_stride));
+            b2dV.set_block_y(kv_pos % CMPA_BLOCK_SZ);
+
+            #pragma unroll
+            for (int k = REG_N * (wg_local_id - (local_size / 2));
+                 k < head_size;
+                 k += REG_N * (local_size / 2)) {
+
+                cm_load<lsc::Normal>(quanVmat.format<uint8_t>(), b2dV.set_block_x(k));
+
+                #pragma unroll
+                for (int r = 0; r < kv_step; r++) {
+                    Vmat[r] = quanVmat[r] - zp[r];
+                    Vmat[r] = cm_mul<half>(Vmat[r], dscale[r]);
+                }
+
+                for (int r = kv_step - 1; r >= kv_left; r--) Vmat[r] = 0;
+
+                prepackAsVNNIWidth2(Vmat, VmatVNNI);
+                cm_slm_block_write(slm_V, slm_offset + k * REG_K * sizeof(half), VmatVNNI.format<half>());
             }
         }
     };
 
     // ============================================================
-    // PATCHED SECTION: block-granular skipping and block-local SLM pipeline
+    // Block-granular sparse gating + block-local pipeline
     // ============================================================
-
-    // With CMPA_BLOCK_SZ == SPARSE_BLOCK_SIZE == 256:
-    // - mask is constant within each 256-token block (kv_pos >> 8)
-    // - avoid paying fence+barrier per 16 tokens for blocks fully skipped.
-    constexpr int KV_BLOCK = CMPA_BLOCK_SZ;               // 256
-    constexpr int STEPS_PER_BLOCK = KV_BLOCK / kv_step;   // 16
+    constexpr int KV_BLOCK = CMPA_BLOCK_SZ;              // 256
+    constexpr int STEPS_PER_BLOCK = KV_BLOCK / kv_step;  // 16
 
     for (int kv_blk = 0; kv_blk < kv_stop; kv_blk += KV_BLOCK) {
 
@@ -196,62 +209,50 @@ void pa_lsc_u8(
         int blk_len = blk_end - kv_blk;
         if (blk_len <= 0) break;
 
-        // number of kv_step iterations in this block
         int steps_in_block = (blk_len + kv_step - 1) / kv_step; // <= 16
 
 #if IS_BLOCK_SPARSE
-        // Since sparse_mask_base and wg_sparse_mask_base have identical values in your case,
-        // skipping the block here is safe for both load and compute.
+        // Per-block skip (mask constant within 256 tokens)
         if (SPARSE_BLOCK_SIZE > 1 && skip_load(kv_blk)) {
             if constexpr (use_causal_mask) {
-                // original code decrements causal_left by kv_step per iteration
                 causal_left -= steps_in_block * kv_step;
             }
             continue;
         }
 #endif
 
-        // Reset ring counters per active block to avoid cross-block SLM slot reuse hazards.
+        // Reset ring counters per active block
         slm_buff_id_write = 0;
         slm_buff_id_read  = 0;
 
-        // Prime the pipeline for this block: load step 0 and step 1
-        load_slm_KV(kv_blk);
-        load_slm_KV(kv_blk + kv_step);
+        // Prime pipeline (avoid 2nd prime if block too short)
+        load_slm_KV_active(kv_blk, blk_end);
+        if (kv_blk + kv_step < blk_end)
+            load_slm_KV_active(kv_blk + kv_step, blk_end);
 
         cm_slm_fence(CM_LOCAL_BARRIER);
         cm_sbarrier(1);
 
-        // Existing pipeline loop, limited to the active block range
         for (int kv_pos = kv_blk; kv_pos < blk_end; kv_pos += kv_step, slm_buff_id_read++) {
 
             cm_fence(CM_LOCAL_BARRIER);
             cm_sbarrier(0);
 
-            // Signal only if there is a next step within THIS block
             if (kv_pos + kv_step < blk_end)
                 cm_sbarrier(1);
 
-            // Prefetch/load 2 steps ahead (guarded inside load_slm_KV)
-            load_slm_KV(kv_pos + kv_step * 2);
+            // Prefetch 2 steps ahead only if it stays within this block
+            if (kv_pos + 2 * kv_step < blk_end)
+                load_slm_KV_active(kv_pos + 2 * kv_step, blk_end);
 
-#if IS_BLOCK_SPARSE
-            // This becomes redundant when mask is constant per 256-token block and block is active,
-            // but kept to keep the patch minimal/safe.
-            if (SPARSE_BLOCK_SIZE > 1 && skip_compute(kv_pos)) {
-                if constexpr (use_causal_mask)
-                    causal_left -= kv_step;
-                continue;
-            }
-#endif
+            // NOTE: per-step skip_compute removed (block already known active)
+
             {
                 uint slm_offset = (slm_buff_id_read & 3) * slm_buff_size;
 
-                // St = K @ Q^T
                 matrix<float, kv_step, q_step> St = ugemm_KQ(slm_K, rQ, slm_offset);
 
                 if constexpr (use_causal_mask) {
-                    // since kv_step == q_step == 16, causal_left is n*kv_step
                     if (causal_left == 0) {
                         apply_causal_mask<1>(St);
                     } else if (causal_left < 0) {
@@ -260,7 +261,6 @@ void pa_lsc_u8(
                     causal_left -= kv_step;
                 } else {
                     int kv_tokens = kv_stop - kv_pos;
-                    // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
                     for (int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
                 }
 
@@ -274,16 +274,14 @@ void pa_lsc_u8(
                 else
                     ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
             }
-        } // end kv_pos loop (within block)
-    } // end kv_blk loop
+        }
+    }
 
     // ============================================================
-    // End of patched section
+    // Store O (unchanged)
     // ============================================================
-
     if (q_tokens_left == 0) return;
 
-    // save cur_O / cur_sum
     matrix<half, num_P_tiles * REG_M, REG_N> cur_O_f16;
     cur_sum = cm_inv(cur_sum);
 
@@ -308,11 +306,12 @@ void pa_lsc_u8(
         }
 
         b2dO.set_block_x(k);
-        cm_store(b2dO.set_block_y(0),     cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
-        cm_store(b2dO.set_block_y(REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
+        cm_store(b2dO.set_block_y(0),
+                 cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
+        cm_store(b2dO.set_block_y(REG_M),
+                 cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
     }
 }
-
 
 #else
 
