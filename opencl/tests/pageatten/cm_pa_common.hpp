@@ -32,10 +32,9 @@ void pa_lsc_u8(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
-    int SPARSE_BLOCK_SIZE,
 #endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
@@ -95,7 +94,7 @@ void pa_lsc_u8(
     int slm_buff_id_write = 0;
     int slm_buff_id_read  = 0;
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
@@ -104,7 +103,7 @@ void pa_lsc_u8(
     };
 
     auto skip_load = [&](int kv_pos) -> bool {
-        return skip_by((const bool*)wg_sparse_mask_base, kv_pos);
+        return skip_by((const bool*)sparse_mask_base, kv_pos);
     };
 #endif
 
@@ -211,9 +210,16 @@ void pa_lsc_u8(
 
         int steps_in_block = (blk_len + kv_step - 1) / kv_step; // <= 16
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
         // Per-block skip (mask constant within 256 tokens)
-        if (SPARSE_BLOCK_SIZE > 1 && skip_load(kv_blk)) {
+        bool block_sparse = false;
+        if (SPARSE_BLOCK_SIZE == 256) {
+            block_sparse = !((const bool*)sparse_mask_base)[(uint)kv_blk >> 8];
+        } else if (SPARSE_BLOCK_SIZE > 1) {
+            block_sparse = skip_load(kv_blk);
+        }
+
+        if (block_sparse) {
             if constexpr (use_causal_mask) {
                 causal_left -= steps_in_block * kv_step;
             }
@@ -325,10 +331,9 @@ void pa_kernel_lsc_prefetch_f16(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
-    int SPARSE_BLOCK_SIZE,
 #endif
     svmptr_t o_base [[type("svmptr_t")]],
     int32_t past_lens,
@@ -350,7 +355,7 @@ void pa_kernel_lsc_prefetch_f16(
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
         if (sb_shift < 0) return false;
@@ -402,7 +407,7 @@ void pa_kernel_lsc_prefetch_f16(
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
             if (SPARSE_BLOCK_SIZE > 1 && skip_compute(kv_pos)) {
                 if constexpr (use_causal_mask)
                     causal_left -= kv_step;

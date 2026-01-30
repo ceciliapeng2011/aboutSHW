@@ -37,13 +37,12 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
     int q_len,
     int num_q_blocks,
-    int num_k_blocks,
-    int SPARSE_BLOCK_SIZE) {
+    int num_k_blocks) {
 #else
     int q_len) {
 #endif
@@ -122,7 +121,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     //Q/O[B, L, H, S]
     uint q_offset = (q_start_sg*num_heads + h)*head_size;
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     bool *block_mask_base, *wg_block_mask_base;
     //# sparse_block_mask [num_heads, num_q_blocks, num_k_blocks]
     //# sparse_block_mask_wg [num_heads, wg_count_along_query, num_k_blocks]
@@ -145,10 +144,9 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(query + q_offset),
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
@@ -164,10 +162,9 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(query + q_offset),
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
