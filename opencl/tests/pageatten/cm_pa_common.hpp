@@ -17,6 +17,8 @@
 #define CMPA_KVCACHE_U8 1
 #if CMPA_KVCACHE_U8
 
+
+
 template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_q_fused = 0>
 void pa_lsc_u8(
     uint slm_K,
@@ -44,7 +46,6 @@ void pa_lsc_u8(
         ? ((num_heads + num_kv_heads * 2) * head_size * sizeof(half))
         : o_pitch;
 
-    // [block_num, kv_heads, block_size, head_size] (u8)
     constexpr uint kv_pitch = head_size * sizeof(uint8_t);
 
     vector<float, q_step> cur_max;
@@ -64,9 +65,7 @@ void pa_lsc_u8(
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
 
-    // ----------------------------
-    // Load Q (unchanged)
-    // ----------------------------
+    // ---- Load Q (unchanged) ----
     if (q_tokens_left > 0) {
         lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(
             reinterpret_cast<uint*>(q_base),
@@ -97,7 +96,6 @@ void pa_lsc_u8(
     int slm_buff_id_read  = 0;
 
 #if IS_BLOCK_SPARSE
-    // SPARSE_BLOCK_SIZE is runtime but in your case is 256 -> sb_shift = 8
     const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
@@ -105,41 +103,41 @@ void pa_lsc_u8(
         return !base[(uint)kv_pos >> sb_shift];
     };
 
-    // In your current scenario wg_sparse_mask_base is identical to sparse_mask_base in values,
-    // but we only use skip_load at block granularity anyway.
     auto skip_load = [&](int kv_pos) -> bool {
         return skip_by((const bool*)wg_sparse_mask_base, kv_pos);
     };
 #endif
 
     // ============================================================
-    // Maskless SLM loader for ACTIVE blocks (no per-step skip_load)
+    // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
     // ============================================================
     auto load_slm_KV_active = [&](int kv_pos, int blk_end) {
 
-        // Only load KV consumed inside this active block.
+        // Only load KV that will be consumed inside this active block.
         if (kv_pos >= blk_end) return;
         if (kv_pos >= kv_stop) return;
 
         // Ring slot for this load
         uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
 
+        // kv_left for tail within kv_stop
         int kv_left = (kv_stop - kv_pos) > kv_step ? kv_step : (kv_stop - kv_pos);
 
+        // Determine quantization block id for this kv_pos (CMPA_BLOCK_SZ == 256)
         auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
         uint32_t dscale_offset =
             cur_block_id * quan_blk_stride +
             CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
             (kv_pos % CMPA_BLOCK_SZ) * sizeof(half);
 
-        // advance write id when we stage
+        // Advance write id exactly when we actually stage data
         slm_buff_id_write++;
 
         vector<half, kv_step> dscale;
         vector<half, kv_step> zp;
 
         if (wg_local_id < local_size / 2) {
-            // ---- K path (writers) ----
+            // ---- Load K scales / zps ----
             cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset), dscale);
             cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
 
@@ -164,7 +162,7 @@ void pa_lsc_u8(
                 cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
             }
         } else {
-            // ---- V path (writers) ----
+            // ---- Load V scales / zps ----
             cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset), dscale);
             cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
 
@@ -198,7 +196,7 @@ void pa_lsc_u8(
     };
 
     // ============================================================
-    // Block-granular sparse gating + batch-of-4 pipeline
+    // Block-granular sparse gating + block-local pipeline
     // ============================================================
     constexpr int KV_BLOCK = CMPA_BLOCK_SZ;              // 256
     constexpr int STEPS_PER_BLOCK = KV_BLOCK / kv_step;  // 16
@@ -223,39 +221,34 @@ void pa_lsc_u8(
         }
 #endif
 
-        // reset ring counters per active block
+        // Reset ring counters per active block
         slm_buff_id_write = 0;
         slm_buff_id_read  = 0;
 
-        // ----------------------------
-        // Batch-of-4 scheduling
-        // ----------------------------
-        for (int s = 0; s < steps_in_block; s += 4) {
+        // Prime pipeline (avoid 2nd prime if block too short)
+        load_slm_KV_active(kv_blk, blk_end);
+        if (kv_blk + kv_step < blk_end)
+            load_slm_KV_active(kv_blk + kv_step, blk_end);
 
-            // Stage up to 4 steps into slots 0..3 (write id controls slot selection)
-            slm_buff_id_write = s;
+        cm_slm_fence(CM_LOCAL_BARRIER);
+        cm_sbarrier(1);
 
-            if (s + 0 < steps_in_block) load_slm_KV_active(kv_blk + (s + 0) * kv_step, blk_end);
-            if (s + 1 < steps_in_block) load_slm_KV_active(kv_blk + (s + 1) * kv_step, blk_end);
-            if (s + 2 < steps_in_block) load_slm_KV_active(kv_blk + (s + 2) * kv_step, blk_end);
-            if (s + 3 < steps_in_block) load_slm_KV_active(kv_blk + (s + 3) * kv_step, blk_end);
+        for (int kv_pos = kv_blk; kv_pos < blk_end; kv_pos += kv_step, slm_buff_id_read++) {
 
-            // Make SLM writes visible, then synchronize all lanes once per batch.
-            cm_slm_fence(CM_LOCAL_BARRIER);
-            cm_barrier();
+            cm_fence(CM_LOCAL_BARRIER);
+            cm_sbarrier(0);
 
-            // Consume/compute up to 4 steps from staged slots
-            slm_buff_id_read = s;
+            if (kv_pos + kv_step < blk_end)
+                cm_sbarrier(1);
 
-            #pragma unroll
-            for (int t = 0; t < 4; t++) {
-                int step = s + t;
-                if (step >= steps_in_block) break;
+            // Prefetch 2 steps ahead only if it stays within this block
+            if (kv_pos + 2 * kv_step < blk_end)
+                load_slm_KV_active(kv_pos + 2 * kv_step, blk_end);
 
-                int kv_pos = kv_blk + step * kv_step;
+            // NOTE: per-step skip_compute removed (block already known active)
 
+            {
                 uint slm_offset = (slm_buff_id_read & 3) * slm_buff_size;
-                slm_buff_id_read++;
 
                 matrix<float, kv_step, q_step> St = ugemm_KQ(slm_K, rQ, slm_offset);
 
@@ -281,9 +274,6 @@ void pa_lsc_u8(
                 else
                     ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
             }
-
-            // Ensure consumers finished using slots 0..3 before next batch overwrites them.
-            cm_barrier();
         }
     }
 
