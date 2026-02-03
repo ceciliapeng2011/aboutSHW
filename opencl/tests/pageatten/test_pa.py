@@ -76,7 +76,7 @@ def DIV_UP(x, y):
 
 
 DUMP_ENQUEUE_ARGUMENTS = True
-
+USE_RANDOM_MASK_BY_FORCE = True
 class page_atten_cm:
     def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal = True, sparse_block_sz = 128):
         self.num_heads = num_heads
@@ -269,6 +269,157 @@ class page_atten_cm:
 
         return output
 
+
+    def run_perf(self, q, k, v, block_mask, n_warmup: int = 20, n_iters: int = 200, deterministic_block_indices: bool = True):
+        """Perf runner that avoids per-iter host<->device copies.
+
+        Returns: list of per-enqueue durations (ns) from cl.finish().
+        """
+        seq_len, _, head_size = q.shape
+        assert head_size == self.head_size
+
+        padded_k = k
+        padded_v = v
+
+        aligned_seqlen = seq_len
+        if seq_len % self.block_sz != 0:
+            padding_tokens = self.block_sz - seq_len % self.block_sz
+            kv_padding_dims = (0, 0, 0, 0, 0, padding_tokens)
+            aligned_seqlen = seq_len + padding_tokens
+            padded_k = torch.nn.functional.pad(k, kv_padding_dims, "constant", 1)
+            padded_v = torch.nn.functional.pad(v, kv_padding_dims, "constant", 1)
+            if self.compressed_kvcache is False:
+                padded_k.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
+                padded_v.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
+
+        k_cache = padded_k.reshape(aligned_seqlen // self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
+        v_cache = padded_v.reshape(aligned_seqlen // self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
+        if self.compressed_kvcache:
+            k_cache = quan_per_token(k_cache)
+            v_cache = quan_per_token(v_cache)
+        else:
+            k_cache = k_cache.reshape(aligned_seqlen // self.block_sz, self.num_kv_heads, -1)
+            v_cache = v_cache.reshape(aligned_seqlen // self.block_sz, self.num_kv_heads, -1)
+
+        blks_per_trunk = self.trunk_sz // self.block_sz
+        trunk_num = (aligned_seqlen + self.trunk_sz - 1) // self.trunk_sz
+        max_blks = aligned_seqlen // self.block_sz
+
+        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.half
+        token_sz = (head_size + 4) if self.compressed_kvcache else head_size
+
+        # Precompute per-trunk masks once (CPU)
+        block_mask_list = None
+        block_mask_in_wg_list = None
+        if self.sparse_block_sz > 1:
+            block_mask_list = []
+            block_mask_in_wg_list = []
+            for trunk_idx in range(trunk_num):
+                q_start = trunk_idx * self.trunk_sz
+                q_end = min(q_start + self.trunk_sz, seq_len)
+                q_len = q_end - q_start
+
+                wg_size = 16
+                q_step = CM_GRF_WIDTH // 32
+                wg_seq_len = wg_size * q_step
+                wg_count = (q_len + wg_seq_len - 1) // wg_seq_len
+
+                kv_len = trunk_idx * self.trunk_sz + q_len
+                q_block_num = (q_len + self.sparse_block_sz - 1) // self.sparse_block_sz
+                kv_block_num = (kv_len + self.sparse_block_sz - 1) // self.sparse_block_sz
+
+                sub_block_mask = torch.zeros(self.num_heads, q_block_num, kv_block_num, dtype=torch.bool)
+                sub_block_mask[...] = block_mask[trunk_idx, :, 0:0 + q_block_num, :kv_block_num]
+
+                sub_block_mask_in_wg = torch.zeros(self.num_heads, wg_count, kv_block_num, dtype=torch.bool)
+
+                for head_idx in range(0, self.num_heads):
+                    for wg_id in range(0, wg_count):
+                        sub_block_mask_in_wg[head_idx, wg_id, :] = False
+                        qblk_start_wg = wg_id * wg_seq_len // self.sparse_block_sz
+                        qblk_end_wg = DIV_UP(min(wg_id * wg_seq_len + wg_seq_len, q_len), self.sparse_block_sz)
+                        for kv_blk_idx in range(0, kv_block_num):
+                            for qblk_idx in range(qblk_start_wg, qblk_end_wg):
+                                if bool(sub_block_mask[head_idx, qblk_idx, kv_blk_idx].item()):
+                                    sub_block_mask_in_wg[head_idx, wg_id, kv_blk_idx] = True
+                block_mask_list.append(sub_block_mask)
+                block_mask_in_wg_list.append(sub_block_mask_in_wg)
+
+        # Pre-create per-trunk device buffers and scalars
+        per_trunk_args = []
+        for trunk_idx in range(trunk_num):
+            blk_num = max_blks if blks_per_trunk * (trunk_idx + 1) > max_blks else blks_per_trunk * (trunk_idx + 1)
+            if deterministic_block_indices:
+                block_indices = torch.arange(blk_num, dtype=torch.int64)
+            else:
+                block_indices = torch.randperm(blk_num)
+
+            sub_k = torch.zeros(blk_num, self.num_kv_heads, self.block_sz * token_sz, dtype=kv_dtype)
+            sub_v = torch.zeros(blk_num, self.num_kv_heads, self.block_sz * token_sz, dtype=kv_dtype)
+            for i in range(len(block_indices)):
+                sub_k[block_indices[i], :] = k_cache[i, :]
+                sub_v[block_indices[i], :] = v_cache[i, :]
+
+            q_start = trunk_idx * self.trunk_sz
+            q_end = min(q_start + self.trunk_sz, seq_len)
+            q_len = q_end - q_start
+            sub_q = q[q_start:q_end, :]
+
+            wg_size = 16
+            q_step = CM_GRF_WIDTH // 32
+            wg_seq_len = wg_size * q_step
+            wg_count = (q_len + wg_seq_len - 1) // wg_seq_len
+
+            GWS = [1, self.num_heads, int(wg_count * wg_size)]
+            LWS = [1, 1, wg_size]
+
+            past_lens = torch.tensor([trunk_idx * self.trunk_sz], dtype=torch.int32)
+            block_indices_begins = torch.tensor([0, blk_num], dtype=torch.int32)
+            subsequence_begins = torch.tensor([0, q_len], dtype=torch.int32)
+
+            t_q = cl.tensor(sub_q.to(torch.float16).detach().numpy())
+            t_k = cl.tensor(sub_k.detach().numpy())
+            t_v = cl.tensor(sub_v.detach().numpy())
+            t_out = cl.tensor([q_len, self.num_heads, self.head_size], np.dtype(np.float16))
+
+            t_block_indices = cl.tensor(block_indices.to(torch.int32).detach().numpy())
+            t_past_lens = cl.tensor(past_lens.detach().numpy())
+            t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
+            t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+
+            if self.sparse_block_sz > 1:
+                t_block_mask = cl.tensor(block_mask_list[trunk_idx].detach().numpy())
+                t_block_mask_in_wg = cl.tensor(block_mask_in_wg_list[trunk_idx].detach().numpy())
+                per_trunk_args.append((GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, t_block_mask.shape[1], t_block_mask.shape[2]))
+            else:
+                per_trunk_args.append((GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len))
+
+        # Flush any setup copies so timing only reflects kernels
+        cl.finish()
+
+        # Warmup
+        for _ in range(n_warmup):
+            for args in per_trunk_args:
+                if self.sparse_block_sz > 1:
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk)
+                else:
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
+        cl.finish()
+
+        # Timed
+        for _ in range(n_iters):
+            for args in per_trunk_args:
+                if self.sparse_block_sz > 1:
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk)
+                else:
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
+
+        return cl.finish()
+
     @staticmethod
     @functools.cache
     def create_instance(num_heads, num_kv_heads, head_size,block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz):
@@ -458,7 +609,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
 
     approx_simple_mask = None
     if sparse_block_sz > 1:
-        if seq_len != 32768 or num_heads != 32 or sparse_block_sz != 256:
+        if seq_len != 32768 or num_heads != 32 or sparse_block_sz != 256 or USE_RANDOM_MASK_BY_FORCE == True:
             approx_simple_mask = generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, density)
         else:
             assert seq_len == 32768 and num_heads == 32 and sparse_block_sz == 256, "only support 32k prompt!"
@@ -513,10 +664,10 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         check_close(ref, out)
     else:
         roofline = 293.27
+        warmup = 5
         rep = 15
-        out = pa_cm(q, k, v, approx_simple_mask, n_repeats=rep)
-        latency = cl.finish()
-        trunks = len(latency) // rep
+        latency = pa_cm.run_perf(q, k, v, approx_simple_mask, n_warmup=warmup, n_iters=rep, deterministic_block_indices=True)
+        trunks = len(latency) // rep if rep > 0 else 0
         trunk_lat = []
         # for i,ns in enumerate(latency): print(f"[{i}]  {ns*1e-6:.3f} ms")
         if rep >= 15:
@@ -526,11 +677,25 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
                 cur_density = 1.0 - count_false_percentage(approx_simple_mask[trunk_idx:trunk_idx+1]) / 100.0  if sparse_block_sz > 1 else 1.0
                 cur_flops = 1 * num_heads * trunk_sz * (trunk_sz*(trunk_idx+1)) * head_size * 2 * cur_density
                 lat = latency[trunk_idx:-1:trunks]
-                avg = sum(lat[10:])/len(lat[10:])*1e-6
-                trunk_lat.append(avg)
-                # print(f'[trunk {trunk_idx}] density {cur_density:.2f}, MFU {cur_flops/(avg*1e6):,.0f} GFLOPS, average latency: {avg:.3f} ms')
-            total_lat = sum(trunk_lat)
-            print(f"[total]: PA_causal {seq_len=} , {trunks=}, density {density:.2f}, compressKVCache {compressed_kvcache}, MFU {flops/(total_lat*1e6):,.0f} GFLOPS, latency: {total_lat:.3f} ms, meet: {roofline*density/total_lat:.2f}")
+                lat_ms = [x * 1e-6 for x in lat]
+                if len(lat_ms):
+                    lat_min = min(lat_ms)
+                    lat_max = max(lat_ms)
+                    lat_avg = sum(lat_ms) / len(lat_ms)
+                else:
+                    lat_min = lat_max = lat_avg = 0.0
+
+                trunk_lat.append((lat_min, lat_avg, lat_max))
+                print(f"[trunk {trunk_idx}] density {cur_density:.2f}, latency(ms): min={lat_min:.3f} avg={lat_avg:.3f} max={lat_max:.3f}")
+
+            total_min = sum(x[0] for x in trunk_lat)
+            total_avg = sum(x[1] for x in trunk_lat)
+            total_max = sum(x[2] for x in trunk_lat)
+            print(
+                f"[total]: PA_causal {seq_len=} , {trunks=}, density {density:.2f}, compressKVCache {compressed_kvcache}, "
+                f"MFU {flops/(total_avg*1e6):,.0f} GFLOPS, latency(ms): min={total_min:.3f} avg={total_avg:.3f} max={total_max:.3f}, "
+                f"meet: {roofline*density/total_avg:.2f}"
+            )
             # print(f'====================================================================================')
 
 def test_ov():
@@ -803,7 +968,7 @@ if __name__ == "__main__":
         seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
         trunk_sz = blocks_per_trunk*block_sz
         
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=0.33, check_acc=True)
+        # test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=0.33, check_acc=True)
 
         test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=False)
         test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=1.0, check_acc=False)
@@ -818,6 +983,7 @@ if __name__ == "__main__":
     if 1:
         for sparse_block_sz in [256]:
             for density in [0.99, 0.66, 0.33, 0.11]:
+            # for density in [0.11]:
                 # seq_len, block_sz, blocks_per_trunk= 8*1024, 256, 16*2
                 seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
                 trunk_sz = blocks_per_trunk*block_sz
