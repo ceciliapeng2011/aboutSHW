@@ -29,17 +29,24 @@
 #define REG_K (SystolicDepth * VNNI_WIDTH)
 #define REG_M RepeatCount
 #define KV_PARTITION_STEP_NUM  (KV_PARTITION_SIZE / KV_STEP)
-
 #if KV_CACHE_COMPRESSION
+    // Currently only supports 'by channel' and 'by token' for K, V still uses 'by token'.
     // scale/zp is half-precision, so size = 2 * 2 = 4 bytes
-    #define KV_SCALE_ZP_SIZE 4 // scale/zp bytes
+    #if KV_CACHE_COMPRESSION_BY_CHANNEL
+    #define GROUPS_PER_BLOCK (KV_BLOCK_SIZE / SUB_GROUP_SIZE)
+    #define K_SCALE_ZP_SIZE (4 * GROUPS_PER_BLOCK) // scale/zp bytes
+    #define V_SCALE_ZP_SIZE 4 // scale/zp bytes
+    #elif KV_CACHE_COMPRESSION_BY_TOKEN
+    #define K_SCALE_ZP_SIZE 4 // scale/zp bytes
+    #define V_SCALE_ZP_SIZE 4 // scale/zp bytes
+    #endif
     #define KV_ELEMENT_TYPE uint8_t
 #else
-    #define KV_SCALE_ZP_SIZE 0 // no scale/zp
+    #define V_SCALE_ZP_SIZE 0 // no scale/zp
     #define KV_ELEMENT_TYPE half
 #endif
 
-//prepack [K, N] to [K/2, N, 2] layout.
+// Prepack [K, N] to [K/2, N, 2] layout.
 template <typename T1, typename T2, int K, int N>
 inline void prepack_to_VNNI_W2(matrix_ref<T1, K, N> input, matrix_ref<T2, K/2, N*2> out) {
     #pragma unroll
@@ -67,8 +74,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //#   key [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
     //# value [block_num, kv_head_num, block_size, head_size] + [block_num, kv_head_num, block_size, 4] (scale/zp)
 
-    //# KV_PARTITION_SIZE should be multiple of kv_block_size(KV_BLOCK_SIZE)
-    //# kv_len dimision will be split into multiple partitions, each WG process a partition
+    //# KV_PARTITION_SIZE should be a multiple of kv_block_size(KV_BLOCK_SIZE)
+    //# kv_len dimension will be split into multiple partitions, each WG processes a partition
     //# total_partitions_num = kv_len // KV_PARTITION_SIZE
     //
     //# MaxRepeatCount=8
@@ -78,7 +85,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //# GWS=[seq_num, num_kv_heads * q_head_chunks_per_kv_head, total_partitions_num]
     //# LWS=[1, 1, 1]
 
-    //# Each WG processes a partition, which is KV_PARTITION_SIZE long and multiple of KV_BLOCK_SIZE.
+    //# Each WG processes a partition, which is KV_PARTITION_SIZE long and a multiple of KV_BLOCK_SIZE.
     //# KV_BLOCK_SIZE can be 32/64/128/256, etc.
     const uint seq_idx = cm_global_id(0);
     const uint kv_head_num_idx = cm_global_id(1) / Q_head_chunks_per_kv_head;
@@ -104,17 +111,19 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     matrix <half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
     cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
 
-    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + V_SCALE_ZP_SIZE); // 0 or 4 bytes: scale/zp
     #if KV_CACHE_COMPRESSION_BY_TOKEN
-        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + K_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+    #elif KV_CACHE_COMPRESSION_BY_CHANNEL
+        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + K_SCALE_ZP_SIZE); // 4 * GROUPS_PER_BLOCK bytes: scale/zp
     #else
-        constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
+        constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * HEAD_SIZE;
     #endif
     uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
 
     uint leftover_size = 0;
     if(kv_partition_idx == kv_partition_num - 1) {
-        // last partition
+        // Last partition
         leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
     }
     if(block_num > total_blocks_num - start_block_idx) {
@@ -127,7 +136,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     // # Each SG can process multiple blocks
     #pragma unroll
     for(uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
-        // split kv_partition into multi kv_block
+        // Split kv_partition into multiple kv_blocks
         uint blk_indices = block_indices[start_block_idx + block_idx];
         uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
         uint k_scale_zp_offset = k_base_offset + KV_BLOCK_SIZE * HEAD_SIZE; // scale/zp offset
@@ -155,25 +164,21 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
         #if KV_CACHE_COMPRESSION
             #if KV_CACHE_COMPRESSION_BY_TOKEN
-            // load scale/zp
+            // Load scale/zp
             vector<half, KV_BLOCK_SIZE> scale_vec;
             vector<half, KV_BLOCK_SIZE> zp_vec;
             cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
             cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
             if(kv_pos_end < KV_BLOCK_SIZE) {
-                // fill leftover with last valid scale/zp
+                // Fill leftover with last valid scale/zp
                 #pragma unroll
                 for(int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
                     scale_vec[i] = 0.0;
                     zp_vec[i] = 0.0;
                 }
             }
-            #else
-            // load scale/zp
-            vector<half, HEAD_SIZE> scale_vec;
-            vector<half, HEAD_SIZE> zp_vec;
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset), scale_vec);
-            cm_svm_block_read(reinterpret_cast<svmptr_t>(key + k_scale_zp_offset + HEAD_SIZE * sizeof(half)), zp_vec);
+            #elif KV_CACHE_COMPRESSION_BY_CHANNEL
+            // TODO: Maybe using scale_vec and zp_vec would be better
             #endif
         #endif
 
@@ -211,25 +216,39 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
                         quant_dst.row(r+1) = quant_src.select<2,1,8,2>(r,1);
                     }
 
-                    #if KV_CACHE_COMPRESSION_BY_TOKEN
-                    #pragma unroll
-                    for(int r = 0; r < REG_K; r++) {
-                        Kt[r] = Kt_quant[r] - temp_zp.format<half, 2, REG_N>()[r%2]; //vector - vector
-                        Kt[r] = cm_mul<half>(Kt[r], temp_scale.format<half, 2, REG_N>()[r%2]);    // vector * vector
-                    }
-                    #else
+                    // === NEW: BY_CHANNEL_SUBGROUP ===
+                    #if KV_CACHE_COMPRESSION_BY_CHANNEL
+                    // Calculate the group for this step (each step spans REG_K==16 rows)
+                    uint group_idx = (kv_pos / SUB_GROUP_SIZE);
+                    // Current channel slice start k, corresponding to REG_K channel width; use your K channel outer loop variable `k`
                     vector<half, REG_K> temp_scale, temp_zp;
-                    temp_scale.select<REG_K, 1>(0) = scale_vec.select<REG_K, 1>(k * 4);
-                    temp_zp.select<REG_K, 1>(0) = zp_vec.select<REG_K, 1>(k * 4);
-
+                    // scale start address = k_scale_zp_offset + group_idx*HEAD_SIZE*sizeof(half) + k*sizeof(half)
+                    svmptr_t scale_ptr = (svmptr_t)(key + k_scale_zp_offset
+                                        + group_idx * HEAD_SIZE * sizeof(half)
+                                        + k * 4 * sizeof(half));
+                    // zp start address = k_scale_zp_offset + GROUPS_PER_BLOCK*HEAD_SIZE*sizeof(half)
+                    //             + group_idx*HEAD_SIZE*sizeof(half) + k*sizeof(half)
+                    svmptr_t zp_ptr = (svmptr_t)(key + k_scale_zp_offset
+                                        + GROUPS_PER_BLOCK * HEAD_SIZE * sizeof(half)
+                                        + group_idx * HEAD_SIZE * sizeof(half)
+                                        + k * 4 * sizeof(half));
+                    cm_svm_block_read<half, REG_K>(scale_ptr, temp_scale);
+                    cm_svm_block_read<half, REG_K>(zp_ptr,    temp_zp);
+                    // Dequantize element-wise: Kt = (u8 - zp) * scale
                     auto Kt_dequant_out = Kt.format<half, REG_K/2, 2*REG_N>();
                     auto Kt_dequant_tmp = Kt_quant.format<uint8_t, REG_K/2, 2*REG_N>();
                     #pragma unroll
-                    for(int r = 0; r < REG_K/2; r++) {
+                    for (int r = 0; r < REG_K/2; ++r) {
                         Kt_dequant_out[r].select<REG_N, 2>(0) = Kt_dequant_tmp[r].select<REG_N, 2>(0) - temp_zp[r*2];
                         Kt_dequant_out[r].select<REG_N, 2>(0) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(0), temp_scale[r*2]);
                         Kt_dequant_out[r].select<REG_N, 2>(1) = Kt_dequant_tmp[r].select<REG_N, 2>(1) - temp_zp[r*2+1];
                         Kt_dequant_out[r].select<REG_N, 2>(1) = cm_mul<half>(Kt_dequant_out[r].select<REG_N, 2>(1), temp_scale[r*2+1]);
+                    }
+                    #elif KV_CACHE_COMPRESSION_BY_TOKEN
+                    #pragma unroll
+                    for(int r = 0; r < REG_K; r++) {
+                        Kt[r] = Kt_quant[r] - temp_zp.format<half, 2, REG_N>()[r%2]; //vector - vector
+                        Kt[r] = cm_mul<half>(Kt[r], temp_scale.format<half, 2, REG_N>()[r%2]);    // vector * vector
                     }
                     #endif
                 #else
