@@ -126,8 +126,8 @@ void pa_lsc_u8(
         int kv_left = kv_step;
         if (kv_pos + kv_step > kv_stop) kv_left = kv_stop - kv_pos;
 
-        // Determine quantization block id for this kv_pos (CMPA_BLOCK_SZ == 256)
-        int kv_pos_in_block = kv_pos - cur_block_id * CMPA_BLOCK_SZ;
+        // Determine kv_pos within logical CMPA_BLOCK_SZ block
+        int kv_pos_in_block = kv_pos - (kv_pos / CMPA_BLOCK_SZ) * CMPA_BLOCK_SZ;
         uint32_t dscale_offset =
             cur_block_id * quan_blk_stride +
             CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
@@ -250,12 +250,14 @@ void pa_lsc_u8(
                 cm_fence(CM_LOCAL_BARRIER);
                 cm_sbarrier(0);
 
+                // Prefetch 2 steps ahead only if it stays within this block
+                if (kv_pos + 2 * kv_step < blk_end) {
+                    load_slm_KV_active(kv_pos + 2 * kv_step, blk_end, cur_block_id);
+                    cm_slm_fence(CM_LOCAL_BARRIER);
+                }
+
                 if (kv_pos + kv_step < blk_end)
                     cm_sbarrier(1);
-
-                // Prefetch 2 steps ahead only if it stays within this block
-                if (kv_pos + 2 * kv_step < blk_end)
-                    load_slm_KV_active(kv_pos + 2 * kv_step, blk_end, cur_block_id);
 
                 // NOTE: per-step skip_compute removed (block already known active)
 
