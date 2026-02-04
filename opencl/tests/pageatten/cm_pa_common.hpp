@@ -113,7 +113,7 @@ void pa_lsc_u8(
     // ============================================================
     // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
     // ============================================================
-    auto load_slm_KV_active = [&](int kv_pos, int blk_end, int blk_base, int cur_block_id) {
+    auto load_slm_KV_active = [&](int kv_pos, int blk_end, int cur_block_id) {
 
         // Only load KV that will be consumed inside this active block.
         if (kv_pos >= blk_end) return;
@@ -127,7 +127,7 @@ void pa_lsc_u8(
         if (kv_pos + kv_step > kv_stop) kv_left = kv_stop - kv_pos;
 
         // Determine quantization block id for this kv_pos (CMPA_BLOCK_SZ == 256)
-        int kv_pos_in_block = kv_pos - blk_base;
+        int kv_pos_in_block = kv_pos - cur_block_id * CMPA_BLOCK_SZ;
         uint32_t dscale_offset =
             cur_block_id * quan_blk_stride +
             CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
@@ -205,8 +205,8 @@ void pa_lsc_u8(
     // ============================================================
     // Block-granular sparse gating + block-local pipeline
     // ============================================================
-    constexpr int KV_BLOCK = CMPA_BLOCK_SZ;              // 256
-    constexpr int STEPS_PER_BLOCK = KV_BLOCK / kv_step;  // 16
+    constexpr int KV_BLOCK = (SPARSE_BLOCK_SIZE > 1) ? SPARSE_BLOCK_SIZE : CMPA_BLOCK_SZ;
+    constexpr int STEPS_PER_BLOCK = KV_BLOCK / kv_step;
 
     for (int kv_blk = 0; kv_blk < kv_stop; kv_blk += KV_BLOCK) {
 
@@ -219,7 +219,7 @@ void pa_lsc_u8(
         int steps_in_block = (blk_len + kv_step - 1) / kv_step; // <= 16
 
 #if SPARSE_BLOCK_SIZE > 1
-        // Per-block skip (mask constant within 256 tokens)
+        // Per-block skip (mask constant within SPARSE_BLOCK_SIZE tokens)
         const bool block_sparse = skip_load(kv_blk);
 
         if (block_sparse) {
@@ -238,9 +238,9 @@ void pa_lsc_u8(
             int cur_block_id = block_indices[kv_blk / CMPA_BLOCK_SZ];
 
             // Prime pipeline (avoid 2nd prime if block too short)
-            load_slm_KV_active(kv_blk, blk_end, kv_blk, cur_block_id);
+            load_slm_KV_active(kv_blk, blk_end, cur_block_id);
             if (kv_blk + kv_step < blk_end)
-                load_slm_KV_active(kv_blk + kv_step, blk_end, kv_blk, cur_block_id);
+                load_slm_KV_active(kv_blk + kv_step, blk_end, cur_block_id);
 
             cm_slm_fence(CM_LOCAL_BARRIER);
             cm_sbarrier(1);
@@ -255,7 +255,7 @@ void pa_lsc_u8(
 
                 // Prefetch 2 steps ahead only if it stays within this block
                 if (kv_pos + 2 * kv_step < blk_end)
-                    load_slm_KV_active(kv_pos + 2 * kv_step, blk_end, kv_blk, cur_block_id);
+                    load_slm_KV_active(kv_pos + 2 * kv_step, blk_end, cur_block_id);
 
                 // NOTE: per-step skip_compute removed (block already known active)
 

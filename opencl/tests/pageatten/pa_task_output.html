@@ -78,5 +78,68 @@
     <h3>Suggested Commit Message</h3>
     <p>pageatten: make sparse gating compile-time (SB=256 perf 0.62/0.63/0.61/0.58 meet)</p>
   </div>
+
+  <div class="section">
+    <h2>Task 1 (Update)</h2>
+    <h3>Instructions</h3>
+    <p>
+      SPARSE_BLOCK_SIZE is a compiling time const. Change opencl/tests/pageatten/cm_pa_common.hpp to reflect this.
+      Make sure it won't hamper performance when SPARSE_BLOCK_SIZE is 256. Run perfornace check yourself using test_pa.py across densities like 0.99, 0.66, 0.33, 0.11.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: gate sparse blocks by SPARSE_BLOCK_SIZE and keep kv-to-quant block indexing tied to CMPA_BLOCK_SZ.</li>
+    </ul>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, blocks_per_trunk=128, sparse_block_sz=256, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>482.471</td>
+          <td>18049</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>318.445</td>
+          <td>18384</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>0.33</td>
+          <td>0.34</td>
+          <td>168.341</td>
+          <td>17830</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>0.11</td>
+          <td>0.12</td>
+          <td>65.210</td>
+          <td>16856</td>
+          <td>0.56</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: gate sparse blocks by SB size (SB256 meet 0.60/0.61/0.59/0.56)</p>
+  </div>
 </body>
 </html>
