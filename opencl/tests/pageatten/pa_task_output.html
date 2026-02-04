@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PA Task Output</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; color: #222; }
+    h1, h2 { margin-bottom: 0.2em; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    code { background: #f3f3f3; padding: 2px 4px; border-radius: 3px; }
+    .section { margin-bottom: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Page Attention Task Output</h1>
+
+  <div class="section">
+    <h2>Task 1</h2>
+    <h3>Instructions</h3>
+    <p>
+      SPARSE_BLOCK_SIZE is a compiling time const. Change opencl/tests/pageatten/cm_pa_common.hpp to reflect this.
+      Make sure it won't hamper performance when SPARSE_BLOCK_SIZE is 256. Run perfornace check yourself using test_pa.py across densities like 0.99, 0.66, 0.33, 0.11.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: remove runtime SPARSE_BLOCK_SIZE comparisons in sparse gating; keep compile-time branches only.</li>
+    </ul>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python test_pa.py</code> (invoked via an inline runner for custom densities)</p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, blocks_per_trunk=128, sparse_block_sz=256, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>467.499</td>
+          <td>18627</td>
+          <td>0.62</td>
+        </tr>
+        <tr>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>309.985</td>
+          <td>18886</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>0.33</td>
+          <td>0.34</td>
+          <td>163.923</td>
+          <td>18310</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>0.11</td>
+          <td>0.12</td>
+          <td>63.076</td>
+          <td>17426</td>
+          <td>0.58</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: make sparse gating compile-time (SB=256 perf 0.62/0.63/0.61/0.58 meet)</p>
+  </div>
+</body>
+</html>

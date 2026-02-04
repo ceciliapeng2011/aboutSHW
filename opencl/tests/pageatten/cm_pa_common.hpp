@@ -95,11 +95,14 @@ void pa_lsc_u8(
     int slm_buff_id_read  = 0;
 
 #if SPARSE_BLOCK_SIZE > 1
-    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
+    constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
-        if (sb_shift < 0) return false;
-        return !base[(uint)kv_pos >> sb_shift];
+        if constexpr (sb_shift < 0) {
+            return false;
+        } else {
+            return !base[(uint)kv_pos >> sb_shift];
+        }
     };
 
     auto skip_load = [&](int kv_pos) -> bool {
@@ -217,12 +220,7 @@ void pa_lsc_u8(
 
 #if SPARSE_BLOCK_SIZE > 1
         // Per-block skip (mask constant within 256 tokens)
-        bool block_sparse = false;
-        if (SPARSE_BLOCK_SIZE == 256) {
-            block_sparse = !((const bool*)sparse_mask_base)[(uint)kv_blk >> 8];
-        } else if (SPARSE_BLOCK_SIZE > 1) {
-            block_sparse = skip_load(kv_blk);
-        }
+        const bool block_sparse = skip_load(kv_blk);
 
         if (block_sparse) {
             if constexpr (use_causal_mask) {
@@ -365,10 +363,13 @@ void pa_kernel_lsc_prefetch_f16(
     matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
 
 #if SPARSE_BLOCK_SIZE > 1
-    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
+    constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
-        if (sb_shift < 0) return false;
-        return !base[(uint)kv_pos >> sb_shift];
+        if constexpr (sb_shift < 0) {
+            return false;
+        } else {
+            return !base[(uint)kv_pos >> sb_shift];
+        }
     };
 
     auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
@@ -417,7 +418,7 @@ void pa_kernel_lsc_prefetch_f16(
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
 #if SPARSE_BLOCK_SIZE > 1
-            if (SPARSE_BLOCK_SIZE > 1 && skip_compute(kv_pos)) {
+            if (skip_compute(kv_pos)) {
                 if constexpr (use_causal_mask)
                     causal_left -= kv_step;
                 continue;
