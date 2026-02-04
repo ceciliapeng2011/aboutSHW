@@ -686,7 +686,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
                     lat_min = lat_max = lat_avg = 0.0
 
                 trunk_lat.append((lat_min, lat_avg, lat_max))
-                print(f"[trunk {trunk_idx}] density {cur_density:.2f}, latency(ms): min={lat_min:.3f} avg={lat_avg:.3f} max={lat_max:.3f}")
+                # print(f"[trunk {trunk_idx}] density {cur_density:.2f}, latency(ms): min={lat_min:.3f} avg={lat_avg:.3f} max={lat_max:.3f}")
 
             total_min = sum(x[0] for x in trunk_lat)
             total_avg = sum(x[1] for x in trunk_lat)
@@ -963,34 +963,30 @@ if __name__ == "__main__":
                                 print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                                 test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
 
-    # perf for sparse X attention.
-    if 1:
+    def smoke_accuracy_test():
         seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
         trunk_sz = blocks_per_trunk*block_sz
-        
-        # test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=0.33, check_acc=True)
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=False)
-        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=1.0, check_acc=False)
-
-        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=False, sparse_block_sz = sparse_block_sz, density=0.5, check_acc=False)
-        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, density=0.5, check_acc=False)
-
-        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=False, sparse_block_sz = sparse_block_sz, density=0.8, check_acc=False)
-        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, density=0.8, check_acc=False)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=True)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 256, density=0.33, check_acc=True)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 128, density=0.33, check_acc=True)
 
     # perf for sparse X attention, with QWen3 8K case
-    if 1:
-        for sparse_block_sz in [256]:
-            for density in [0.99, 0.66, 0.33, 0.11]:
-            # for density in [0.11]:
-                # seq_len, block_sz, blocks_per_trunk= 8*1024, 256, 16*2
-                seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
-                trunk_sz = blocks_per_trunk*block_sz
+    def smoke_perf_test():
+        # seq_len, block_sz, blocks_per_trunk= 8*1024, 256, 16*2
+        seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
+        trunk_sz = blocks_per_trunk*block_sz
+
+        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=False)
+
+        for sparse_block_sz in [256, 128]:
+            for density in [1.0, 0.99, 0.66, 0.33, 0.11]:
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=False, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
                 test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
+    smoke_accuracy_test()
+    smoke_perf_test()
     # test_ov()
