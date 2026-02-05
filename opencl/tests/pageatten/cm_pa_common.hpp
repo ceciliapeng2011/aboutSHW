@@ -106,10 +106,19 @@ void pa_lsc_u8(
     };
 
     auto skip_load = [&](int kv_pos) -> bool {
+        if constexpr (SPARSE_BLOCK_SIZE == 256) {
+            return skip_by((const bool*)sparse_mask_base, kv_pos);
+        } else {
+            return skip_by((const bool*)wg_sparse_mask_base, kv_pos);
+        }
+    };
+
+    auto skip_compute = [&](int kv_pos) -> bool {
         return skip_by((const bool*)sparse_mask_base, kv_pos);
     };
 #endif
 
+#if SPARSE_BLOCK_SIZE == 256
     // ============================================================
     // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
     // ============================================================
@@ -291,6 +300,140 @@ void pa_lsc_u8(
             }
         }
     }
+
+#else
+    // ============================================================
+    // Legacy per-step pipeline for SPARSE_BLOCK_SIZE == 128 or 1
+    // ============================================================
+    auto load_slm_KV = [&](int kv_pos) {
+        if (kv_pos >= kv_stop) return;
+
+#if SPARSE_BLOCK_SIZE > 1
+        if (skip_load(kv_pos)) {
+            slm_buff_id_write++;
+            return;
+        }
+#endif
+
+        int cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
+        int kv_pos_in_block = kv_pos - (kv_pos / CMPA_BLOCK_SZ) * CMPA_BLOCK_SZ;
+        uint32_t dscale_offset =
+            cur_block_id * quan_blk_stride +
+            CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
+            kv_pos_in_block * sizeof(half);
+
+        uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
+        vector<half, kv_step> dscale;
+        vector<half, kv_step> zp;
+        int kv_left = (kv_stop - kv_pos) > kv_step ? kv_step : (kv_stop - kv_pos);
+
+        slm_buff_id_write++;
+
+        if (wg_local_id < local_size / 2) {
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset), dscale);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
+
+            matrix<half, kv_step, REG_K> kmat;
+            auto quanKmat =
+                kmat.format<half, 2, kv_step * REG_K / 2>()[1].format<uint8_t, kv_step, REG_K>();
+            b2dK.set_base_ptr(reinterpret_cast<uint8_t*>(k_cache_base + cur_block_id * quan_blk_stride));
+            b2dK.set_block_y(kv_pos_in_block);
+
+            for (int k = REG_K * wg_local_id; k < head_size; k += REG_K * (local_size / 2)) {
+                cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+
+                #pragma unroll
+                for (int r = 0; r < kv_step; r++) {
+                    kmat[r] = quanKmat[r] - zp[r];
+                    kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
+                }
+
+                for (int r = kv_step - 1; r >= kv_left; r--) kmat[r] = 0;
+
+                cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
+            }
+        } else {
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset), dscale);
+            cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + dscale_offset + CMPA_BLOCK_SZ * sizeof(half)), zp);
+
+            matrix<half, REG_K / 2, REG_N * 2> VmatVNNI;
+            matrix<half, REG_K, REG_N> Vmat;
+            auto quanVmat =
+                Vmat.format<half, 2, REG_K * REG_N / 2>().row(1).format<uint8_t, REG_K, REG_N>();
+            b2dV.set_base_ptr(reinterpret_cast<uint8_t*>(v_cache_base + cur_block_id * quan_blk_stride));
+            b2dV.set_block_y(kv_pos_in_block);
+
+            #pragma unroll
+            for (int k = REG_N * (wg_local_id - (local_size / 2));
+                 k < head_size;
+                 k += REG_N * (local_size / 2)) {
+
+                cm_load<lsc::Normal>(quanVmat.format<uint8_t>(), b2dV.set_block_x(k));
+
+                #pragma unroll
+                for (int r = 0; r < kv_step; r++) {
+                    Vmat[r] = quanVmat[r] - zp[r];
+                    Vmat[r] = cm_mul<half>(Vmat[r], dscale[r]);
+                }
+
+                for (int r = kv_step - 1; r >= kv_left; r--) Vmat[r] = 0;
+
+                prepackAsVNNIWidth2(Vmat, VmatVNNI);
+                cm_slm_block_write(slm_V, slm_offset + k * REG_K * sizeof(half), VmatVNNI.format<half>());
+            }
+        }
+    };
+
+    load_slm_KV(0);
+    load_slm_KV(kv_step);
+    cm_slm_fence(CM_LOCAL_BARRIER);
+    cm_sbarrier(1);
+
+    for (int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step, slm_buff_id_read++) {
+        cm_fence(CM_LOCAL_BARRIER);
+        cm_sbarrier(0);
+
+        if (kv_pos + kv_step < kv_stop)
+            cm_sbarrier(1);
+        load_slm_KV(kv_pos + kv_step * 2);
+
+#if SPARSE_BLOCK_SIZE > 1
+        if (skip_compute(kv_pos)) {
+            if constexpr (use_causal_mask)
+                causal_left -= kv_step;
+            continue;
+        }
+#endif
+
+        {
+            uint slm_offset = (slm_buff_id_read & 3) * slm_buff_size;
+
+            matrix<float, kv_step, q_step> St = ugemm_KQ(slm_K, rQ, slm_offset);
+
+            if constexpr (use_causal_mask) {
+                if (causal_left == 0) {
+                    apply_causal_mask<1>(St);
+                } else if (causal_left < 0) {
+                    St = -3.4e38f;
+                }
+                causal_left -= kv_step;
+            } else {
+                int kv_tokens = kv_stop - kv_pos;
+                for (int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
+            }
+
+            auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+
+            matrix<half, REG_N, REG_K> P;
+            Transpose2DMatrix(St, P);
+
+            if (kv_pos == 0)
+                ugemm_PV0(slm_V, P, rO, slm_offset);
+            else
+                ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+        }
+    }
+#endif
 
     // ============================================================
     // Store O (unchanged)

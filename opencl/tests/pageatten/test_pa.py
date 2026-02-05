@@ -963,8 +963,8 @@ if __name__ == "__main__":
                                 print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                                 test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
 
-    def smoke_accuracy_test():
-        seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
+    def smoke_accuracy_test(blocks_per_trunk = 128):
+        seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
         test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=True)
@@ -972,9 +972,8 @@ if __name__ == "__main__":
         test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 128, density=0.33, check_acc=True)
 
     # perf for sparse X attention, with QWen3 8K case
-    def smoke_perf_test():
-        # seq_len, block_sz, blocks_per_trunk= 8*1024, 256, 16*2
-        seq_len, block_sz, blocks_per_trunk= 32*1024, 256, 128
+    def smoke_perf_test(blocks_per_trunk = 128):
+        seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
         test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = 1, density=1.0, check_acc=False)
@@ -989,4 +988,7 @@ if __name__ == "__main__":
 
     smoke_accuracy_test()
     smoke_perf_test()
+
+    smoke_accuracy_test(16)
+    smoke_perf_test(16)
     # test_ov()
