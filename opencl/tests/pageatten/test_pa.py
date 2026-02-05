@@ -13,6 +13,7 @@ import sys
 
 from flashattn import get_flash0
 from check_density import paired_adjacent_row_diff_pct, load_ov_model_block_mask
+from generate_block_mask import generate_block_mask_with_ratio, count_false_percentage
 
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
@@ -530,28 +531,13 @@ def check_close(input, other, atol=1e-2, rtol=1e-2):
     atol_max = (((input - other).abs()) - 1e-5*other.abs()).max()
     print(f"[check_close] rtol_max: {rtol_max}")
     print(f"[check_close] atol_max: {atol_max}")
-    if not torch.allclose(input, other, atol=atol, rtol=rtol, equal_nan=True):
+    if not torch.allclose(input, other, atol=atol, rtol=rtol, equal_nan=False):
         close_check = torch.isclose(input, other, atol=atol, rtol=rtol)
         not_close_indices = torch.where(~close_check) # Invert the close check to find failures
         print(f"Not close indices: {not_close_indices}")
         print(f"    input_tensor: {input[not_close_indices]}")
         print(f"    other_tensor: {other[not_close_indices]}")
         assert 0
-
-def count_false_percentage(mask):
-    B, H, NQ, NL = mask.shape
-    tril_mask = torch.tril(torch.ones((NQ, NL), dtype=torch.bool, device=mask.device))
-    expanded_tril = tril_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-    # Count elements in the tril region
-    tril_elements = torch.sum(expanded_tril).item()
-    # Count False elements in the tril region
-    false_in_tril = torch.sum(~mask & expanded_tril).item()
-    # Calculate percentage
-    if tril_elements > 0:
-        false_percentage = (false_in_tril / tril_elements) * 100
-    else:
-        false_percentage = 0.0
-    return false_percentage
 
 def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=False, sparse_block_sz=128, density=0.5, check_acc = True):
     cl.profiling(True)
@@ -572,45 +558,12 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         k = torch.rand(seq_len, num_kv_heads, head_size).to(dtype=act_dtype)
         v = torch.rand(seq_len, num_kv_heads, head_size).to(dtype=act_dtype)/high
 
-    def create_block_mask(num_q_blocks: int, num_k_blocks: int, ratio: float) -> torch.Tensor:
-        diag = torch.eye(num_q_blocks, num_k_blocks, dtype=torch.bool)
-        if ratio <= 0:
-            return diag
-        if ratio >= 1:
-            return torch.tril(torch.ones((num_q_blocks, num_k_blocks), dtype=torch.bool))
-        causal_without_diag = torch.tril(torch.ones((num_q_blocks, num_k_blocks), dtype=torch.bool), diagonal=-1)
-        rand_mask = torch.rand((num_q_blocks, num_k_blocks))
-        non_diag_causal = causal_without_diag & (rand_mask < ratio)
-        return diag | non_diag_causal
-
-    def generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, true_ratio=density, is_causal=True, device='cpu'):
-        trunk_num = (seq_len + trunk_sz -1) // trunk_sz
-        q_block_num = (trunk_sz + sparse_block_sz -1) // sparse_block_sz
-        k_block_num = (seq_len + sparse_block_sz -1) // sparse_block_sz
-
-        if true_ratio <= 0:
-            block_mask = torch.full([trunk_num, num_heads, q_block_num, k_block_num], False).to(dtype=torch.bool)
-        elif true_ratio >= 1:
-            block_mask = torch.full([trunk_num, num_heads, q_block_num, k_block_num], True).to(dtype=torch.bool)
-        else:
-            block_mask = torch.rand(trunk_num, num_heads, q_block_num, k_block_num, device=device) < true_ratio
-
-        if is_causal:
-            causal_pattern = torch.tril(torch.ones(q_block_num, k_block_num, dtype=torch.bool, device=device))
-            block_mask = block_mask & causal_pattern
-        else:
-            block_mask = block_mask
-        block_mask[:,:,:,0] = True  # the first column is always True
-        # if q_block_num == 2 and k_block_num == 2: # HARD CODE FOR DEBUG
-        #     block_mask = torch.tensor([True, False, False, True], dtype=torch.bool).reshape(q_block_num, k_block_num).expand(trunk_num, num_heads, q_block_num, k_block_num)
-
-
-        return block_mask
-
-    approx_simple_mask = None
+    # Generate approximate sparse block mask
+    is_causal = True  # PageAttention implictly means causal_mask
+    requested_density = density
     if sparse_block_sz > 1:
         if seq_len != 32768 or num_heads != 32 or sparse_block_sz != 256 or USE_RANDOM_MASK_BY_FORCE == True:
-            approx_simple_mask = generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, density)
+            approx_simple_mask, effective_density = generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, sparse_block_sz, requested_density, is_causal)      
         else:
             assert seq_len == 32768 and num_heads == 32 and sparse_block_sz == 256, "only support 32k prompt!"
             block_mask_tmp = load_ov_model_block_mask('/home/ceciliapeng/toolbox/linux/xattn_thresh0.99/dump_xattn_mask_bs256', sparse_block_sz, seq_len, 4096, 36, num_heads)
@@ -619,24 +572,27 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             # L02 H11 | density=33.12%  'xattn_thresh0.99/dump_xattn_mask_bs256'
             # L14 H01 | density=11.45%  'xattn_thresh0.99/dump_xattn_mask_bs256'
             L, H, Q, K = block_mask_tmp.shape
-            if density >= 1.0:
-                approx_simple_mask = torch.full([1, num_heads, Q, K], True).to(dtype=torch.bool)
-            elif density > 0.9:
-                approx_simple_mask = block_mask_tmp[3, 4, ...].repeat(1, num_heads, 1, 1)
-            elif density > 0.6:
-                approx_simple_mask = block_mask_tmp[2, 15, ...].repeat(1, num_heads, 1, 1)
-            elif density > 0.3:
-                approx_simple_mask = block_mask_tmp[2, 11, ...].repeat(1, num_heads, 1, 1)
+            trunk_num = (seq_len + trunk_sz - 1) // trunk_sz
+            assert Q % trunk_num == 0, "Q should be divisible by trunk_num for correct reshaping"
+            if requested_density >= 1.0:
+                approx_simple_mask = torch.full([1, 1, Q, K], True).to(dtype=torch.bool)
+            elif requested_density > 0.9:
+                approx_simple_mask = block_mask_tmp[3, 4, ...]
+            elif requested_density > 0.6:
+                approx_simple_mask = block_mask_tmp[2, 15, ...]
+            elif requested_density > 0.3:
+                approx_simple_mask = block_mask_tmp[2, 11, ...]
             else:
-                approx_simple_mask = block_mask_tmp[14, 1, ...].repeat(1, num_heads, 1, 1)
-        percentage = count_false_percentage(approx_simple_mask)
+                approx_simple_mask = block_mask_tmp[14, 1, ...]
+            approx_simple_mask = approx_simple_mask.reshape(trunk_num, 1, Q//trunk_num, K).repeat(1, num_heads, 1, 1)
+        percentage = count_false_percentage(approx_simple_mask, is_stacked_by_trunk=True)
         # print(f"Percentage of False elements: {percentage:.2f}%")
         # print(f"============ block_mask.shape={approx_simple_mask.shape}")
         # print(f"============ block_mask={approx_simple_mask}")
-        density = 1.0 - percentage / 100.0
+        effective_density = 1.0 - percentage / 100.0
     else:
-        density = 1.0
-        
+        approx_simple_mask, effective_density = None, 1.0
+
     if sparse_block_sz == 128 and False:
         pct_per_pair, mean_pct, max_pct = paired_adjacent_row_diff_pct(approx_simple_mask)
         L, H, Q, K = approx_simple_mask.shape
@@ -649,7 +605,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
                 #     q0, q1 = 2*p, 2*p + 1
                 #     print(f"  pair rows ({q0},{q1}) : {pct_per_pair[l,h,p].item():.2f}%")
 
-    is_causal = True  # PageAttention implictly means causal_mask
+    # // warmup
     pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
     out = pa_cm(q, k, v, approx_simple_mask)
     latency = cl.finish()
@@ -667,34 +623,38 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         warmup = 5
         rep = 15
         latency = pa_cm.run_perf(q, k, v, approx_simple_mask, n_warmup=warmup, n_iters=rep, deterministic_block_indices=True)
-        trunks = len(latency) // rep if rep > 0 else 0
+        # pa_cm(q, k, v, approx_simple_mask, n_repeats = rep)
+        # latency = cl.finish()
+        num_trunks = len(latency) // rep if rep > 0 else 0
         trunk_lat = []
         # for i,ns in enumerate(latency): print(f"[{i}]  {ns*1e-6:.3f} ms")
-        if rep >= 15:
+        if rep >= 1:
             # print(f'====================================================================================')
-            flops = 1 * num_heads * seq_len * seq_len * head_size * 2 * density
-            for trunk_idx in range(trunks):
-                cur_density = 1.0 - count_false_percentage(approx_simple_mask[trunk_idx:trunk_idx+1]) / 100.0  if sparse_block_sz > 1 else 1.0
-                cur_flops = 1 * num_heads * trunk_sz * (trunk_sz*(trunk_idx+1)) * head_size * 2 * cur_density
-                lat = latency[trunk_idx:-1:trunks]
-                lat_ms = [x * 1e-6 for x in lat]
-                if len(lat_ms):
-                    lat_min = min(lat_ms)
-                    lat_max = max(lat_ms)
-                    lat_avg = sum(lat_ms) / len(lat_ms)
-                else:
-                    lat_min = lat_max = lat_avg = 0.0
+            total_flops = 1 * num_heads * seq_len * seq_len * head_size * 2 * effective_density
 
-                trunk_lat.append((lat_min, lat_avg, lat_max))
-                # print(f"[trunk {trunk_idx}] density {cur_density:.2f}, latency(ms): min={lat_min:.3f} avg={lat_avg:.3f} max={lat_max:.3f}")
+            if num_trunks > 0:
+                total_lat_ms = [
+                    sum(latency[i * num_trunks + t] for t in range(num_trunks)) * 1e-6
+                    for i in range(len(latency) // num_trunks)
+                ]
+            else:
+                total_lat_ms = []
 
-            total_min = sum(x[0] for x in trunk_lat)
-            total_avg = sum(x[1] for x in trunk_lat)
-            total_max = sum(x[2] for x in trunk_lat)
+            if len(total_lat_ms):
+                total_min = min(total_lat_ms)
+                total_max = max(total_lat_ms)
+                total_avg = sum(total_lat_ms) / rep
+            else:
+                total_min = total_max = total_avg = 0.0
+            mfu = total_flops / (total_avg * 1e6) if total_avg > 0 else 0.0
+            meet = (roofline * effective_density / total_avg) if total_avg > 0 else 0.0
+            density_note = (
+                f"density req/eff {requested_density:.2f}/{effective_density:.2f}"
+            )
             print(
-                f"[total]: PA_causal {seq_len=} , {trunks=}, density {density:.2f}, compressKVCache {compressed_kvcache}, "
-                f"MFU {flops/(total_avg*1e6):,.0f} GFLOPS, latency(ms): min={total_min:.3f} avg={total_avg:.3f} max={total_max:.3f}, "
-                f"meet: {roofline*density/total_avg:.2f}"
+                f"[total]: PA_causal {sparse_block_sz=} {seq_len=} , {num_trunks=}, {density_note}, compressKVCache {compressed_kvcache}, "
+                f"MFU {mfu:,.0f} GFLOPS, latency(ms): min={total_min:.3f} avg={total_avg:.3f} max={total_max:.3f}, "
+                f"meet: {meet:.2f}"
             )
             # print(f'====================================================================================')
 
@@ -853,7 +813,7 @@ def test_ov():
     GWS = [1, pa_cm.num_heads, int(wg_count * wg_size)]
     LWS = [1, 1, wg_size]
 
-    print(f"calling cm_page_attention {GWS=} {LWS=} sparse_block_sz:{pa_cm.sparse_block_sz} kv_cache:{"U8" if pa_cm.compressed_kvcache else "F16"}")
+    # print(f"calling cm_page_attention {GWS=} {LWS=} sparse_block_sz:{pa_cm.sparse_block_sz} kv_cache:{"U8" if pa_cm.compressed_kvcache else "F16"}")
     if pa_cm.sparse_block_sz > 1:
         t_block_mask = cl.tensor(block_mask.to(torch.bool).detach().numpy())
         t_block_mask_in_wg  = cl.tensor(block_mask_in_wg.to(torch.bool).detach().numpy())
@@ -980,6 +940,7 @@ if __name__ == "__main__":
 
         for sparse_block_sz in [256, 128]:
             for density in [1.0, 0.99, 0.66, 0.33, 0.11]:
+            # for density in [1.0]:
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")

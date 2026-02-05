@@ -5,6 +5,8 @@ import numpy as np
 from collections import defaultdict
 from clops.utils import Colors
 
+from generate_block_mask import count_false_percentage
+
 torch.set_printoptions(linewidth=1024, precision=2)
 np.set_printoptions(precision=2, suppress=True)
 
@@ -13,21 +15,6 @@ def get_tensor(name, dtype=np.float16):
         data = f.read()
         np_data = np.frombuffer(data, dtype=dtype).copy()
         return torch.from_numpy(np_data)
-
-def count_false_percentage(mask):
-    B, H, NQ, NL = mask.shape
-    tril_mask = torch.tril(torch.ones((NQ, NL), dtype=torch.bool, device=mask.device))
-    expanded_tril = tril_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-    # Count elements in the tril region
-    tril_elements = torch.sum(expanded_tril).item()
-    # Count False elements in the tril region
-    false_in_tril = torch.sum(~mask & expanded_tril).item()
-    # Calculate percentage
-    if tril_elements > 0:
-        false_percentage = (false_in_tril / tril_elements) * 100
-    else:
-        false_percentage = 0.0
-    return false_percentage
 
 def check_cuda_density(base, dump_name):
     base = '/home/ceciliapeng/OCL/xattn-cuda/'
