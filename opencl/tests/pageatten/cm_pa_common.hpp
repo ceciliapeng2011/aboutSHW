@@ -586,6 +586,168 @@ void pa_kernel_lsc_prefetch_f16(
     constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     int causal_left = q_start+past_lens;
 
+#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+    constexpr int kv_block = SPARSE_BLOCK_SIZE;
+    for (int kv_blk = 0; kv_blk < kv_stop; kv_blk += kv_block) {
+        int blk_end = kv_blk + kv_block;
+        if (blk_end > kv_stop) blk_end = kv_stop;
+        int blk_len = blk_end - kv_blk;
+        if (blk_len <= 0) break;
+        int steps_in_block = (blk_len + kv_step - 1) / kv_step;
+
+        if constexpr (SPARSE_BLOCK_SIZE == 256) {
+            if (skip_compute(kv_blk)) {
+                if constexpr (use_causal_mask) {
+                    causal_left -= steps_in_block * kv_step;
+                }
+                continue;
+            }
+        }
+
+        for (int kv_pos = kv_blk; kv_pos < blk_end; kv_pos += kv_step) {
+            auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
+            //For the last step, duplicate prefetch here.
+            uint32_t prefetch_kv_pos = (kv_pos+kv_step) >= kv_stop ?  kv_pos : (kv_pos+kv_step);
+            auto prefetch_block_id = block_indices[prefetch_kv_pos / CMPA_BLOCK_SZ];
+        //# St = k @ Qt
+        matrix<float, kv_step, q_step> St;
+        {
+            constexpr int num_K = kv_step/REG_M;
+            auto St2 = St.format<float, num_K, REG_M*REG_N>();
+
+            matrix<half, num_K, REG_M * REG_K> Kmat;
+
+            prefetch_K.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+prefetch_block_id*blk_stride));
+            prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+
+            if constexpr (SPARSE_BLOCK_SIZE == 128) {
+                if (skip_compute(kv_pos)) {
+                    if constexpr (use_causal_mask)
+                        causal_left -= kv_step;
+                    continue;
+                }
+            }
+            b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
+            b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
+            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
+            if ((kv_pos + kv_step) > kv_stop) {
+                auto valid_rows = kv_stop - kv_pos;
+                for (int r = valid_rows; r < kv_step; r++)
+                    Kmat.format<half, num_K*REG_M, REG_N>().row(r) = 0.f;
+            }
+            #pragma unroll
+            for(int k = 0; k < num_K; k++)
+                St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                                0,
+                                rQ[0].format<int32_t>(),
+                                Kmat[k].format<int32_t>());
+
+            #pragma unroll
+            for(int ri = 1; ri < head_size/REG_K; ri++) {
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
+                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
+                #pragma unroll
+                for(int k = 0; k < num_K; k++) {
+                    St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                        St2.row(k),
+                        rQ[ri].format<int32_t>(),
+                        Kmat[k].format<int32_t>());
+                }
+            }
+        }
+        if constexpr (use_causal_mask) {
+            // since kv_step == q_step == 16, causal_left is n*kv_step
+            if (causal_left == 0) {
+                apply_causal_mask<1>(St);
+            } else if (causal_left < 0) {
+                St = -3.4e38f;
+            }
+            causal_left -= kv_step;
+        } else {
+            int kv_tokens = kv_stop - kv_pos;
+            // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
+            for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
+        }
+
+        //show(St);
+        auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+
+        matrix<half, REG_N, REG_K> P;
+        Transpose2DMatrix(St, P);
+
+        prefetch_V.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+prefetch_block_id*blk_stride));
+        prefetch_V.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
+
+        b2dV.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+cur_block_id*blk_stride));
+        b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
+        if (kv_pos == 0) {
+            // ugemm_PV0(slm_V, P, rO, slm_offset);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            #pragma unroll
+            for(int k = 0, ri = 0; k < head_size; k += REG_N, ri += num_P_tiles) {
+                matrix<half, REG_K/2, REG_N*2> Vmat;
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+                if ((kv_pos + kv_step) > kv_stop) {
+                    uint valid_rows = kv_stop - kv_pos;
+                    uint valid_rows_vnni = (valid_rows+1)/2;
+                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                        Vmat.row(r) = 0.f;
+                    if (valid_rows % 2 == 1)
+                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+                }
+                #pragma unroll
+                for(int p = 0; p < num_P_tiles; p++) {
+                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                                    0,
+                                    Vmat.format<int32_t>(),
+                                    P2.row(p).format<int32_t>());
+                }
+            }
+        }
+        else {
+            //ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            #pragma unroll
+            for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
+                matrix<half, REG_K/2, REG_N*2> Vmat;
+
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                 // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+                if ((kv_pos + kv_step) > kv_stop) {
+                    uint valid_rows = kv_stop - kv_pos;
+                    uint valid_rows_vnni = (valid_rows+1)/2;
+                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                        Vmat.row(r) = 0.f;
+                    if (valid_rows % 2 == 1)
+                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+                }
+                //# compensate cur_O
+                //  matrix <float, head_size/REG_K*2, REG_M*REG_N> rO;
+                #pragma unroll
+                for(int p = 0; p < num_P_tiles; p++) {
+                    auto cO = rO[ri + p].format<float, REG_M, REG_N>();
+                    #pragma unroll
+                    for(int r = 0; r < REG_M; r++)
+                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
+                }
+
+                #pragma unroll
+                for(int p = 0; p < num_P_tiles; p++) {
+                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
+                                rO[ri + p].format<float>(),
+                                Vmat.format<int32_t>(),
+                                P2.row(p).format<int32_t>());
+                }
+            }
+        }
+        }
+    }
+#elif SPARSE_BLOCK_SIZE == 1 || OPTIMIZED_SPARSE_PIPELINE == 0
     for(int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step) {
         auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
         //For the last step, duplicate prefetch here.
@@ -728,6 +890,9 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
     }
+#else
+#error "Unsupported SPARSE_BLOCK_SIZE. Supported values: 1, 128, 256."
+#endif
     if (q_tokens_left == 0) return;
 
     //# save cur_O/cur_sum.transpose(0, 1)

@@ -231,5 +231,134 @@
     <h3>Suggested Commit Message</h3>
     <p>Fix U8 KV block offset + SLM barrier order; perf meet=0.57 (s1), 0.61/0.62/0.63/0.61/0.58 (s256 d=1.00/0.99/0.67/0.34/0.12)</p>
   </div>
+
+  <div class="section">
+    <h2>Pre-fix Snapshot Commit</h2>
+    <h3>Instructions</h3>
+    <p>
+      Before fixes, commit current status with performance data in the commit message.
+      Append results in this HTML with task instructions and suggested commit message.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: add SPARSE_BLOCK_SIZE block loop in FP16 path, inline K/V prefetch + tail cleanup, and guard unsupported SB sizes.</li>
+      <li>opencl/tests/pageatten/test_pa.py: parameterize smoke tests with <code>compressed_kvcache</code> and set non-compressed roofline; default to run smoke tests with <code>compressed_kvcache=False</code>.</li>
+    </ul>
+
+    <h3>Accuracy Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Result:</strong> smoke accuracy (SB=1/256/128) passed with rtol_max 0.0009365 and atol_max 0.0002416.</p>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=False</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>483.797</td>
+          <td>18181</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>484.737</td>
+          <td>18146</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>480.377</td>
+          <td>18128</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>319.886</td>
+          <td>18148</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>153.275</td>
+          <td>18938</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>50.782</td>
+          <td>19053</td>
+          <td>0.64</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>488.369</td>
+          <td>18011</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>488.561</td>
+          <td>17824</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>366.052</td>
+          <td>15860</td>
+          <td>0.53</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>226.081</td>
+          <td>12839</td>
+          <td>0.43</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>138.732</td>
+          <td>6974</td>
+          <td>0.23</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: FP16 SB loop + perf (ckv=false meet sb1=0.61 sb256=0.60/0.60/0.60/0.63/0.64 sb128=0.60/0.59/0.53/0.43/0.23)</p>
+  </div>
 </body>
 </html>
