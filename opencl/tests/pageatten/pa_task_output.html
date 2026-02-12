@@ -360,5 +360,242 @@
     <h3>Suggested Commit Message</h3>
     <p>pageatten: FP16 SB loop + perf (ckv=false meet sb1=0.61 sb256=0.60/0.60/0.60/0.63/0.64 sb128=0.60/0.59/0.53/0.43/0.23)</p>
   </div>
+
+  <div class="section">
+    <h2>Task 4</h2>
+    <h3>Instructions</h3>
+    <p>
+      Precompute <code>cur_block_id</code> and <code>kv_pos_in_block</code> ahead of <code>load_slm_KV_active</code>.
+      Add static_assert checks for the optimized U8 quick path when
+      <code>SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN</code> and <code>CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE == 0</code>.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: precompute <code>cur_block_id</code> and <code>kv_pos_in_block</code> before <code>load_slm_KV_active</code> calls to remove repeated division/modulo.</li>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: add static_asserts for the U8 quick path with <code>SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN</code> and <code>CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE == 0</code>.</li>
+    </ul>
+
+    <h3>Accuracy Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Result:</strong> smoke accuracy completed (rtol_max 802.5, atol_max 0.0016479).</p>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>516.716</td>
+          <td>17023</td>
+          <td>0.57</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.01</td>
+          <td>498.190</td>
+          <td>17794</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>1.00</td>
+          <td>483.690</td>
+          <td>18144</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>316.924</td>
+          <td>18461</td>
+          <td>0.62</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>162.791</td>
+          <td>17970</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>57.734</td>
+          <td>16890</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>526.834</td>
+          <td>16761</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>523.450</td>
+          <td>16701</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>408.873</td>
+          <td>14254</td>
+          <td>0.48</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>274.205</td>
+          <td>10627</td>
+          <td>0.35</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>135.611</td>
+          <td>7163</td>
+          <td>0.24</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Performance Check (FP16)</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=False</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>479.600</td>
+          <td>18340</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.01</td>
+          <td>487.403</td>
+          <td>18188</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>1.00</td>
+          <td>482.680</td>
+          <td>18182</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>322.241</td>
+          <td>18157</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>155.259</td>
+          <td>18842</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>51.535</td>
+          <td>18922</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>484.316</td>
+          <td>18233</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>483.850</td>
+          <td>18068</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>360.642</td>
+          <td>16160</td>
+          <td>0.54</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>222.099</td>
+          <td>13121</td>
+          <td>0.44</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>139.695</td>
+          <td>6953</td>
+          <td>0.23</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: precompute U8 KV block indices; quick path SB==WG (U8 perf sb1=0.57 sb256=0.59/0.60/0.62/0.60/0.56 sb128=0.56/0.56/0.48/0.35/0.24; FP16 perf sb1=0.61 sb256=0.61/0.61/0.61/0.63/0.63 sb128=0.61/0.60/0.54/0.44/0.23)</p>
+  </div>
 </body>
 </html>

@@ -82,6 +82,31 @@ def save_block_mask_csv_per_layer_head(block_mask: torch.Tensor, out_dir: str):
             path = os.path.join(out_dir, f"block_mask_L{l:02d}_H{h:02d}.csv")
             np.savetxt(path, bm[l, h], fmt="%d", delimiter=",")
 
+def verify_block_mask_integrity(block_mask: torch.Tensor):
+    """
+    Verify block_mask integrity.
+
+    Rules:
+      1) block_mask shape is [B, H, NQ, NL]
+      2) For each (B, H), the first column (NL=0) must be all True.
+    """
+    assert block_mask.dtype == torch.bool, "block_mask must be torch.bool"
+    assert block_mask.dim() == 4, "block_mask must be 4D [B, H, NQ, NL]"
+
+    B, H, NQ, NL = block_mask.shape
+    if NL == 0:
+        raise AssertionError("block_mask has NL=0; cannot verify first column")
+
+    first_col = block_mask[:, :, :, 0]
+    if not torch.all(first_col):
+        bad = (~first_col).nonzero(as_tuple=False)
+        sample = bad[:10].tolist()
+        raise AssertionError(
+            f"block_mask integrity failed: first column has False at {len(bad)} positions; sample={sample}"
+        )
+
+    return True
+
 def load_ov_model_block_mask(
     base_dir,
     xattn_block_size=128,
@@ -193,6 +218,10 @@ def check_ov_density(
         for l in range(B):
             for h in range(H):
                 density = 100.0 - count_false_percentage(block_mask[l, h, :, :].reshape(1, 1, NQ, NL))
+                try:
+                    verify_block_mask_integrity(block_mask[l:l+1, h:h+1, :, :])
+                except AssertionError as exc:
+                    print(f"{Colors.RED}WARNING: block_mask integrity failed at L{l:02d} H{h:02d}: {exc}{Colors.END}")
                 print(f"L{l:02d} H{h:02d} | density={density:.2f}%")
 
     return 100.0 - count_false_percentage(block_mask)

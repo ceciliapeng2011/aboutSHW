@@ -15,7 +15,41 @@
  *******************************************************************************/
 #include "cm_attention_common.hpp"
 
-#define OPTIMIZED_SPARSE_PIPELINE 1
+#ifndef CMPA_WG_SEQ_LEN
+#error "CMPA_WG_SEQ_LEN must be defined"
+#endif
+
+#ifndef SPARSE_BLOCK_SIZE
+#error "SPARSE_BLOCK_SIZE must be defined"
+#endif
+
+#ifndef CMPA_KVCACHE_U8
+#error "CMPA_KVCACHE_U8 must be defined"
+#endif
+
+#if CMPA_KVCACHE_U8
+#define OPTIMIZED_SPARSE_PIPELINE ( \
+                                   (SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN) && \
+                                   (SPARSE_BLOCK_SIZE == 128 || SPARSE_BLOCK_SIZE == 256) && \
+                                   ((CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE) == 0) \
+                                  )
+#else
+#define OPTIMIZED_SPARSE_PIPELINE ( \
+                                   (SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN) && \
+                                   (SPARSE_BLOCK_SIZE == 128 || SPARSE_BLOCK_SIZE == 256) \
+                                  )
+#endif
+
+#if OPTIMIZED_SPARSE_PIPELINE == 1
+    static_assert(SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN,
+        "This optimized pipeline requires SPARSE_BLOCK_SIZE to be the same as CMPA_WG_SEQ_LEN");
+    static_assert(SPARSE_BLOCK_SIZE == 128 || SPARSE_BLOCK_SIZE == 256,
+        "This optimized pipeline assumes SPARSE_BLOCK_SIZE is 128 or 256 to efficiently index sparse blocks");
+#if CMPA_KVCACHE_U8
+    static_assert((CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE) == 0,
+        "U8 optimized sparse pipeline assumes CMPA_BLOCK_SZ is divisible by SPARSE_BLOCK_SIZE to efficiently index kvcache blocks");
+#endif
+#endif
 
 #if CMPA_KVCACHE_U8
 template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_q_fused = 0>
@@ -31,7 +65,7 @@ void pa_lsc_u8(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
 #endif
@@ -93,7 +127,12 @@ void pa_lsc_u8(
     int slm_buff_id_write = 0;
     int slm_buff_id_read  = 0;
 
-#if (SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128) && OPTIMIZED_SPARSE_PIPELINE == 1
+#if OPTIMIZED_SPARSE_PIPELINE == 1
+    // ==================================================================================
+    // Optimized block-granular sparse pipeline when SPARSE_BLOCK_SIZE == WG_SEQ_LEN
+    // ==================================================================================
+    constexpr int cmpa_shift = (CMPA_BLOCK_SZ == 256) ? 8 : (CMPA_BLOCK_SZ == 128) ? 7 : -1;
+    constexpr int cmpa_mask = CMPA_BLOCK_SZ - 1;
     constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
 
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
@@ -104,22 +143,23 @@ void pa_lsc_u8(
         }
     };
 
+    auto get_mask_base = [&](bool for_load) -> const bool* {
+        (void)for_load;
+        return (const bool*)sparse_mask_base;
+    };
+
     auto skip_load = [&](int kv_pos) -> bool {
-        if constexpr (SPARSE_BLOCK_SIZE == 256) {
-            return skip_by((const bool*)sparse_mask_base, kv_pos);
-        } else {
-            return skip_by((const bool*)wg_sparse_mask_base, kv_pos);
-        }
+        return skip_by(get_mask_base(true), kv_pos);
     };
 
     auto skip_compute = [&](int kv_pos) -> bool {
-        return skip_by((const bool*)sparse_mask_base, kv_pos);
+        return skip_by(get_mask_base(false), kv_pos);
     };
 
     // ============================================================
     // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
     // ============================================================
-    auto load_slm_KV_active = [&](int kv_pos, int blk_end, int blk_base, int cur_block_id) {
+    auto load_slm_KV_active = [&](int kv_pos, int blk_end, int kv_pos_in_block, int cur_block_id) {
 
         // Only load KV that will be consumed inside this active block.
         if (kv_pos >= blk_end) return;
@@ -132,8 +172,6 @@ void pa_lsc_u8(
         int kv_left = kv_step;
         if (kv_pos + kv_step > kv_stop) kv_left = kv_stop - kv_pos;
 
-        // Determine kv_pos within logical CMPA_BLOCK_SZ block
-        int kv_pos_in_block = kv_pos - blk_base;
         uint32_t dscale_offset =
             cur_block_id * quan_blk_stride +
             CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
@@ -231,31 +269,22 @@ void pa_lsc_u8(
             if constexpr (use_causal_mask) {
                 causal_left -= steps_in_block * kv_step;
             }
+            continue;
         }
 
-        if (!block_sparse)
         {
-            bool block_active_thread = true;
-            if constexpr (SPARSE_BLOCK_SIZE == 128) {
-                block_active_thread = !skip_compute(kv_blk);
-                if (!block_active_thread) {
-                    if constexpr (use_causal_mask) {
-                        causal_left -= steps_in_block * kv_step;
-                    }
-                }
-            }
-
             // Reset ring counters per active block
             slm_buff_id_write = 0;
             slm_buff_id_read  = 0;
 
-            int blk_base = (kv_blk / CMPA_BLOCK_SZ) * CMPA_BLOCK_SZ;
-            int cur_block_id = block_indices[kv_blk / CMPA_BLOCK_SZ];
+            auto kv_blk_block_id = block_indices[kv_blk >> cmpa_shift];
+            auto kv_blk_pos_in_block = kv_blk & cmpa_mask;
 
             // Prime pipeline (avoid 2nd prime if block too short)
-            load_slm_KV_active(kv_blk, blk_end, blk_base, cur_block_id);
+            load_slm_KV_active(kv_blk, blk_end, kv_blk_pos_in_block, kv_blk_block_id);
             if (kv_blk + kv_step < blk_end)
-                load_slm_KV_active(kv_blk + kv_step, blk_end, blk_base, cur_block_id);
+                load_slm_KV_active(kv_blk + kv_step, blk_end, (kv_blk + kv_step) & cmpa_mask,
+                    block_indices[(kv_blk + kv_step) >> cmpa_shift]);
 
             cm_slm_fence(CM_LOCAL_BARRIER);
             cm_sbarrier(1);
@@ -267,18 +296,14 @@ void pa_lsc_u8(
 
                 // Prefetch 2 steps ahead only if it stays within this block
                 if (kv_pos + 2 * kv_step < blk_end) {
-                    load_slm_KV_active(kv_pos + 2 * kv_step, blk_end, blk_base, cur_block_id);
+                    int prefetch_kv_pos = kv_pos + 2 * kv_step;
+                    load_slm_KV_active(prefetch_kv_pos, blk_end, prefetch_kv_pos & cmpa_mask,
+                        block_indices[prefetch_kv_pos >> cmpa_shift]);
                     cm_slm_fence(CM_LOCAL_BARRIER);
                 }
 
                 if (kv_pos + kv_step < blk_end)
                     cm_sbarrier(1);
-
-                if constexpr (SPARSE_BLOCK_SIZE == 128) {
-                    if (!block_active_thread) {
-                        continue;
-                    }
-                }
 
                 {
                     uint slm_offset = (slm_buff_id_read & 3) * slm_buff_size;
@@ -311,11 +336,11 @@ void pa_lsc_u8(
         }
     }
 
-#elif SPARSE_BLOCK_SIZE == 1 || OPTIMIZED_SPARSE_PIPELINE == 0
-    // ============================================================
-    // Legacy per-step pipeline for SPARSE_BLOCK_SIZE == 128 or 1
-    // ============================================================
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#else
+    // ========================================================================
+    // Legacy per-step pipeline for any SPARSE_BLOCK_SIZE (including 1)
+    // ======================================================================
+#if SPARSE_BLOCK_SIZE > 1
     constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
         if constexpr (sb_shift < 0) {
@@ -336,7 +361,7 @@ void pa_lsc_u8(
     auto load_slm_KV = [&](int kv_pos) {
         if (kv_pos >= kv_stop) return;
 
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
         if (skip_load(kv_pos)) {
             slm_buff_id_write++;
             return;
@@ -435,7 +460,7 @@ void pa_lsc_u8(
             cm_sbarrier(1);
         load_slm_KV(kv_pos + kv_step * 2);
 
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
         if (skip_compute(kv_pos)) {
             if constexpr (use_causal_mask) {
                 causal_left -= kv_step;
@@ -472,8 +497,6 @@ void pa_lsc_u8(
                 ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
         }
     }
-#else
-#error "Unsupported SPARSE_BLOCK_SIZE. Supported values: 1, 128, 256."
 #endif
 
     // ============================================================
@@ -524,7 +547,7 @@ void pa_kernel_lsc_prefetch_f16(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_cache_base [[type("svmptr_t")]],
     svmptr_t v_cache_base [[type("svmptr_t")]],
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     svmptr_t wg_sparse_mask_base [[type("svmptr_t")]],
 #endif
@@ -548,7 +571,7 @@ void pa_kernel_lsc_prefetch_f16(
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
 
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
     constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
     auto skip_by = [&](const bool* base, int kv_pos) -> bool {
         if constexpr (sb_shift < 0) {
@@ -558,10 +581,12 @@ void pa_kernel_lsc_prefetch_f16(
         }
     };
 
-    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
+    auto skip_compute = [&](int kv_pos) {
+        return skip_by((const bool*)sparse_mask_base, kv_pos);
+    };
 #endif
 
-    auto q_tokens_left = q_len;// - q_start;
+    auto q_tokens_left = q_len;;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
 
@@ -586,7 +611,10 @@ void pa_kernel_lsc_prefetch_f16(
     constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     int causal_left = q_start+past_lens;
 
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if OPTIMIZED_SPARSE_PIPELINE == 1
+    // ====================================================================================
+    // Optimized block-granular sparse pipeline when SPARSE_BLOCK_SIZE == WG_SEQ_LEN
+    // ====================================================================================
     constexpr int kv_block = SPARSE_BLOCK_SIZE;
     for (int kv_blk = 0; kv_blk < kv_stop; kv_blk += kv_block) {
         int blk_end = kv_blk + kv_block;
@@ -595,13 +623,11 @@ void pa_kernel_lsc_prefetch_f16(
         if (blk_len <= 0) break;
         int steps_in_block = (blk_len + kv_step - 1) / kv_step;
 
-        if constexpr (SPARSE_BLOCK_SIZE == 256) {
-            if (skip_compute(kv_blk)) {
-                if constexpr (use_causal_mask) {
-                    causal_left -= steps_in_block * kv_step;
-                }
-                continue;
+        if (skip_compute(kv_blk)) {
+            if constexpr (use_causal_mask) {
+                causal_left -= steps_in_block * kv_step;
             }
+            continue;
         }
 
         for (int kv_pos = kv_blk; kv_pos < blk_end; kv_pos += kv_step) {
@@ -621,12 +647,10 @@ void pa_kernel_lsc_prefetch_f16(
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
-            if constexpr (SPARSE_BLOCK_SIZE == 128) {
-                if (skip_compute(kv_pos)) {
-                    if constexpr (use_causal_mask)
-                        causal_left -= kv_step;
-                    continue;
-                }
+            if (skip_compute(kv_pos)) {
+                if constexpr (use_causal_mask)
+                    causal_left -= kv_step;
+                continue;
             }
             b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
             b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
@@ -747,7 +771,10 @@ void pa_kernel_lsc_prefetch_f16(
         }
         }
     }
-#elif SPARSE_BLOCK_SIZE == 1 || OPTIMIZED_SPARSE_PIPELINE == 0
+#else
+    // ========================================================================
+    // Legacy per-step pipeline for any SPARSE_BLOCK_SIZE (including 1)
+    // ======================================================================
     for(int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step) {
         auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
         //For the last step, duplicate prefetch here.
@@ -765,7 +792,7 @@ void pa_kernel_lsc_prefetch_f16(
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
-#if SPARSE_BLOCK_SIZE == 256 || SPARSE_BLOCK_SIZE == 128
+#if SPARSE_BLOCK_SIZE > 1
             if (skip_compute(kv_pos)) {
                 if constexpr (use_causal_mask)
                     causal_left -= kv_step;
@@ -890,8 +917,6 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
     }
-#else
-#error "Unsupported SPARSE_BLOCK_SIZE. Supported values: 1, 128, 256."
 #endif
     if (q_tokens_left == 0) return;
 

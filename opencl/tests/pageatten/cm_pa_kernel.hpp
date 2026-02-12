@@ -22,6 +22,10 @@
 #define USE_LSC 0
 #endif
 
+#ifndef CMPA_WG_SEQ_LEN
+#error "CMPA_WG_SEQ_LEN must be defined"
+#endif
+
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
     half* query [[type("svmptr_t")]],
@@ -76,7 +80,11 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 
     // multiple work-groups are required to split a sequence,
     // need to figure out which part of query-tokens to process
+#if defined(CMPA_WG_SEQ_LEN)
+    constexpr int wg_seq_len = CMPA_WG_SEQ_LEN;
+#else
     int wg_seq_len = local_size * q_step;
+#endif
     int past_q_lens = past_lens[0];
     kv_start = 0;
     kv_seq_len = q_len + past_q_lens;
