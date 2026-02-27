@@ -35,7 +35,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 #else
 #if CMPA_KVCACHE_U8
     int8_t* k_cache [[type("svmptr_t")]],
-    int8_t* v_cache [[type("svmptr_t")]],
+    SurfaceIndex v_cache_stateful [[type("buffer_t")]],
 #else
     half* k_cache [[type("svmptr_t")]],
     SurfaceIndex v_cache_stateful [[type("buffer_t")]],
@@ -142,6 +142,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 
 #if CMPA_KVCACHE_U8
     uint kv_offset = hkv*(head_size+4)*pa_block_sz;
+    uint kv_offset_bytes = kv_offset; // U8: byte offset
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
                             slm_V,
@@ -158,7 +159,12 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_offset_bytes,
 #endif
                             reinterpret_cast<svmptr_t>(k_cache + kv_offset),
+#ifdef CM_HAS_LSC_UNTYPED_2D
                             reinterpret_cast<svmptr_t>(v_cache + kv_offset),
+#else
+                            v_cache_stateful,
+                            kv_offset_bytes,
+#endif
 #if IS_BLOCK_SPARSE
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),

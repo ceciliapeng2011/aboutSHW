@@ -17,6 +17,7 @@ def rnd_up(a, b):
     return (a + b - 1) // b * b
 
 xe_arch = 2
+print(f"xe_arch: {xe_arch}")
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16

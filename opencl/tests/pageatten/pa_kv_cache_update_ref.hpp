@@ -77,22 +77,18 @@ CM_INLINE void quantize_and_store(vector_ref<half, HEAD_SIZE> data, uchar* out, 
         uint scale_offset = out_offset + HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE + token_pos * sizeof(half);
         half max_val = cm_reduced_max<half>(data);
         half min_val = cm_reduced_min<half>(data);
-        float scale_val = float(0.0);
-        half zp_val = half(0.0);
-        if(max_val == min_val) {
-            scale_val = float(0.0);
-            zp_val = max_val;
-        } else {
-            scale_val = 255.0 / (max_val - min_val);
-            zp_val = (0.0 - min_val) * scale_val;
-        }
+
+        half qrange = max_val - min_val;
+        float scale_val = qrange == (half)0.0 ? 1.0f : 255.0 / qrange;
+        half zp_val = (0.0 - min_val) * scale_val;
+
         vector<half, HEAD_SIZE>  dequant_data = cm_mul<half>(data, scale_val) + zp_val;
         vector<uchar, HEAD_SIZE> data_u8 = cm_rnde<uchar, HEAD_SIZE>(dequant_data);
 
         store_kvcache<uchar, HEAD_SIZE>(reinterpret_cast<svmptr_t>(out + out_offset + token_pos * HEAD_SIZE), 0, data_u8);
 
         half *out_scale_zp = (half*)(out + scale_offset);
-        out_scale_zp[0] = (max_val - min_val) / 255.0;
+        out_scale_zp[0] = 1.0 / scale_val;
         out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
 }
 #endif
@@ -146,13 +142,13 @@ extern "C" _GENX_MAIN_ void pa_kv_cache_update(
             break;
         }
     }
-    // printf("wg:%d.%d, token_idx: %d, subsequence_idx: %d\n", wg_id, wg_local_id, token_idx, subsequence_idx);
 
     const uint subsequence_begin_idx = subsequence_begins[subsequence_idx];
     const uint past_len = past_lens[subsequence_idx];
     const uint current_block_idx = (past_len + token_idx - subsequence_begin_idx) / PAGED_ATTENTION_BLOCK_SIZE;
     const uint token_start_pos = (past_len + token_idx - subsequence_begin_idx) % PAGED_ATTENTION_BLOCK_SIZE;
     const uint block_offset = block_indices_begins[subsequence_idx] + current_block_idx;
+
     {
         uint block_k_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * ADJUSTED_K_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
         uint key_out_offset = block_k_base_offset + token_start_pos * K_HEAD_SIZE;

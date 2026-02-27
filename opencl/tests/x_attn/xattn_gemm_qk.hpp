@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2022-2025 Intel Corporation
+ * Copyright (c) 2018-2026 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -117,6 +117,11 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     #ifdef CM_HAS_LSC_UNTYPED_2D
     kq_exp_partial_sum += offset_partial_sum;
     #endif
+
+// #define CONCAT_IMPL(a, b) KERNEL_NAME::gemm_qk
+// #define CONCAT(x, y) CONCAT_IMPL(x, y)
+// #define FUNC CONCAT(BLOCK_SG_M, BLOCK_SG_N)
+//     FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
 
 #define CONCAT_IMPL(a, b) gemm_qk_ ##a ##x ##b ##_xe2
 #define CONCAT(x, y) CONCAT_IMPL(x, y)

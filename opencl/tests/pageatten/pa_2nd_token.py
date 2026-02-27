@@ -72,6 +72,7 @@ def get_tensor(name, dtype=np.float16):
 
 #xe_arch: 1: xe, 2: xe2
 xe_arch = 2
+print(f"xe_arch: {xe_arch}")
 
 if xe_arch == 1:
     kv_step = 8
