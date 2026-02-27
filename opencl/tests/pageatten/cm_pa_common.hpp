@@ -426,6 +426,16 @@ void pa_kernel_lsc_prefetch_f16(
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, head_size/REG_M, REG_M*REG_N> rO;
 
+#if IS_BLOCK_SPARSE
+    const int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
+    auto skip_by = [&](const bool* base, int kv_pos) -> bool {
+        if (sb_shift < 0) return false;
+        return !base[(uint)kv_pos >> sb_shift];
+    };
+
+    auto skip_compute = [&](int kv_pos) { return skip_by((const bool*)sparse_mask_base, kv_pos); };
+#endif
+
     auto q_tokens_left = q_len;// - q_start;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
