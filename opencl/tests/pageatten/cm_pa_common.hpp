@@ -55,6 +55,8 @@ void pa_lsc_u8(
     auto q_tokens_left = q_len;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
+    static_assert(CMPA_SUB_BLOCK_SZ % 16 == 0);
+    static_assert(CMPA_BLOCK_SZ % CMPA_SUB_BLOCK_SZ == 0);
 
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
@@ -103,14 +105,16 @@ void pa_lsc_u8(
             }
 #endif
             auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
-            uint32_t k_dscale_offset = CMPA_KVCACHE_U8 == 1 ?
-                                       cur_block_id * k_quan_blk_stride + CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
-                                       kv_pos % CMPA_BLOCK_SZ * sizeof(half) :
-                                       cur_block_id * k_quan_blk_stride + CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
+
+#if CMPA_KVCACHE_U8 == 1
+            uint32_t k_dscale_offset = cur_block_id * k_quan_blk_stride + CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
+                                       kv_pos % CMPA_BLOCK_SZ * sizeof(half);
+            uint32_t k_zp_offset = k_dscale_offset + CMPA_BLOCK_SZ * sizeof(half);
+#else
+            uint32_t k_dscale_offset = cur_block_id * k_quan_blk_stride + CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
                                        (kv_pos % CMPA_BLOCK_SZ) / CMPA_SUB_BLOCK_SZ * head_size *sizeof(half);
-            uint32_t k_zp_offset = CMPA_KVCACHE_U8 == 1 ?
-                                   k_dscale_offset + CMPA_BLOCK_SZ * sizeof(half) :
-                                   k_dscale_offset + CMPA_BLOCK_SZ / CMPA_SUB_BLOCK_SZ * head_size * sizeof(half);
+            uint32_t k_zp_offset = k_dscale_offset + CMPA_BLOCK_SZ / CMPA_SUB_BLOCK_SZ * head_size * sizeof(half);
+#endif
             uint32_t v_dscale_offset = cur_block_id * v_quan_blk_stride + CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) +
                                        kv_pos % CMPA_BLOCK_SZ * sizeof(half);
             uint32_t v_zp_offset = v_dscale_offset + CMPA_BLOCK_SZ * sizeof(half);

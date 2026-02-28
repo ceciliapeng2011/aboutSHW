@@ -764,6 +764,18 @@ if __name__ == "__main__":
                             print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                             test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
                             test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
+    #ACC test PA per channel
+    if 1:
+        seq_len = 32 * 1024
+        block_sz = 256
+        trunk_sz = seq_len
+        compressed_kv = 2
+        for sub_block_sz in [16, 32, 64, 128]:
+            print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+            print(f'[PA_BASE_ACC_TETS]: seq_len={seq_len} block_sz={block_sz} trunk_sz={trunk_sz} kv_cache=={"U8" if compressed_kv else "F16"} sparse_block_sz=1')
+            print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=trunk_sz, compressed_kvcache=compressed_kv, sub_block_sz=sub_block_sz, sparse_block_sz = 1, check_acc=True)
+            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=trunk_sz, compressed_kvcache=compressed_kv, sub_block_sz=sub_block_sz, sparse_block_sz = 1, check_acc=True)
     #ACC test sparse X Attention:
     if 0:
         for sparse_block_sz in [128, 256, 64,]:
