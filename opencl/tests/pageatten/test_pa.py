@@ -100,13 +100,14 @@ class page_atten_cm:
         q_step = CM_GRF_WIDTH // 32
         self.wg_seq_len = wg_size * q_step
 
-        src1 = r'''#include "cm_pa_kernel.hpp"'''
+        src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=}...")
 
         scale_factor = 1.0/(head_size**0.5)
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
+                      f' -DKERNEL_NAME=cm_page_attention'
                       f" -DCMFLA_NUM_HEADS={num_heads}"
                       f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
                       f" -DCMFLA_HEAD_SIZE={head_size}"
@@ -292,9 +293,9 @@ class page_atten_cm:
                         t_block_indices_begins,
                         t_subsequence_begins,
                         t_out,
+                        q_len,
                         t_block_mask,
                         t_block_mask_in_wg,
-                        q_len,
                         num_q_blocks,
                         num_k_blocks,
                     )
@@ -446,7 +447,7 @@ class page_atten_cm:
                 t_block_mask_in_wg = cl.tensor(block_mask_in_wg_list[trunk_idx].detach().numpy())
                 per_trunk_args.append(
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
-                     t_block_mask, t_block_mask_in_wg, q_len, num_q_blocks, num_k_blocks)
+                     q_len, t_block_mask, t_block_mask_in_wg, num_q_blocks, num_k_blocks)
                 )
             else:
                 per_trunk_args.append(
@@ -462,8 +463,8 @@ class page_atten_cm:
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
-                     t_block_mask, t_block_mask_in_wg, q_len, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk)
+                     q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
                 else:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
                      q_len) = args
@@ -475,8 +476,8 @@ class page_atten_cm:
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
-                     t_block_mask, t_block_mask_in_wg, q_len, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, t_block_mask, t_block_mask_in_wg, q_len, nq, nk)
+                     q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
                 else:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
                      q_len) = args
@@ -938,9 +939,9 @@ def test_ov():
             t_block_indices_begins,
             t_subsequence_begins,
             t_out,
+            q_len,
             t_block_mask,
             t_block_mask_in_wg,
-            q_len,
             num_q_blocks,
             num_k_blocks,
         )

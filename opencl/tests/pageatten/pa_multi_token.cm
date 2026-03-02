@@ -1,21 +1,11 @@
-/*******************************************************************************
- * Copyright (c) 2018-2026 Intel Corporation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *******************************************************************************/
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+namespace KERNEL_NAME {
 
 #ifdef CM_HAS_LSC_UNTYPED_2D
-#include "cm_pa_common.hpp"
+#include "cm_pa_xe2.hpp"
 #else
 #include "cm_pa_xe1.hpp"
 #endif
@@ -24,7 +14,7 @@
 #error "CMPA_WG_SEQ_LEN must be defined"
 #endif
 
-extern "C" _GENX_MAIN_ void cm_page_attention(
+extern "C" _GENX_MAIN_ void KERNEL_NAME(
     //query [q_len, num_heads, S]
 #ifdef CM_HAS_LSC_UNTYPED_2D
     half* query [[type("svmptr_t")]],
@@ -53,14 +43,14 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
+    int q_len,
 #if SPARSE_BLOCK_SIZE > 1
     bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
-    int q_len,
     int num_q_blocks,
     int num_k_blocks) {
 #else
-    int q_len) {
+    ) {
 #endif
     constexpr int is_causal = CMFLA_IS_CAUSAL;
     constexpr int num_heads = CMFLA_NUM_HEADS;
@@ -213,3 +203,4 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             block_indices);
 #endif
 }
+} // namespace KERNEL_NAME
