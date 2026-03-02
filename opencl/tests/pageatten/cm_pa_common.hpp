@@ -95,7 +95,6 @@ void pa_lsc_u8(
     auto q_tokens_left = q_len;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
-    static_assert(head_size % REG_N == 0, "head_size must be divisible by REG_N");
 
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
@@ -123,6 +122,7 @@ void pa_lsc_u8(
 
     constexpr int quan_blk_stride =
         CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE + 4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
+
     int causal_left = q_start + past_lens;
 
     constexpr uint slm_buff_size = kv_step * head_size * sizeof(half);
@@ -162,6 +162,7 @@ void pa_lsc_u8(
     // Maskless SLM loader for ACTIVE blocks (per-step skip removed)
     // ============================================================
     auto load_slm_KV_active = [&](int kv_pos, int blk_end, int kv_pos_in_block, int cur_block_id) {
+
         // Only load KV that will be consumed inside this active block.
         if (kv_pos >= blk_end) return;
         if (kv_pos >= kv_stop) return;
@@ -198,6 +199,7 @@ void pa_lsc_u8(
 
             for (int k = REG_K * wg_local_id; k < head_size; k += REG_K * (local_size / 2)) {
                 cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+
                 #pragma unroll
                 for (int r = 0; r < kv_step; r++) {
                     kmat[r] = quanKmat[r] - zp[r];
@@ -516,6 +518,7 @@ void pa_lsc_u8(
 
     #pragma unroll
     for (int k = 0, ri = 0; k < head_size; k += REG_N, ri += num_P_tiles) {
+
         #pragma unroll
         for (int p = 0; p < num_P_tiles; p++) {
             auto cO = rO[ri + p].format<float, REG_M, REG_N>();
@@ -524,14 +527,13 @@ void pa_lsc_u8(
             for (int r = 0; r < cO.n_rows(); r++) {
                 cur_O_f16[r + p * REG_M] = cm_mul<float>(cO.row(r), cur_sum[r + p * REG_M]);
             }
-            cm_store(b2dO.set_block_y(p * REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p));
         }
 
         b2dO.set_block_x(k);
         cm_store(b2dO.set_block_y(0),
-             cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
+                 cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
         cm_store(b2dO.set_block_y(REG_M),
-             cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
+                 cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
     }
 }
 
@@ -559,7 +561,7 @@ void pa_kernel_lsc_prefetch_f16(
     // constexpr uint k_pitch = is_qkv_fused ? q_pitch : (num_kv_heads * head_size * sizeof(half));
     // constexpr uint v_pitch = is_qkv_fused ? q_pitch : (num_kv_heads * head_size * sizeof(half));
     //[block_num, kv_heads, block_size, head_size]
-    constexpr uint k_pitch = head_size * sizeof(half);
+    constexpr uint k_pitch =  head_size * sizeof(half);
     constexpr uint v_pitch = k_pitch;
 
     vector<float, q_step> cur_max;
@@ -568,9 +570,8 @@ void pa_kernel_lsc_prefetch_f16(
     cur_max = -3e38f;
     cur_sum = 0;
     constexpr int num_P_tiles = REG_N / REG_M;
-    constexpr int VALUE_TILE_NUM = 1;
     matrix<half, head_size/REG_K, REG_K*REG_N> rQ;
-    matrix <float, head_size/REG_M, REG_M*REG_N> rO;
+    matrix <float, head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
 
 #if SPARSE_BLOCK_SIZE > 1
     constexpr int sb_shift = (SPARSE_BLOCK_SIZE == 128) ? 7 : (SPARSE_BLOCK_SIZE == 256) ? 8 : -1;
@@ -590,11 +591,10 @@ void pa_kernel_lsc_prefetch_f16(
     auto q_tokens_left = q_len;;
     static_assert(q_step == REG_N);
     static_assert(kv_step == REG_K);
-    static_assert(REG_N % REG_M == 0, "REG_N must be divisible by REG_M");
-    static_assert(head_size % REG_M == 0, "head_size must be divisible by REG_M");
 
     if (q_tokens_left < 0) q_tokens_left = 0;
     if (q_tokens_left > q_step) q_tokens_left = q_step;
+
     if (q_tokens_left > 0) {
         lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dQ(reinterpret_cast<uint*>(q_base), q_tokens_left - 1, head_size*sizeof(half) - 1, q_pitch - 1, 0, 0);
         #pragma unroll
@@ -606,10 +606,11 @@ void pa_kernel_lsc_prefetch_f16(
 
     lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
     lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
+
     static_assert(wg_local_size == 16);
     lsc::block_2d_desc<half, 1, kv_step/wg_local_size, REG_K> prefetch_K(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);
     lsc::block_2d_desc<half, 1, REG_K/wg_local_size, REG_N> prefetch_V(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, v_pitch - 1, 0, 0);
-    constexpr int blk_stride = CMFLA_NUM_KV_HEADS * CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
+    constexpr int blk_stride = CMFLA_NUM_KV_HEADS*CMFLA_HEAD_SIZE*CMPA_BLOCK_SZ;
     int causal_left = q_start+past_lens;
 
 #if OPTIMIZED_SPARSE_PIPELINE == 1
@@ -784,12 +785,12 @@ void pa_kernel_lsc_prefetch_f16(
         //# St = k @ Qt
         matrix<float, kv_step, q_step> St;
         {
-            constexpr int num_K = kv_step / REG_M;
+            constexpr int num_K = kv_step/REG_M;
             auto St2 = St.format<float, num_K, REG_M*REG_N>();
 
             matrix<half, num_K, REG_M * REG_K> Kmat;
 
-            prefetch_K.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+prefetch_block_id * blk_stride));
+            prefetch_K.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+prefetch_block_id*blk_stride));
             prefetch_K.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
 
@@ -801,13 +802,13 @@ void pa_kernel_lsc_prefetch_f16(
             }
 #endif
             b2dK.set_base_ptr((reinterpret_cast<half*>(k_cache_base)+cur_block_id*blk_stride));
-            b2dK.set_block_y(kv_pos % CMPA_BLOCK_SZ);
+            b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
             // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
             if ((kv_pos + kv_step) > kv_stop) {
                 auto valid_rows = kv_stop - kv_pos;
                 for (int r = valid_rows; r < kv_step; r++)
-                    Kmat.format<half, num_K * REG_M, REG_K>().row(r) = 0.f;
+                    Kmat.format<half, num_K*REG_M, REG_N>().row(r) = 0.f;
             }
             #pragma unroll
             for(int k = 0; k < num_K; k++)
@@ -820,12 +821,6 @@ void pa_kernel_lsc_prefetch_f16(
             for(int ri = 1; ri < head_size/REG_K; ri++) {
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
-                // somtimes KV cache would be filled with random Nan, so need to clean up the unused key data.
-                if ((kv_pos + kv_step) > kv_stop) {
-                    auto valid_rows = kv_stop - kv_pos;
-                    for (int r = valid_rows; r < kv_step; r++)
-                        Kmat.format<half, num_K * REG_M, REG_K>().row(r) = 0.f;
-                }
                 #pragma unroll
                 for(int k = 0; k < num_K; k++) {
                     St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
@@ -836,28 +831,11 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
         if constexpr (use_causal_mask) {
-            if constexpr (kv_step == q_step) {
-            // since kv_step == q_step == 16, causal_left is n * kv_step
+            // since kv_step == q_step == 16, causal_left is n*kv_step
             if (causal_left == 0) {
                 apply_causal_mask<1>(St);
             } else if (causal_left < 0) {
                 St = -3.4e38f;
-            }
-            } else {
-            if (causal_left == 0) {
-                // q_step is half of kv_step
-                // calsual mask first half of the kv
-                apply_causal_mask<1>(St.select<q_step, 1, q_step, 1>(0, 0));
-                St.select<q_step, 1, q_step, 1>(q_step, 0) = -3.4e38f;
-            } else if (causal_left < 0) {
-                St = -3.4e38f;
-            } else if (causal_left < kv_step) {
-                // q_step is half of kv_step
-                // calsual mask second half of the kv
-                // if w/o St += 0.f;, I will meet IGC: Internal Compiler Error: Access violation on ARL-H
-                St += 0.f;
-                apply_causal_mask<1>(St.select<q_step, 1, q_step, 1>(q_step, 0));
-            }
             }
             causal_left -= kv_step;
         } else {
@@ -866,7 +844,7 @@ void pa_kernel_lsc_prefetch_f16(
             for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         }
 
-        // show(St);
+        //show(St);
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
@@ -877,61 +855,66 @@ void pa_kernel_lsc_prefetch_f16(
 
         b2dV.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+cur_block_id*blk_stride));
         b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
-        auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
-        matrix<half, REG_K/2, REG_N*2*VALUE_TILE_NUM> Vmat;
-        #pragma unroll
-        for(int k = 0, ri=0; k < head_size; k += REG_N * VALUE_TILE_NUM, ri += num_P_tiles * VALUE_TILE_NUM) {
-            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
-            cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-            // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
-            if ((kv_pos + kv_step) > kv_stop) {
-                uint valid_rows = kv_stop - kv_pos;
-                uint valid_rows_vnni = (valid_rows+1)/2;
-                for (int r = valid_rows_vnni; r < REG_K/2; r++)
-                    Vmat.row(r) = 0.f;
-                if (valid_rows % 2 == 1)
-                    Vmat.row(valid_rows_vnni-1).select<REG_N, 2>(1) = 0.f;
+        if (kv_pos == 0) {
+            // ugemm_PV0(slm_V, P, rO, slm_offset);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            #pragma unroll
+            for(int k = 0, ri = 0; k < head_size; k += REG_N, ri += num_P_tiles) {
+                matrix<half, REG_K/2, REG_N*2> Vmat;
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+                if ((kv_pos + kv_step) > kv_stop) {
+                    uint valid_rows = kv_stop - kv_pos;
+                    uint valid_rows_vnni = (valid_rows+1)/2;
+                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                        Vmat.row(r) = 0.f;
+                    if (valid_rows % 2 == 1)
+                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
+                }
+                #pragma unroll
+                for(int p = 0; p < num_P_tiles; p++) {
+                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                                    0,
+                                    Vmat.format<int32_t>(),
+                                    P2.row(p).format<int32_t>());
+                }
             }
+        }
+        else {
+            //ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            #pragma unroll
+            for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
+                matrix<half, REG_K/2, REG_N*2> Vmat;
 
-            if (kv_pos == 0) {
-                #pragma unroll
-                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
-                    int rO_base = ri + tile * num_P_tiles;
-                    auto Vtile = Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile);
-                    #pragma unroll
-                    for (int p = 0; p < num_P_tiles; p++) {
-                        rO[rO_base + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
-                            0,
-                            Vtile.format<int32_t>(),
-                            P2.row(p).format<int32_t>());
-                    }
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
+                 // somtimes KV cache would be filled with random Nan, so need to clean up the unused value data.
+                if ((kv_pos + kv_step) > kv_stop) {
+                    uint valid_rows = kv_stop - kv_pos;
+                    uint valid_rows_vnni = (valid_rows+1)/2;
+                    for (int r = valid_rows_vnni; r < kv_step / 2; r++)
+                        Vmat.row(r) = 0.f;
+                    if (valid_rows % 2 == 1)
+                        Vmat.row(valid_rows_vnni-1).select<REG_N,2>(1) = 0.f;
                 }
-            } else {
+                //# compensate cur_O
+                //  matrix <float, head_size/REG_K*2, REG_M*REG_N> rO;
                 #pragma unroll
-                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
-                    int rO_base = ri + tile * num_P_tiles;
+                for(int p = 0; p < num_P_tiles; p++) {
+                    auto cO = rO[ri + p].format<float, REG_M, REG_N>();
                     #pragma unroll
-                    for(int p = 0; p < num_P_tiles; p++) {
-                        auto cO = rO[rO_base + p].format<float, REG_M, REG_N>();
-                        #pragma unroll
-                        for(int r = 0; r < REG_M; r++)
-                            cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
-                    }
+                    for(int r = 0; r < REG_M; r++)
+                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
                 }
 
                 #pragma unroll
-                for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
-                    int rO_base = ri + tile * num_P_tiles;
-                    auto Vtile =
-                        Vmat.format<half, REG_K/2, REG_N*2*VALUE_TILE_NUM>()
-                            .select<REG_K/2, 1, REG_N*2, 1>(0, REG_N*2*tile);
-                    #pragma unroll
-                    for (int p = 0; p < num_P_tiles; p++) {
-                        rO[rO_base + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
-                            rO[rO_base + p].format<float>(),
-                            Vtile.format<int32_t>(),
-                            P2.row(p).format<int32_t>());
-                    }
+                for(int p = 0; p < num_P_tiles; p++) {
+                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
+                                rO[ri + p].format<float>(),
+                                Vmat.format<int32_t>(),
+                                P2.row(p).format<int32_t>());
                 }
             }
         }
@@ -940,22 +923,25 @@ void pa_kernel_lsc_prefetch_f16(
     if (q_tokens_left == 0) return;
 
     //# save cur_O/cur_sum.transpose(0, 1)
-    matrix<half, num_P_tiles * REG_M, REG_N> cur_O_f16;
+    matrix<half, num_P_tiles*REG_M, REG_N> cur_O_f16;
     cur_sum = cm_inv(cur_sum);
 
     lsc::block_2d_desc<half, 1, REG_M, REG_N> b2dO(o_base, q_tokens_left - 1, head_size*sizeof(half) - 1, o_pitch - 1, 0, 0);
+
     #pragma unroll
     for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
-        b2dO.set_block_x(k);
         #pragma unroll
         for(int p = 0; p < num_P_tiles; p++) {
             auto cO = rO[ri + p].format<float, REG_M, REG_N>();
             #pragma unroll
             for(int r = 0; r < cO.n_rows(); r++) {
                 cur_O_f16[r + p*REG_M] = cm_mul<float>(cO.row(r), cur_sum[r + p*REG_M]);
+
             }
-            cm_store(b2dO.set_block_y(p * REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p));
         }
+        b2dO.set_block_x(k);
+        cm_store(b2dO.set_block_y(0), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
+        cm_store(b2dO.set_block_y(REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
     }
 }
 
