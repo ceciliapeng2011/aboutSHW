@@ -5,6 +5,8 @@ import numpy as np
 from collections import defaultdict
 from clops.utils import Colors
 
+from generate_block_mask import count_false_percentage
+
 torch.set_printoptions(linewidth=1024, precision=2)
 np.set_printoptions(precision=2, suppress=True)
 
@@ -13,21 +15,6 @@ def get_tensor(name, dtype=np.float16):
         data = f.read()
         np_data = np.frombuffer(data, dtype=dtype).copy()
         return torch.from_numpy(np_data)
-
-def count_false_percentage(mask):
-    B, H, NQ, NL = mask.shape
-    tril_mask = torch.tril(torch.ones((NQ, NL), dtype=torch.bool, device=mask.device))
-    expanded_tril = tril_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
-    # Count elements in the tril region
-    tril_elements = torch.sum(expanded_tril).item()
-    # Count False elements in the tril region
-    false_in_tril = torch.sum(~mask & expanded_tril).item()
-    # Calculate percentage
-    if tril_elements > 0:
-        false_percentage = (false_in_tril / tril_elements) * 100
-    else:
-        false_percentage = 0.0
-    return false_percentage
 
 def check_cuda_density(base, dump_name):
     base = '/home/ceciliapeng/OCL/xattn-cuda/'
@@ -94,8 +81,33 @@ def save_block_mask_csv_per_layer_head(block_mask: torch.Tensor, out_dir: str):
         for h in range(H):
             path = os.path.join(out_dir, f"block_mask_L{l:02d}_H{h:02d}.csv")
             np.savetxt(path, bm[l, h], fmt="%d", delimiter=",")
-  
-def check_ov_density(
+
+def verify_block_mask_integrity(block_mask: torch.Tensor):
+    """
+    Verify block_mask integrity.
+
+    Rules:
+      1) block_mask shape is [B, H, NQ, NL]
+      2) For each (B, H), the first column (NL=0) must be all True.
+    """
+    assert block_mask.dtype == torch.bool, "block_mask must be torch.bool"
+    assert block_mask.dim() == 4, "block_mask must be 4D [B, H, NQ, NL]"
+
+    B, H, NQ, NL = block_mask.shape
+    if NL == 0:
+        raise AssertionError("block_mask has NL=0; cannot verify first column")
+
+    first_col = block_mask[:, :, :, 0]
+    if not torch.all(first_col):
+        bad = (~first_col).nonzero(as_tuple=False)
+        sample = bad[:10].tolist()
+        raise AssertionError(
+            f"block_mask integrity failed: first column has False at {len(bad)} positions; sample={sample}"
+        )
+
+    return True
+
+def load_ov_model_block_mask(
     base_dir,
     xattn_block_size=128,
     prompt_len=32*1024,
@@ -169,11 +181,23 @@ def check_ov_density(
             # print(f'iter {i}, layer {idx} {filename} {cur_q_blocks=}, {cur_k_blocks=}')
             layer_mask = layer_mask.reshape([num_heads, cur_q_blocks, cur_k_blocks])
             block_mask[idx, :, i * cur_q_blocks : (i + 1) * cur_q_blocks, : cur_k_blocks] = layer_mask
-    
+
+    return block_mask
+
+def check_ov_density(
+    base_dir,
+    xattn_block_size=128,
+    prompt_len=32*1024,
+    pa_trunk_size=4*1024,
+    num_layers=36,
+    num_heads=32
+):
+    block_mask = load_ov_model_block_mask(base_dir, xattn_block_size, prompt_len, pa_trunk_size, num_layers, num_heads)
+
     # extra checks     
     # save_block_mask_csv_per_layer_head(block_mask, os.path.join(base_dir, "block_mask_csv"))
 
-    if xattn_block_size == 128:
+    if xattn_block_size == 128 and False:
         pct_per_pair, mean_pct, max_pct = paired_adjacent_row_diff_pct(block_mask)
         L, H, Q, K = block_mask.shape
         print(f"block_mask shape={block_mask.shape}, num_pairs={Q//2} (dropping last row if Q is odd)")
@@ -191,21 +215,37 @@ def check_ov_density(
         print(f'densities over heads {densities}')
         densities = np.array([100.0 - count_false_percentage(block_mask[b, :, :, :].reshape(1, H, NQ, NL)) for b in range (B)])
         print(f'densities over layers {densities}')
+        for l in range(B):
+            for h in range(H):
+                density = 100.0 - count_false_percentage(block_mask[l, h, :, :].reshape(1, 1, NQ, NL))
+                try:
+                    verify_block_mask_integrity(block_mask[l:l+1, h:h+1, :, :])
+                except AssertionError as exc:
+                    print(f"{Colors.RED}WARNING: block_mask integrity failed at L{l:02d} H{h:02d}: {exc}{Colors.END}")
+                print(f"L{l:02d} H{h:02d} | density={density:.2f}%")
 
     return 100.0 - count_false_percentage(block_mask)
 
 if __name__ == "__main__":
-    density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.9/dump_xattn_mask_bs128', xattn_block_size=128)
-    print(f'{Colors.BLUE}=============== density of OV with thresh 0.9 block size 128: {density:.2f}%  ==============={Colors.END}\n')
+    # density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.99/dump_xattn_mask_bs128', xattn_block_size=128)
+    # print(f'{Colors.BLUE}=============== density of OV with thresh 0.99 block size 128: {density:.2f}%  ==============={Colors.END}\n')
+    density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.99/dump_xattn_mask_bs256', xattn_block_size=256)
+    print(f'{Colors.BLUE}=============== density of OV with thresh 0.99 block size 256: {density:.2f}%  ==============={Colors.END}\n')
 
+    # density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.9/dump_xattn_mask_bs128', xattn_block_size=128)
+    # print(f'{Colors.BLUE}=============== density of OV with thresh 0.9 block size 128: {density:.2f}%  ==============={Colors.END}\n')
     density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.9/dump_xattn_mask_bs256', xattn_block_size=256)
     print(f'{Colors.BLUE}=============== density of OV with thresh 0.9 block size 256: {density:.2f}%  ==============={Colors.END}\n')
     
-    density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.6/dump_xattn_mask_bs128', xattn_block_size=128)
-    print(f'{Colors.BLUE}=============== density of OV with thresh 0.6 block size 128: {density:.2f}%  ==============={Colors.END}\n')
-
+    # density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.6/dump_xattn_mask_bs128', xattn_block_size=128)
+    # print(f'{Colors.BLUE}=============== density of OV with thresh 0.6 block size 128: {density:.2f}%  ==============={Colors.END}\n')
     density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.6/dump_xattn_mask_bs256', xattn_block_size=256)
     print(f'{Colors.BLUE}=============== density of OV with thresh 0.6 block size 256: {density:.2f}%  ==============={Colors.END}\n')
+    
+    # density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.1/dump_xattn_mask_bs128', xattn_block_size=128)
+    # print(f'{Colors.BLUE}=============== density of OV with thresh 0.1 block size 128: {density:.2f}%  ==============={Colors.END}\n')
+    density = check_ov_density('/home/ceciliapeng/toolbox/linux/xattn_thresh0.1/dump_xattn_mask_bs256', xattn_block_size=256)
+    print(f'{Colors.BLUE}=============== density of OV with thresh 0.1 block size 256: {density:.2f}%  ==============={Colors.END}\n')
 
     # def get_all_last_subdir_paths(base_path):
     #     last_subdirs = []

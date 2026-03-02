@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PA Task Output</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; color: #222; }
+    h1, h2 { margin-bottom: 0.2em; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    code { background: #f3f3f3; padding: 2px 4px; border-radius: 3px; }
+    .section { margin-bottom: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Page Attention Task Output</h1>
+
+  <div class="section">
+    <h2>Task 1</h2>
+    <h3>Instructions</h3>
+    <p>
+      SPARSE_BLOCK_SIZE is a compiling time const. Change opencl/tests/pageatten/cm_pa_common.hpp to reflect this.
+      Make sure it won't hamper performance when SPARSE_BLOCK_SIZE is 256. Run perfornace check yourself using test_pa.py across densities like 0.99, 0.66, 0.33, 0.11.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: remove runtime SPARSE_BLOCK_SIZE comparisons in sparse gating; keep compile-time branches only.</li>
+    </ul>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python test_pa.py</code> (invoked via an inline runner for custom densities)</p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, blocks_per_trunk=128, sparse_block_sz=256, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>467.499</td>
+          <td>18627</td>
+          <td>0.62</td>
+        </tr>
+        <tr>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>309.985</td>
+          <td>18886</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>0.33</td>
+          <td>0.34</td>
+          <td>163.923</td>
+          <td>18310</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>0.11</td>
+          <td>0.12</td>
+          <td>63.076</td>
+          <td>17426</td>
+          <td>0.58</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: make sparse gating compile-time (SB=256 perf 0.62/0.63/0.61/0.58 meet)</p>
+  </div>
+
+  <div class="section">
+    <h2>Task 1 (Update)</h2>
+    <h3>Instructions</h3>
+    <p>
+      SPARSE_BLOCK_SIZE is a compiling time const. Change opencl/tests/pageatten/cm_pa_common.hpp to reflect this.
+      Make sure it won't hamper performance when SPARSE_BLOCK_SIZE is 256. Run perfornace check yourself using test_pa.py across densities like 0.99, 0.66, 0.33, 0.11.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: gate sparse blocks by SPARSE_BLOCK_SIZE and keep kv-to-quant block indexing tied to CMPA_BLOCK_SZ.</li>
+    </ul>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, blocks_per_trunk=128, sparse_block_sz=256, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>482.471</td>
+          <td>18049</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>318.445</td>
+          <td>18384</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>0.33</td>
+          <td>0.34</td>
+          <td>168.341</td>
+          <td>17830</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>0.11</td>
+          <td>0.12</td>
+          <td>65.210</td>
+          <td>16856</td>
+          <td>0.56</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: gate sparse blocks by SB size (SB256 meet 0.60/0.61/0.59/0.56)</p>
+  </div>
+
+  <div class="section">
+    <h2>Task 3</h2>
+    <h3>Instructions</h3>
+    <p>
+      Let's only focus on CMPA_KVCACHE_U8 path for now. Analyze how to further improve when SPARSE_BLOCK_SIZE is 128.
+      Make sure it won't hamper performance when SPARSE_BLOCK_SIZE is 256. Give suggestion correspondingly to each
+      problem you identified.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: fix kv_pos_in_block to be relative to logical CMPA_BLOCK_SZ block.</li>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: ensure SLM prefetch is fenced before signaling barrier.</li>
+    </ul>
+
+    <h3>Accuracy Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Result:</strong> Both smoke accuracy cases of bs1 and bs256 completed without assertion (rtol_max 802.5, atol_max 0.0016479).</p>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, blocks_per_trunk=128, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>510.311</td>
+          <td>17237</td>
+          <td>0.57</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>483.741</td>
+          <td>18183</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>468.901</td>
+          <td>18571</td>
+          <td>0.62</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>311.695</td>
+          <td>18783</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.34</td>
+          <td>164.380</td>
+          <td>18259</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.12</td>
+          <td>63.461</td>
+          <td>17320</td>
+          <td>0.58</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>Fix U8 KV block offset + SLM barrier order; perf meet=0.57 (s1), 0.61/0.62/0.63/0.61/0.58 (s256 d=1.00/0.99/0.67/0.34/0.12)</p>
+  </div>
+
+  <div class="section">
+    <h2>Pre-fix Snapshot Commit</h2>
+    <h3>Instructions</h3>
+    <p>
+      Before fixes, commit current status with performance data in the commit message.
+      Append results in this HTML with task instructions and suggested commit message.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: add SPARSE_BLOCK_SIZE block loop in FP16 path, inline K/V prefetch + tail cleanup, and guard unsupported SB sizes.</li>
+      <li>opencl/tests/pageatten/test_pa.py: parameterize smoke tests with <code>compressed_kvcache</code> and set non-compressed roofline; default to run smoke tests with <code>compressed_kvcache=False</code>.</li>
+    </ul>
+
+    <h3>Accuracy Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Result:</strong> smoke accuracy (SB=1/256/128) passed with rtol_max 0.0009365 and atol_max 0.0002416.</p>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=False</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>483.797</td>
+          <td>18181</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>484.737</td>
+          <td>18146</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>480.377</td>
+          <td>18128</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>319.886</td>
+          <td>18148</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>153.275</td>
+          <td>18938</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>50.782</td>
+          <td>19053</td>
+          <td>0.64</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>488.369</td>
+          <td>18011</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>488.561</td>
+          <td>17824</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>366.052</td>
+          <td>15860</td>
+          <td>0.53</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>226.081</td>
+          <td>12839</td>
+          <td>0.43</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>138.732</td>
+          <td>6974</td>
+          <td>0.23</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: FP16 SB loop + perf (ckv=false meet sb1=0.61 sb256=0.60/0.60/0.60/0.63/0.64 sb128=0.60/0.59/0.53/0.43/0.23)</p>
+  </div>
+
+  <div class="section">
+    <h2>Task 4</h2>
+    <h3>Instructions</h3>
+    <p>
+      Precompute <code>cur_block_id</code> and <code>kv_pos_in_block</code> ahead of <code>load_slm_KV_active</code>.
+      Add static_assert checks for the optimized U8 quick path when
+      <code>SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN</code> and <code>CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE == 0</code>.
+    </p>
+
+    <h3>Changes</h3>
+    <ul>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: precompute <code>cur_block_id</code> and <code>kv_pos_in_block</code> before <code>load_slm_KV_active</code> calls to remove repeated division/modulo.</li>
+      <li>opencl/tests/pageatten/cm_pa_common.hpp: add static_asserts for the U8 quick path with <code>SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN</code> and <code>CMPA_BLOCK_SZ % SPARSE_BLOCK_SIZE == 0</code>.</li>
+    </ul>
+
+    <h3>Accuracy Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Result:</strong> smoke accuracy completed (rtol_max 802.5, atol_max 0.0016479).</p>
+
+    <h3>Performance Check</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=True</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>516.716</td>
+          <td>17023</td>
+          <td>0.57</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.01</td>
+          <td>498.190</td>
+          <td>17794</td>
+          <td>0.59</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>1.00</td>
+          <td>483.690</td>
+          <td>18144</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>316.924</td>
+          <td>18461</td>
+          <td>0.62</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>162.791</td>
+          <td>17970</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>57.734</td>
+          <td>16890</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>526.834</td>
+          <td>16761</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>523.450</td>
+          <td>16701</td>
+          <td>0.56</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>408.873</td>
+          <td>14254</td>
+          <td>0.48</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>274.205</td>
+          <td>10627</td>
+          <td>0.35</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>135.611</td>
+          <td>7163</td>
+          <td>0.24</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Performance Check (FP16)</h3>
+    <p><strong>Command:</strong> <code>python /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten/test_pa.py</code></p>
+    <p><strong>Config:</strong> seq_len=32768, block_sz=256, num_trunks=1, compressed_kvcache=False</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Sparse Block Size</th>
+          <th>Requested Density</th>
+          <th>Observed Density</th>
+          <th>Latency Avg (ms)</th>
+          <th>MFU (GFLOPS)</th>
+          <th>Meet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>479.600</td>
+          <td>18340</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>1.00</td>
+          <td>1.01</td>
+          <td>487.403</td>
+          <td>18188</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.99</td>
+          <td>1.00</td>
+          <td>482.680</td>
+          <td>18182</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.66</td>
+          <td>0.67</td>
+          <td>322.241</td>
+          <td>18157</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>155.259</td>
+          <td>18842</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>256</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>51.535</td>
+          <td>18922</td>
+          <td>0.63</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>1.00</td>
+          <td>1.00</td>
+          <td>484.316</td>
+          <td>18233</td>
+          <td>0.61</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.99</td>
+          <td>0.99</td>
+          <td>483.850</td>
+          <td>18068</td>
+          <td>0.60</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.66</td>
+          <td>0.66</td>
+          <td>360.642</td>
+          <td>16160</td>
+          <td>0.54</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.33</td>
+          <td>0.33</td>
+          <td>222.099</td>
+          <td>13121</td>
+          <td>0.44</td>
+        </tr>
+        <tr>
+          <td>128</td>
+          <td>0.11</td>
+          <td>0.11</td>
+          <td>139.695</td>
+          <td>6953</td>
+          <td>0.23</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Suggested Commit Message</h3>
+    <p>pageatten: precompute U8 KV block indices; quick path SB==WG (U8 perf sb1=0.57 sb256=0.59/0.60/0.62/0.60/0.56 sb128=0.56/0.56/0.48/0.35/0.24; FP16 perf sb1=0.61 sb256=0.61/0.61/0.61/0.63/0.63 sb128=0.61/0.60/0.54/0.44/0.23)</p>
+  </div>
+</body>
+</html>

@@ -14,8 +14,15 @@
  * limitations under the License.
  *******************************************************************************/
 
+#ifdef CM_HAS_LSC_UNTYPED_2D
 #include "cm_pa_common.hpp"
+#else
 #include "cm_pa_xe1.hpp"
+#endif
+
+#ifndef CMPA_WG_SEQ_LEN
+#error "CMPA_WG_SEQ_LEN must be defined"
+#endif
 
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
@@ -46,13 +53,12 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
     int q_len,
     int num_q_blocks,
-    int num_k_blocks,
-    int SPARSE_BLOCK_SIZE) {
+    int num_k_blocks) {
 #else
     int q_len) {
 #endif
@@ -86,7 +92,11 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
 
     // multiple work-groups are required to split a sequence,
     // need to figure out which part of query-tokens to process
+#if defined(CMPA_WG_SEQ_LEN)
+    constexpr int wg_seq_len = CMPA_WG_SEQ_LEN;
+#else
     int wg_seq_len = local_size * q_step;
+#endif
     int past_q_lens = past_lens[0];
     kv_start = 0;
     kv_seq_len = q_len + past_q_lens;
@@ -131,7 +141,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
     uint q_offset = (q_start_sg*num_heads + h)*head_size;
     uint q_offset_bytes = q_offset * sizeof(half);
 
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
     bool *block_mask_base, *wg_block_mask_base;
     //# sparse_block_mask [num_heads, num_q_blocks, num_k_blocks]
     //# sparse_block_mask_wg [num_heads, wg_count_along_query, num_k_blocks]
@@ -165,10 +175,9 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             v_cache_stateful,
                             kv_offset_bytes,
 #endif
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
@@ -195,10 +204,9 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             v_cache_stateful,
                             kv_offset_bytes,
 #endif
-#if IS_BLOCK_SPARSE
+#if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),
-                            SPARSE_BLOCK_SIZE,
 #endif
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
