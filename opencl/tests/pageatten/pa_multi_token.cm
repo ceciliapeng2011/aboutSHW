@@ -43,15 +43,14 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
-    int q_len,
+    int q_len
 #if SPARSE_BLOCK_SIZE > 1
-    bool* sparse_block_mask [[type("svmptr_t")]],
+    , bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
     int num_q_blocks,
-    int num_k_blocks) {
-#else
-    ) {
+    int num_k_blocks
 #endif
+    ) {
     constexpr int is_causal = CMFLA_IS_CAUSAL;
     constexpr int num_heads = CMFLA_NUM_HEADS;
     constexpr int head_size = CMFLA_HEAD_SIZE;
