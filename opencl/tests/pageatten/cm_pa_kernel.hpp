@@ -15,7 +15,7 @@
  *******************************************************************************/
 
 #include "cm_pa_common.hpp"
-
+#include "cm_pa_xe1.hpp"
 
 extern "C" _GENX_MAIN_ void cm_page_attention(
     //query [q_len, num_heads, S]
