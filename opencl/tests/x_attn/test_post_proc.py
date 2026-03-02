@@ -5,7 +5,8 @@ import numpy as np
 from clops import cl
 from clops.utils import Colors
 from clops import compare
-
+xe_arch = 2
+print(f"xe_arch: {xe_arch}")
 def div_up(a, b):
     return (a + b - 1) // b
 def rnd_up(a, b):
@@ -93,7 +94,8 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
 
 def main():
     test_post_proc(BLOCK_SIZE = 128)
-    test_post_proc(BLOCK_SIZE = 256)
+    if xe_arch == 2:
+        test_post_proc(BLOCK_SIZE = 256)
 
 if __name__ == "__main__":
     torch.manual_seed(3)
