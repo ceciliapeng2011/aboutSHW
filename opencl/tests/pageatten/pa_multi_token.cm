@@ -10,10 +10,6 @@ namespace KERNEL_NAME {
 #include "cm_pa_xe1.hpp"
 #endif
 
-#ifndef CMPA_WG_SEQ_LEN
-#error "CMPA_WG_SEQ_LEN must be defined"
-#endif
-
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     //query [q_len, num_heads, S]
 #ifdef CM_HAS_LSC_UNTYPED_2D

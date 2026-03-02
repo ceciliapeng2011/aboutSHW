@@ -117,7 +117,6 @@ class page_atten_cm:
                       f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
                       f" -DCMPA_WG_SEQ_LEN={int(self.wg_seq_len)}"
                       f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
-                      f" -DCMPA_XE_ARCH={int(xe_arch)}"
                       f" -mdump_asm -g2")
                      )
 
