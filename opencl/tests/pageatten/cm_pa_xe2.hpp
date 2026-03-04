@@ -15,8 +15,6 @@
  *******************************************************************************/
 #ifdef CM_HAS_LSC_UNTYPED_2D
 
-#include "cm_attention_common.hpp"
-
 #ifndef CMPA_WG_SEQ_LEN
 #error "CMPA_WG_SEQ_LEN must be defined"
 #endif
