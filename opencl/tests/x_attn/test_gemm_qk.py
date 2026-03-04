@@ -16,8 +16,23 @@ def div_up(a, b):
 def rnd_up(a, b):
     return (a + b - 1) // b * b
 
-xe_arch = 2
+def get_cm_grf_width():
+    cm_kernels = cl.kernels(r'''
+    extern "C" _GENX_MAIN_ void cm_get_grf_width(int * info [[type("svmptr_t")]]) {
+        info[0] = CM_GRF_WIDTH;
+    }''', f"-cmc")
+    t_info = cl.tensor([2], np.dtype(np.int32))
+    cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
+    return t_info.numpy()[0]
+
+CM_GRF_WIDTH = get_cm_grf_width()
+print(f"{CM_GRF_WIDTH=}")
+if CM_GRF_WIDTH == 256:
+    xe_arch = 1
+else:
+    xe_arch = 2
 print(f"xe_arch: {xe_arch}")
+
 DUMP_ENQUEUE_ARGUMENTS = True
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'

@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 import numpy as np
 
+from clops import cl
+
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
 
@@ -71,7 +73,21 @@ def get_tensor(name, dtype=np.float16):
         return torch.from_numpy(np_data)
 
 #xe_arch: 1: xe, 2: xe2
-xe_arch = 2
+def get_cm_grf_width():
+    cm_kernels = cl.kernels(r'''
+    extern "C" _GENX_MAIN_ void cm_get_grf_width(int * info [[type("svmptr_t")]]) {
+        info[0] = CM_GRF_WIDTH;
+    }''', f"-cmc")
+    t_info = cl.tensor([2], np.dtype(np.int32))
+    cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
+    return t_info.numpy()[0]
+
+CM_GRF_WIDTH = get_cm_grf_width()
+print(f"{CM_GRF_WIDTH=}")
+if CM_GRF_WIDTH == 256:
+    xe_arch = 1
+else:
+    xe_arch = 2
 print(f"xe_arch: {xe_arch}")
 
 if xe_arch == 1:
@@ -613,7 +629,6 @@ print("GPU cm kernels for flash attn2:")
 #====================================================================================================
 # using the same parameter & inputs, develop cm kernels which produces the same output
 # prototyping CM kernels
-from clops import cl
 import numpy as np
 import time
 
