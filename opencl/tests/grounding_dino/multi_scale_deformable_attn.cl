@@ -77,7 +77,7 @@ __kernel void multi_scale_deformable_attn(
 
     __global scalar_t *data_col_ptr = data_col + index;
     int data_weight_ptr = sampling_index * num_levels * num_point;
-    int data_loc_w_ptr = dsata_weight_ptr << 1;
+    int data_loc_w_ptr = data_weight_ptr << 1;
     const int qid_stride = num_heads * embed_dims;
     const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
     scalar_t col = 0;
