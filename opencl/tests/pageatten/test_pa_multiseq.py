@@ -245,45 +245,83 @@ def serialize_round_plans_for_single_subsequence(round_plans: list[RoundPlan]) -
 
 
 class PagedAttentionRuntime:
-    def __init__(self, num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, is_causal=True):
+    def __init__(
+        self,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_sz,
+        compressed_kvcache,
+        is_causal=True,
+        sparse_block_size=1,
+        enable_hybrid_dispatch=True,
+    ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.block_sz = block_sz
         self.compressed_kvcache = compressed_kvcache
         self.is_causal = is_causal
+        self.sparse_block_size = sparse_block_size
+        self.enable_hybrid_dispatch = enable_hybrid_dispatch
 
-        wg_size = 16
-        q_step = CM_GRF_WIDTH // 32
-        self.wg_seq_len = wg_size * q_step
+        self.q_step = CM_GRF_WIDTH // 32
+        self.max_wg_size = 16       # Most optimal thread numbers per workgroup
+        self.optimized_wg_seq_len = self.max_wg_size * self.q_step
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_heads=} {head_size=}...")
 
         scale_factor = 1.0 / (head_size ** 0.5)
-        self.kernels = cl.kernels(
-            src1,
-            (
-                f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
-                f' -DKERNEL_NAME=cm_page_attention'
-                f" -DCMFLA_NUM_HEADS={num_heads}"
-                f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
-                f" -DCMFLA_HEAD_SIZE={head_size}"
-                f" -DCMFLA_SCALE_FACTOR={scale_factor}"
-                f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
-                f" -DCMPA_BLOCK_SZ={self.block_sz}"
-                f" -DSPARSE_BLOCK_SIZE=1"
-                f" -DCMPA_WG_SEQ_LEN={int(self.wg_seq_len)}"
-                f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
-                f" -mdump_asm -g2"
-            ),
+        base_options = (
+            f' -cmc -Qxcm_register_file_size=256'
+            f' -I{cwd}'
+            f' -Qxcm_jit_option="-abortonspill" -mCM_printregusage'
+            f" -mdump_asm -g2"
+            f' -DKERNEL_NAME=cm_page_attention'
+            f" -DCMFLA_NUM_HEADS={int(num_heads)}"
+            f" -DCMFLA_NUM_KV_HEADS={int(num_kv_heads)}"
+            f" -DCMFLA_HEAD_SIZE={int(head_size)}"
+            f" -DCMFLA_SCALE_FACTOR={scale_factor}"
+            f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
+            f" -DCMPA_BLOCK_SZ={int(self.block_sz)}"
+            f" -DSPARSE_BLOCK_SIZE={int(self.sparse_block_size)}"
+            f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
         )
+
+        # Generic dynamic path (uses runtime local size to derive wg_seq_len in kernel).
+        dynamic_options = base_options
+        self.kernels_dynamic = cl.kernels(src1, dynamic_options)
+
+        # Optional optimized path (compile-time fixed CMPA_WG_SEQ_LEN), only valid for sparse 128/256.
+        self.kernels_optimized = None
+        if self.sparse_block_size in (128, 256):
+            optimized_options = base_options + f" -DCMPA_WG_SEQ_LEN={int(self.optimized_wg_seq_len)}"
+            self.kernels_optimized = cl.kernels(src1, optimized_options)
 
     @staticmethod
     @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, is_causal):
-        return PagedAttentionRuntime(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, is_causal)
+    def create_instance(
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_sz,
+        compressed_kvcache,
+        is_causal,
+        sparse_block_size=1,
+        enable_hybrid_dispatch=True,
+    ):
+        return PagedAttentionRuntime(
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_sz,
+            compressed_kvcache,
+            is_causal,
+            sparse_block_size=sparse_block_size,
+            enable_hybrid_dispatch=enable_hybrid_dispatch,
+        )
 
     def _reshape_cache_for_kernel(self, cache: torch.Tensor) -> torch.Tensor:
         if self.compressed_kvcache:
@@ -381,12 +419,41 @@ class PagedAttentionRuntime:
             t_block_indices_begins = cl.tensor(round_inputs.block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(round_inputs.subsequence_begins.detach().numpy())
 
-            wg_size = 16
-            wg_count = DIV_UP(batch_size_in_tokens, self.wg_seq_len)
+            max_subsequence_q_len = 0
+            for sequence_index in range(len(round_inputs.subsequences)):
+                q_start = int(round_inputs.subsequence_begins[sequence_index].item())
+                q_end = int(round_inputs.subsequence_begins[sequence_index + 1].item())
+                subsequence_q_len = q_end - q_start
+                if subsequence_q_len > max_subsequence_q_len:
+                    max_subsequence_q_len = subsequence_q_len
+
+            q_step = self.q_step
+            wg_size = DIV_UP(max_subsequence_q_len, q_step) if max_subsequence_q_len > 0 else 1
+            if wg_size > self.max_wg_size:
+                wg_size = self.max_wg_size
+            wg_seq_len = wg_size * q_step
+
+            wg_count = 0
+            for sequence_index in range(len(round_inputs.subsequences)):
+                q_start = int(round_inputs.subsequence_begins[sequence_index].item())
+                q_end = int(round_inputs.subsequence_begins[sequence_index + 1].item())
+                subsequence_q_len = q_end - q_start
+                wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
             gws = [1, self.num_heads, int(wg_count * wg_size)]
             lws = [1, 1, wg_size]
 
+            use_optimized_dispatch = (
+                self.enable_hybrid_dispatch
+                and self.kernels_optimized is not None
+                and self.sparse_block_size in (128, 256)
+                and wg_size == self.max_wg_size
+                and self.optimized_wg_seq_len == self.sparse_block_size
+            )
+            selected_kernels = self.kernels_optimized if use_optimized_dispatch else self.kernels_dynamic
+            dispatch_mode = "optimized" if use_optimized_dispatch else "dynamic"
+
             print("[enqueue] gws=", gws, "lws=", lws)
+            print("[enqueue] dispatch_mode=", dispatch_mode)
             print("[enqueue] q.shape=", tuple(q_tensor.shape), "q.dtype=", q_tensor.dtype)
             print("[enqueue] key_cache.shape=", tuple(kernel_key_cache.shape), "key_cache.dtype=", kernel_key_cache.dtype)
             print("[enqueue] value_cache.shape=", tuple(kernel_value_cache.shape), "value_cache.dtype=", kernel_value_cache.dtype)
@@ -396,7 +463,7 @@ class PagedAttentionRuntime:
             print("[enqueue] subsequence_begins=", round_inputs.subsequence_begins.tolist())
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
 
-            self.kernels.enqueue(
+            selected_kernels.enqueue(
                 "cm_page_attention",
                 gws,
                 lws,

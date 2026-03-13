@@ -16,7 +16,9 @@
 #ifdef CM_HAS_LSC_UNTYPED_2D
 
 #ifndef CMPA_WG_SEQ_LEN
-#error "CMPA_WG_SEQ_LEN must be defined"
+// Keep fixed-WG optimized path optional.
+// When undefined, default to 0 so OPTIMIZED_SPARSE_PIPELINE is disabled.
+#define CMPA_WG_SEQ_LEN 0
 #endif
 
 #ifndef SPARSE_BLOCK_SIZE
