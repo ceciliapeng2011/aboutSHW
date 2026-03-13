@@ -3,11 +3,15 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
 from clops import cl
 
+cl.profiling(True)
+torch.manual_seed(0)
+torch.set_printoptions(linewidth=1024)
 
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
@@ -363,56 +367,51 @@ class PagedAttentionRuntime:
         cl.finish()
 
         for _ in range(n_repeats):
-            for sequence_index, subsequence in enumerate(round_inputs.subsequences):
-                q_start = int(round_inputs.subsequence_begins[sequence_index].item())
-                q_end = int(round_inputs.subsequence_begins[sequence_index + 1].item())
-                blk_start = int(round_inputs.block_indices_begins[sequence_index].item())
-                blk_end = int(round_inputs.block_indices_begins[sequence_index + 1].item())
+            q_tensor = round_inputs.query.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
+            kernel_key_cache = self._reshape_cache_for_kernel(round_inputs.key_cache.contiguous())
+            kernel_value_cache = self._reshape_cache_for_kernel(round_inputs.value_cache.contiguous())
+            out_shape = (batch_size_in_tokens, self.num_heads, self.head_size)
 
-                q_len = q_end - q_start
-                physical_blocks = round_inputs.block_indices[blk_start:blk_end]
-                num_local_blocks = int(physical_blocks.numel())
-                q_tensor = round_inputs.query[q_start:q_end].reshape(q_len, self.num_heads, self.head_size).contiguous()
+            t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
+            t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
+            t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
+            t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
+            t_past_lens = cl.tensor(round_inputs.past_lens.detach().numpy())
+            t_block_indices = cl.tensor(round_inputs.block_indices.detach().numpy())
+            t_block_indices_begins = cl.tensor(round_inputs.block_indices_begins.detach().numpy())
+            t_subsequence_begins = cl.tensor(round_inputs.subsequence_begins.detach().numpy())
 
-                # NOTE: Current workaround for one-subsequence kernel path:
-                # each subsequence gets local KV cache and local block-indices [0..N-1].
-                # TODO(enable_real_multi_subsequence): keep one shared cache tensor
-                # and pass global block_indices/block_indices_begins across subsequences.
-                local_key_cache = round_inputs.key_cache[physical_blocks].contiguous()
-                local_value_cache = round_inputs.value_cache[physical_blocks].contiguous()
-                kernel_key_cache = self._reshape_cache_for_kernel(local_key_cache)
-                kernel_value_cache = self._reshape_cache_for_kernel(local_value_cache)
+            wg_size = 16
+            wg_count = DIV_UP(batch_size_in_tokens, self.wg_seq_len)
+            gws = [1, self.num_heads, int(wg_count * wg_size)]
+            lws = [1, 1, wg_size]
 
-                t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
-                t_out = cl.tensor([q_len, self.num_heads, self.head_size], np.dtype(np.float16))
-                t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
-                t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
-                t_past_lens = cl.tensor(round_inputs.past_lens[sequence_index:sequence_index + 1].detach().numpy())
-                t_block_indices = cl.tensor(np.arange(num_local_blocks, dtype=np.int32))
-                t_block_indices_begins = cl.tensor(np.array([0, num_local_blocks], dtype=np.int32))
-                t_subsequence_begins = cl.tensor(np.array([0, q_len], dtype=np.int32))
+            print("[enqueue] gws=", gws, "lws=", lws)
+            print("[enqueue] q.shape=", tuple(q_tensor.shape), "q.dtype=", q_tensor.dtype)
+            print("[enqueue] key_cache.shape=", tuple(kernel_key_cache.shape), "key_cache.dtype=", kernel_key_cache.dtype)
+            print("[enqueue] value_cache.shape=", tuple(kernel_value_cache.shape), "value_cache.dtype=", kernel_value_cache.dtype)
+            print("[enqueue] past_lens=", round_inputs.past_lens.tolist())
+            print("[enqueue] block_indices=", round_inputs.block_indices.tolist())
+            print("[enqueue] block_indices_begins=", round_inputs.block_indices_begins.tolist())
+            print("[enqueue] subsequence_begins=", round_inputs.subsequence_begins.tolist())
+            print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
 
-                wg_size = 16
-                wg_count = DIV_UP(q_len, self.wg_seq_len)
-                gws = [1, self.num_heads, int(wg_count * wg_size)]
-                lws = [1, 1, wg_size]
+            self.kernels.enqueue(
+                "cm_page_attention",
+                gws,
+                lws,
+                t_q,
+                t_key_cache,
+                t_value_cache,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                batch_size_in_tokens,
+            )
 
-                self.kernels.enqueue(
-                    "cm_page_attention",
-                    gws,
-                    lws,
-                    t_q,
-                    t_key_cache,
-                    t_value_cache,
-                    t_past_lens,
-                    t_block_indices,
-                    t_block_indices_begins,
-                    t_subsequence_begins,
-                    t_out,
-                    q_len,
-                )
-
-                output[q_start:q_end] = torch.from_numpy(t_out.numpy().reshape(q_len, -1))
+            output = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
 
         return output
 
@@ -550,22 +549,22 @@ def reference_round(runtime: PagedAttentionRuntime, round_inputs: PagedAttention
     return torch.cat(refs, dim=0)
 
 
-def test_page_attn_causal_batch1(seq_len, num_heads=16, num_kv_heads=16, head_size=80, block_sz=128, trunk_sz=512, compressed_kvcache=False, enable_prefix_caching=False, check_acc=True):
-    return test_page_attn_causal_multiseq(
+def run_page_attn_causal_batch1(seq_len, num_heads=2, num_kv_heads=1, head_size=32, block_sz=32, compressed_kvcache=False, max_num_batched_tokens=256, dynamic_split_fuse=True, check_acc=True):
+    return run_page_attn_causal_multiseq(
         sessions=[SessionDescriptor(num_input_tokens=seq_len, num_output_tokens=0)],
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         block_sz=block_sz,
-        trunk_sz=trunk_sz,
         compressed_kvcache=compressed_kvcache,
-        enable_prefix_caching=enable_prefix_caching,
-        max_num_batched_tokens=seq_len,
+        enable_prefix_caching=False,
+        max_num_batched_tokens=max_num_batched_tokens,
+        dynamic_split_fuse=dynamic_split_fuse,
         check_acc=check_acc,
     )
 
 
-def test_page_attn_causal_multiseq(sessions=None, num_heads=4, num_kv_heads=2, head_size=128, block_sz=128, trunk_sz=512, compressed_kvcache=False, enable_prefix_caching=False, max_num_batched_tokens=None, dynamic_split_fuse=True, check_acc=True, return_rounds=False):
+def run_page_attn_causal_multiseq(sessions=None, num_heads=2, num_kv_heads=1, head_size=32, block_sz=32, compressed_kvcache=False, enable_prefix_caching=False, max_num_batched_tokens=256, dynamic_split_fuse=True, check_acc=True, return_rounds=False):
     if enable_prefix_caching:
         # NOTE: Prefix caching is not modeled in this standalone PA harness yet.
         # TODO(enable_prefix_caching): emulate hash-based shared KV block reuse.
@@ -578,15 +577,11 @@ def test_page_attn_causal_multiseq(sessions=None, num_heads=4, num_kv_heads=2, h
     ]
 
     scheduler = ContinuousBatchingScheduler(
-        max_num_batched_tokens=max_num_batched_tokens or trunk_sz,
-        max_subsequence_tokens=trunk_sz,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_subsequence_tokens=max_num_batched_tokens,
         dynamic_split_fuse=dynamic_split_fuse,
     )
     round_plans = scheduler.schedule(descriptors)
-    # NOTE: Keep this shim while kernel only supports one subsequence per enqueue.
-    # TODO(enable_real_multi_subsequence): delete this line and submit
-    # scheduler output directly once multi-subsequence kernel support lands.
-    round_plans = serialize_round_plans_for_single_subsequence(round_plans)
     runtime = PagedAttentionRuntime.create_instance(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, True)
 
     round_outputs = []
@@ -611,24 +606,101 @@ def test_page_attn_causal_multiseq(sessions=None, num_heads=4, num_kv_heads=2, h
     return flat_output
 
 
-if __name__ == "__main__":
-    cl.profiling(True)
-    torch.manual_seed(0)
-    torch.set_printoptions(linewidth=1024)
-    
-    # test_page_attn_causal_batch1(seq_len=128, num_heads=16, num_kv_heads=16, head_size=80, block_sz=128, trunk_sz=512, compressed_kvcache=False, check_acc=True)
-
-    test_page_attn_causal_multiseq(
-        sessions=[
-            SessionDescriptor(num_input_tokens=128, num_output_tokens=1),
-            SessionDescriptor(num_input_tokens=192, num_output_tokens=1),
-        ],
-        num_heads=2,
-        num_kv_heads=1,
-        head_size=32,
-        block_sz=32,
-        trunk_sz=128,
-        compressed_kvcache=False,
-        max_num_batched_tokens=128,
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,seq_len,trunk_size",
+    [
+        (2, 1, 32, 32, False, 128, 128),
+        (4, 2, 64, 32, False, 128, 128),
+        (4, 1, 64, 64, True, 128, 128),
+        (2, 1, 32, 32, False, 96, 128),
+    ],
+)
+def test_pa_batch1_pytest_configs(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, seq_len, trunk_size):
+    run_page_attn_causal_batch1(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        dynamic_split_fuse=True,
         check_acc=True,
     )
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 128),
+        (4, 2, 64, 32, False, 128),
+        (4, 1, 64, 64, True, 128),
+    ],
+)
+def test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    run_page_attn_causal_multiseq(
+        sessions=[
+            SessionDescriptor(num_input_tokens=trunk_size, num_output_tokens=0),
+            SessionDescriptor(num_input_tokens=trunk_size + 64, num_output_tokens=0),
+        ],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        check_acc=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 64),
+        (4, 2, 64, 32, False, 128),
+        (4, 1, 64, 64, True, 128),
+    ],
+)
+def test_pa_multiseq_pytest_prefill_batch_size_in_sequences_2(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    run_page_attn_causal_multiseq(
+        sessions=[
+            SessionDescriptor(num_input_tokens=trunk_size // 2, num_output_tokens=0),
+            SessionDescriptor(num_input_tokens=trunk_size // 2, num_output_tokens=0),
+        ],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        check_acc=True,
+    )
+
+# '''
+# Usage:
+
+# # `py_compile` to verify syntax correctness of the test file before running pytest.
+# python -m py_compile test_pa_multiseq.py
+
+# # `-q` for quieter pytest output, and `-k` to select the specific test to run.
+# python -m pytest -q test_pa_multiseq.py -k test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1
+
+# # `-s` to show captured print statement for debugging purposes.
+# python -m pytest -s test_pa_multiseq.py -k test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1
+
+# '''
+
