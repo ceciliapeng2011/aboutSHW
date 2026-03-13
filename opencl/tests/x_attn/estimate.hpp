@@ -33,6 +33,10 @@
 #define ATTR_BUF [[type("buffer_t")]]
 #endif
 
+#ifndef KV_CACHE_COMPRESSION
+#define KV_CACHE_COMPRESSION 0
+#endif
+
 #define MYMIN(x, y) ((x) < (y) ? (x) : (y))
 
 template<typename T, int N>
@@ -378,7 +382,7 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     uint block_idx = (uint)(id_wg_n * BLOCK_WG_N + id_sg_n * BLOCK_SG_N) * STRIDE / KV_BLOCK_SIZE;
     uint max_block_idx = (uint)(N * STRIDE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE - 1;
     block_idx = MYMIN(block_idx, max_block_idx);
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
     uint offset = block_indices_p[block_idx] * (HK * KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
     lsc::block_2d_desc<int, 1, KEY_LINES_PER_LOAD, 8> desc_b0{ key_cache + offset, KEY_LINES_PER_LOAD - 1, (uint)(K * sizeof(char) - 1), (uint)(K * sizeof(char) - 1),
         0, 0 };
@@ -399,7 +403,7 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     // N[:]xK[0:32]                                                     --> 16 * 1 regs
     matrix<int, KEY_LINES_PER_LOAD, 8> b0_up_s8, b0_down_s8, b1_up_s8, b1_down_s8;
     matrix<half, 2, BLOCK_REG_B> b0;                      // --> 16 regs
-    #if QUANTIZATION_BY_TOKEN
+    #if (KV_CACHE_COMPRESSION == 1)
     matrix<half, 2, KEY_LINES_PER_LOAD * 2> scales, zps;
     matrix<half, 2, KV_BLOCK_SIZE> scales_block, zps_block;
     #else
@@ -434,9 +438,9 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     }
 
     // load b: N[0:16]xK[0:16]
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
     {
-        #if QUANTIZATION_BY_TOKEN
+        #if (KV_CACHE_COMPRESSION == 1)
         lsc::block_2d_desc<int, 1, 16, 16 / 2> desc_scale{ key_cache + scale_offset0, 16 * 2 - 1, (uint)(16 * sizeof(half) - 1), (uint)(16 * sizeof(half) - 1),
             0, 0 };
         matrix<half, 16, 16> tmp_scale, tmp_zp;
@@ -472,8 +476,8 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
         desc_b1.set_block_x(desc_b1.get_block_x() + 8);
     }
 
-#if USE_INT8
-    #if QUANTIZATION_BY_TOKEN
+#if (KV_CACHE_COMPRESSION != 0)
+    #if (KV_CACHE_COMPRESSION == 1)
     auto dec = [&](vector<int, 64> B0_i8, vector<int, 64> B1_i8, matrix_ref<half, REG_N, BLOCK_REG_B> B0) {
 #pragma unroll
         for (int n = 0; n < REG_N; n++) {
@@ -551,7 +555,7 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
     };
 
     for (uint s = 0; s < STRIDE; s++) {
-#if USE_INT8 && QUANTIZATION_BY_TOKEN
+#if (KV_CACHE_COMPRESSION == 1)
         auto tmp = scales_block[0].select<16, 1>(s * 16);
         scales[0].select<16, 2>(0) = tmp;
         scales[0].select<16, 2>(1) = scales[0].select<16, 2>(0);
@@ -583,10 +587,10 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
                 // load b: N[0:16*2]xK[16:32]
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1_up_s8.format<int>(), desc_b0);
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b1_down_s8.format<int>(), desc_b1);
-                #if QUANTIZATION_BY_TOKEN
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b0_up_s8.format<int>().select<64, 1>(), b0_down_s8.format<int>().select<64, 1>(), b0);
                 dot(a0, b0);
                 #else
@@ -609,8 +613,8 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
 
-#if USE_INT8
-                #if QUANTIZATION_BY_TOKEN
+#if (KV_CACHE_COMPRESSION != 0)
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b0_up_s8.format<int>().select<64, 1>(64), b0_down_s8.format<int>().select<64, 1>(64), b0);
                 dot(a0, b0);
                 #else
@@ -639,10 +643,10 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
 
                 // load b: N[0:16*2]xK[32:64]
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_up_s8.format<int>(), desc_b0);
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_down_s8.format<int>(), desc_b1);
-                #if QUANTIZATION_BY_TOKEN
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b1_up_s8.format<int>().select<64, 1>(), b1_down_s8.format<int>().select<64, 1>(), b0);
                 dot(a0, b0);
                 #else
@@ -670,8 +674,8 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                     desc_a.set_block_x(desc_a.get_block_x() + 16);
                 }
 
-#if USE_INT8
-                #if QUANTIZATION_BY_TOKEN
+#if (KV_CACHE_COMPRESSION != 0)
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b1_up_s8.format<int>().select<64, 1>(64), b1_down_s8.format<int>().select<64, 1>(64), b0);
                 dot(a0, b0);
                 #else
@@ -698,11 +702,11 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                 // load a: M[0:16*4]xK[0:16]
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0,  0>(a0.select<4, 1, BLOCK_REG_A, 1>(0).format<half>(), desc_a);
                 cm_load<lsc::Normal, CacheHint::Cached, CacheHint::Cached, 0, 32>(a0.select<4, 1, BLOCK_REG_A, 1>(4).format<half>(), desc_a);
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
                 // load b: N[0:16*2]xK[0:32]
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_up_s8.format<int>(), desc_b0);
                 cm_load<lsc::Transpose, CacheHint::Cached, CacheHint::Cached>(b0_down_s8.format<int>(), desc_b1);
-                #if QUANTIZATION_BY_TOKEN
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b0_up_s8.format<int>().select<64, 1>(), b0_down_s8.format<int>().select<64, 1>(), b0);
                 dot(a0, b0);
                 #else
@@ -739,8 +743,8 @@ uint M, uint N, uint K, uint query_stride, uint q_start_strided) {
                 } else {
                     desc_a.set_block_x(desc_a.get_block_x() + 16);
                 }
-#if USE_INT8
-                #if QUANTIZATION_BY_TOKEN
+#if (KV_CACHE_COMPRESSION != 0)
+                #if (KV_CACHE_COMPRESSION == 1)
                 dec(b0_up_s8.format<int>().select<64, 1>(64), b0_down_s8.format<int>().select<64, 1>(64), b0);
                 dot(a0, b0);
                 #else

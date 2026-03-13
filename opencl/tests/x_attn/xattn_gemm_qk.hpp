@@ -84,7 +84,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     get_mn(id_wg_m, id_wg_n, M, N, slice_no, slice, BLOCK_WG_M, BLOCK_WG_N);
 
     // key cache: [block, HQ, KV_BLOCK_SIZE, HEAD_SIZE_KEY]
-#if USE_INT8
+#if (KV_CACHE_COMPRESSION != 0)
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
 #else
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
