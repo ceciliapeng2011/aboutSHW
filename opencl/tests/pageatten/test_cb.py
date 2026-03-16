@@ -1,7 +1,6 @@
 import functools
 import os
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 import pytest
@@ -50,10 +49,6 @@ def DIV_UP(x, y):
     return (x + y - 1) // y
 
 
-def ss(num_tokens: int, past_len: int = 0) -> "SubsequenceDescriptor":
-    return SubsequenceDescriptor(num_tokens=num_tokens, past_len=past_len)
-
-
 @dataclass(frozen=True)
 class SubsequenceDescriptor:
     num_tokens: int
@@ -70,20 +65,30 @@ class SubsequenceDescriptor:
         return self.past_len + self.num_tokens
 
 
-class CacheQuantMode(str, Enum):
-    BY_TOKEN = "BY_TOKEN"
-
-
 @dataclass(frozen=True)
-class PagedAttentionTestCase:
-    subsequences: tuple[SubsequenceDescriptor, ...]
-    num_heads: int = 2
-    num_kv_heads: int = 2
-    k_head_size: int = 64
-    v_head_size: int = 64
-    block_size: int = 16
-    kv_cache_compression: bool = False
-    key_cache_quant_mode: CacheQuantMode = CacheQuantMode.BY_TOKEN
+class SessionDescriptor:
+    num_input_tokens: int
+    num_output_tokens: int
+
+    def __post_init__(self):
+        if self.num_input_tokens < 1:
+            raise ValueError(f"num_input_tokens must be >= 1, got {self.num_input_tokens}")
+        if self.num_output_tokens < 1:
+            raise ValueError(f"num_output_tokens must be >= 1, got {self.num_output_tokens}")
+        if self.num_output_tokens > 2:
+            # NOTE: Temporary kernel limitation in this harness:
+            # allowing at most one decode stage per session.
+            # Semantics in this file:
+            # - num_output_tokens == 1 -> prefill only
+            # - num_output_tokens == 2 -> prefill + 1 decode stage
+            # TODO(enable_mixed_prefill_decode): remove this guard once kernel supports
+            # true mixed prefill/decode iteration in a single scheduler flow.
+            raise ValueError(
+                "num_output_tokens must be <= 2 in this harness (supports only one decode stage)"
+            )
+    @property
+    def total_tokens(self) -> int:
+        return self.num_input_tokens + self.num_output_tokens
 
 
 @dataclass(frozen=True)
@@ -121,10 +126,123 @@ class PagedAttentionInputs:
 
 
 @dataclass(frozen=True)
-class SubsequenceTensors:
+class SequenceTensors:
     query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
+
+
+class ContinuousBatchingScheduler:
+    def __init__(self, max_num_batched_tokens: int, max_subsequence_tokens: int | None = None, dynamic_split_fuse: bool = True):
+        if max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_subsequence_tokens = max_subsequence_tokens or max_num_batched_tokens
+        self.dynamic_split_fuse = dynamic_split_fuse
+
+    def schedule(self, sessions: list[SessionDescriptor]) -> list[RoundPlan]:
+        remaining_input_tokens = [session.num_input_tokens for session in sessions]
+        # num_output_tokens includes prefill completion. Decode-stage count is (num_output_tokens - 1).
+        remaining_output_tokens = [max(session.num_output_tokens - 1, 0) for session in sessions]
+        emitted_tokens = [0 for _ in sessions]
+        round_plans: list[RoundPlan] = []
+
+        while any((remaining_input_tokens[i] > 0 or remaining_output_tokens[i] > 0) for i in range(len(sessions))):
+            capacity = self.max_num_batched_tokens
+            round_sequence_ids: list[int] = []
+            round_subsequences: list[SubsequenceDescriptor] = []
+
+            if self.dynamic_split_fuse:
+                # Generation first: one token per session when input is exhausted.
+                for sequence_id, _session in enumerate(sessions):
+                    if capacity == 0:
+                        break
+                    if remaining_input_tokens[sequence_id] == 0 and remaining_output_tokens[sequence_id] > 0:
+                        scheduled_tokens = 1
+                        round_sequence_ids.append(sequence_id)
+                        round_subsequences.append(
+                            SubsequenceDescriptor(num_tokens=scheduled_tokens, past_len=emitted_tokens[sequence_id])
+                        )
+                        emitted_tokens[sequence_id] += scheduled_tokens
+                        remaining_output_tokens[sequence_id] -= scheduled_tokens
+                        capacity -= scheduled_tokens
+
+                # Greedy prompt chunk split by request order.
+                for sequence_id, _session in enumerate(sessions):
+                    if capacity == 0:
+                        break
+                    if remaining_input_tokens[sequence_id] == 0:
+                        continue
+                    per_sequence_cap = min(self.max_subsequence_tokens, capacity)
+                    scheduled_tokens = min(remaining_input_tokens[sequence_id], per_sequence_cap)
+                    if scheduled_tokens <= 0:
+                        continue
+                    round_sequence_ids.append(sequence_id)
+                    round_subsequences.append(
+                        SubsequenceDescriptor(num_tokens=scheduled_tokens, past_len=emitted_tokens[sequence_id])
+                    )
+                    emitted_tokens[sequence_id] += scheduled_tokens
+                    remaining_input_tokens[sequence_id] -= scheduled_tokens
+                    capacity -= scheduled_tokens
+            else:
+                # vLLM-like: prompt phase (whole prompt, no split) then generation phase (1 token/session/iter).
+                has_prompt_left = any(remaining > 0 for remaining in remaining_input_tokens)
+                if has_prompt_left:
+                    for sequence_id, _session in enumerate(sessions):
+                        if capacity == 0:
+                            break
+                        remaining = remaining_input_tokens[sequence_id]
+                        if remaining == 0:
+                            continue
+                        if remaining > self.max_subsequence_tokens or remaining > self.max_num_batched_tokens:
+                            raise ValueError(
+                                f"Session {sequence_id} prompt length {remaining} exceeds prompt scheduling limit"
+                            )
+                        if remaining > capacity:
+                            continue
+
+                        round_sequence_ids.append(sequence_id)
+                        round_subsequences.append(
+                            SubsequenceDescriptor(num_tokens=remaining, past_len=emitted_tokens[sequence_id])
+                        )
+                        emitted_tokens[sequence_id] += remaining
+                        remaining_input_tokens[sequence_id] = 0
+                        capacity -= remaining
+                else:
+                    for sequence_id, _session in enumerate(sessions):
+                        if capacity == 0:
+                            break
+                        if remaining_output_tokens[sequence_id] <= 0:
+                            continue
+                        round_sequence_ids.append(sequence_id)
+                        round_subsequences.append(
+                            SubsequenceDescriptor(num_tokens=1, past_len=emitted_tokens[sequence_id])
+                        )
+                        emitted_tokens[sequence_id] += 1
+                        remaining_output_tokens[sequence_id] -= 1
+                        capacity -= 1
+
+            if not round_subsequences:
+                raise RuntimeError("Failed to build a non-empty continuous batching round")
+
+            round_plans.append(RoundPlan(tuple(round_sequence_ids), tuple(round_subsequences)))
+
+        return round_plans
+
+
+def serialize_round_plans_for_single_subsequence(round_plans: list[RoundPlan]) -> list[RoundPlan]:
+    # NOTE: Compatibility adapter for current kernel behavior.
+    # Kernel dispatch currently assumes one logical subsequence per enqueue.
+    # TODO(enable_real_multi_subsequence): remove this serialization and pass
+    # scheduler-produced multi-subsequence round plans directly.
+    serialized: list[RoundPlan] = []
+    for round_plan in round_plans:
+        if len(round_plan.subsequences) <= 1:
+            serialized.append(round_plan)
+            continue
+        for sequence_id, subsequence in zip(round_plan.sequence_ids, round_plan.subsequences):
+            serialized.append(RoundPlan(sequence_ids=(sequence_id,), subsequences=(subsequence,)))
+    return serialized
 
 
 class PagedAttentionRuntime:
@@ -229,7 +347,7 @@ class PagedAttentionRuntime:
         value_blocks = padded_value.reshape(-1, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
         return key_blocks, value_blocks
 
-    def build_round_inputs(self, subsequence_tensors: list[SubsequenceTensors], round_plan: RoundPlan) -> PagedAttentionInputs:
+    def build_round_inputs(self, sequence_tensors: list[SequenceTensors], round_plan: RoundPlan) -> PagedAttentionInputs:
         flat_query: list[torch.Tensor] = []
         flat_key: list[torch.Tensor] = []
         flat_value: list[torch.Tensor] = []
@@ -242,7 +360,7 @@ class PagedAttentionRuntime:
         physical_block_offset = 0
 
         for sequence_id, subsequence in zip(round_plan.sequence_ids, round_plan.subsequences):
-            tensors = subsequence_tensors[sequence_id]
+            tensors = sequence_tensors[sequence_id]
             context_len = subsequence.total_seq_len
 
             q_slice = tensors.query[subsequence.past_len:context_len].contiguous()
@@ -366,8 +484,8 @@ class PagedAttentionRuntime:
         return output
 
 
-def create_subsequence_tensors(subsequence: SubsequenceDescriptor, num_heads, num_kv_heads, head_size, compressed_kvcache, act_dtype=torch.float16) -> SubsequenceTensors:
-    total_seq_len = subsequence.total_seq_len
+def create_sequence_tensors(subsequence: SubsequenceDescriptor, num_heads, num_kv_heads, head_size, compressed_kvcache, act_dtype=torch.float16) -> SequenceTensors:
+    total_seq_len = subsequence.total_tokens
     low = -1
     high = 2
     query = torch.randint(low, high, [total_seq_len, num_heads, head_size]).to(dtype=act_dtype)
@@ -381,7 +499,24 @@ def create_subsequence_tensors(subsequence: SubsequenceDescriptor, num_heads, nu
         key = torch.rand(total_seq_len, num_kv_heads, head_size).to(dtype=act_dtype)
         value = torch.rand(total_seq_len, num_kv_heads, head_size).to(dtype=act_dtype) / high
 
-    return SubsequenceTensors(query=query, key=key, value=value)
+    return SequenceTensors(query=query, key=key, value=value)
+
+
+def normalize_session_descriptors(sessions=None, num_output_tokens=1):
+    if sessions is None:
+        sessions = (128, 257, 511)
+
+    normalized = []
+    for entry in sessions:
+        if isinstance(entry, SessionDescriptor):
+            normalized.append(entry)
+        elif isinstance(entry, int):
+            normalized.append(SessionDescriptor(num_input_tokens=entry, num_output_tokens=num_output_tokens))
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            normalized.append(SessionDescriptor(num_input_tokens=int(entry[0]), num_output_tokens=int(entry[1])))
+        else:
+            raise TypeError("Each session must be an int, a (num_input_tokens, num_output_tokens) pair, or a SessionDescriptor")
+    return normalized
 
 
 def get_attention_mask(q_len: int, kv_len: int, num_heads: int, q_dtype: torch.dtype, q_device: torch.device, past_len: int, is_causal=True):
@@ -482,148 +617,252 @@ def reference_round(runtime: PagedAttentionRuntime, round_inputs: PagedAttention
     return torch.cat(refs, dim=0)
 
 
-def run_paged_attention_smoke_case(case: PagedAttentionTestCase, check_acc=True, return_inputs=False):
-    if case.key_cache_quant_mode != CacheQuantMode.BY_TOKEN:
-        raise ValueError("Only CacheQuantMode.BY_TOKEN is supported in this test harness")
-    if case.k_head_size != case.v_head_size:
-        raise ValueError("k_head_size must equal v_head_size in this CM paged-attention harness")
+def run_page_attn_causal_batch1(seq_len, num_heads=2, num_kv_heads=1, head_size=32, block_sz=32, compressed_kvcache=False, max_num_batched_tokens=256, dynamic_split_fuse=True, check_acc=True):
+    return run_page_attn_causal_multiseq(
+        sessions=[SessionDescriptor(num_input_tokens=seq_len, num_output_tokens=1)],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        enable_prefix_caching=False,
+        max_num_batched_tokens=max_num_batched_tokens,
+        dynamic_split_fuse=dynamic_split_fuse,
+        check_acc=check_acc,
+    )
 
-    descriptors = list(case.subsequences)
-    subsequence_tensors = [
-        create_subsequence_tensors(
-            descriptor,
-            case.num_heads,
-            case.num_kv_heads,
-            case.k_head_size,
-            case.kv_cache_compression,
-        )
+
+def run_page_attn_causal_multiseq(sessions=None, num_heads=2, num_kv_heads=1, head_size=32, block_sz=32, compressed_kvcache=False, enable_prefix_caching=False, max_num_batched_tokens=256, dynamic_split_fuse=True, check_acc=True, return_rounds=False):
+    if enable_prefix_caching:
+        # NOTE: Prefix caching is not modeled in this standalone PA harness yet.
+        # TODO(enable_prefix_caching): emulate hash-based shared KV block reuse.
+        raise ValueError("enable_prefix_caching=True is not supported in this test harness")
+
+    descriptors = normalize_session_descriptors(sessions=sessions)
+    sequence_tensors = [
+        create_sequence_tensors(descriptor, num_heads, num_kv_heads, head_size, compressed_kvcache)
         for descriptor in descriptors
     ]
-    runtime = PagedAttentionRuntime.create_instance(
-        case.num_heads,
-        case.num_kv_heads,
-        case.k_head_size,
-        case.block_size,
-        case.kv_cache_compression,
-        True,
-    )
 
-    round_plan = RoundPlan(
-        sequence_ids=tuple(range(len(descriptors))),
-        subsequences=tuple(descriptors),
+    scheduler = ContinuousBatchingScheduler(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_subsequence_tokens=max_num_batched_tokens,
+        dynamic_split_fuse=dynamic_split_fuse,
     )
-    round_inputs = runtime.build_round_inputs(subsequence_tensors, round_plan)
-    round_output = runtime.submit_round(round_inputs)
+    round_plans = scheduler.schedule(descriptors)
+    runtime = PagedAttentionRuntime.create_instance(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, True)
+
+    round_outputs = []
+    round_refs = []
+    round_inputs_list = []
+
+    for round_plan in round_plans:
+        round_inputs = runtime.build_round_inputs(sequence_tensors, round_plan)
+        round_inputs_list.append(round_inputs)
+        round_outputs.append(runtime.submit_round(round_inputs))
+        if check_acc:
+            round_refs.append(reference_round(runtime, round_inputs))
+
+    flat_output = torch.cat(round_outputs, dim=0) if round_outputs else torch.empty(0, num_heads * head_size, dtype=torch.float16)
 
     if check_acc:
-        round_ref = reference_round(runtime, round_inputs)
-        check_close(round_ref, round_output)
+        flat_ref = torch.cat(round_refs, dim=0) if round_refs else torch.empty_like(flat_output)
+        check_close(flat_ref, flat_output)
 
-    if return_inputs:
-        return round_inputs, round_output
-    return round_output
-
-
-def requires_decode_path(case: PagedAttentionTestCase) -> bool:
-    return any(subsequence.past_len > 0 for subsequence in case.subsequences)
+    if return_rounds:
+        return round_inputs_list, round_outputs
+    return flat_output
 
 
-def assert_generate_stage_inputs(round_inputs: PagedAttentionInputs):
-    batch_size_in_tokens = int(round_inputs.query.shape[0])
-    batch_size_in_sequences = int(round_inputs.past_lens.numel())
-    assert batch_size_in_tokens == batch_size_in_sequences
-    assert batch_size_in_tokens > 0
-    assert torch.all(round_inputs.past_lens >= 1)
-    token_counts = torch.diff(round_inputs.subsequence_begins)
-    assert torch.all(token_counts == 1)
-
-
-PREFILL_ONLY_SMOKE_CASES = (
-    PagedAttentionTestCase(
-        subsequences=(ss(10),),
-    ),
-    PagedAttentionTestCase(
-        subsequences=(
-            ss(10),
-            ss(81),
-            ss(129),
-        ),
-    ),
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,seq_len,trunk_size",
+    [
+        (2, 1, 32, 32, False, 128, 128),
+        (4, 2, 64, 32, False, 128, 128),
+        (4, 1, 64, 64, True, 128, 128),
+        (2, 1, 32, 32, False, 96, 128),
+    ],
 )
+def test_pa_batch1_pytest_configs(num_heads, num_kv_heads, head_size, block_sz, compressed_kvcache, seq_len, trunk_size):
+    run_page_attn_causal_batch1(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        dynamic_split_fuse=True,
+        check_acc=True,
+    )
 
 
-GENERATE_ONLY_SMOKE_CASES = (
-    PagedAttentionTestCase(
-        subsequences=(ss(1, 10),),
-    ),
-    PagedAttentionTestCase(
-        subsequences=(ss(1, 34), ss(1, 515)),
-    ),
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 128),
+        (4, 2, 64, 32, False, 128),
+        (4, 1, 64, 64, True, 128),
+    ],
 )
+def test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    run_page_attn_causal_multiseq(
+        sessions=[
+            SessionDescriptor(num_input_tokens=trunk_size, num_output_tokens=1),
+            SessionDescriptor(num_input_tokens=trunk_size + 64, num_output_tokens=1),
+        ],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        check_acc=True,
+    )
 
 
-MIXED_ONLY_SMOKE_CASES = (
-    PagedAttentionTestCase(
-        subsequences=(
-            ss(1, 34),
-            ss(25),
-            ss(10, 34),
-        ),
-    ),
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 64),
+        (4, 2, 64, 32, False, 128),
+        (4, 1, 64, 64, True, 128),
+    ],
 )
+def test_pa_multiseq_pytest_prefill_batch_size_in_sequences_2(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    run_page_attn_causal_multiseq(
+        sessions=[
+            SessionDescriptor(num_input_tokens=trunk_size // 2, num_output_tokens=1),
+            SessionDescriptor(num_input_tokens=trunk_size // 2, num_output_tokens=1),
+        ],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        check_acc=True,
+    )
 
 
-def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
-    parts = []
-    for subsequence in case.subsequences:
-        if subsequence.past_len == 0:
-            parts.append(f"{subsequence.num_tokens}")
-        else:
-            parts.append(f"{subsequence.num_tokens}x{subsequence.past_len}")
-    return "_".join(parts)
+def assert_generate_stage_rounds(round_inputs_list: list[PagedAttentionInputs]):
+    generate_round_count = 0
+    for round_inputs in round_inputs_list:
+        batch_size_in_tokens = int(round_inputs.query.shape[0])
+        batch_size_in_sequences = int(round_inputs.past_lens.numel())
+
+        # PagedAttentionStage::GENERATE condition:
+        # query_shape[0] == past_lens_shape[0]
+        if batch_size_in_tokens != batch_size_in_sequences:
+            continue
+
+        # There must be at least one query item per subsequence.
+        assert batch_size_in_tokens > 0
+
+        # Generate/decode-stage-only validation:
+        # must have existing KV context from prefill.
+        assert torch.all(round_inputs.past_lens >= 1)
+
+        # Stronger check: every subsequence contributes exactly one query token.
+        token_counts = torch.diff(round_inputs.subsequence_begins)
+        assert torch.all(token_counts == 1)
+        generate_round_count += 1
+
+    assert generate_round_count > 0
 
 
-@pytest.mark.parametrize("case", PREFILL_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_smoke_paged_attention_prefill_only(case: PagedAttentionTestCase):
-    round_inputs, _round_output = run_paged_attention_smoke_case(case, check_acc=True, return_inputs=True)
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 64),
+        (4, 2, 64, 32, False, 128),
+        (4, 1, 64, 64, True, 128),
+    ],
+)
+def test_pa_multiseq_pytest_generate_stage_only(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    round_inputs_list, _round_outputs = run_page_attn_causal_multiseq(
+        sessions=[
+            SessionDescriptor(num_input_tokens=1, num_output_tokens=2),
+            SessionDescriptor(num_input_tokens=1, num_output_tokens=2),
+            SessionDescriptor(num_input_tokens=1, num_output_tokens=2),
+        ],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        dynamic_split_fuse=True,
+        check_acc=True,
+        return_rounds=True,
+    )
+    assert_generate_stage_rounds(round_inputs_list)
 
-    assert tuple(round_inputs.subsequences) == case.subsequences
-    assert int(round_inputs.max_context_len) == max(subsequence.total_seq_len for subsequence in case.subsequences)
-    assert round_inputs.past_lens.tolist() == [subsequence.past_len for subsequence in case.subsequences]
 
-    assert all(subsequence.past_len == 0 for subsequence in case.subsequences)
-    assert any(subsequence.num_tokens > 1 for subsequence in case.subsequences)
-    assert int(round_inputs.query.shape[0]) != int(round_inputs.past_lens.numel())
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_size,block_sz,compressed_kvcache,trunk_size",
+    [
+        (2, 1, 32, 32, False, 4),
+    ],
+)
+def test_pa_multiseq_pytest_generate_stage_only_multi_round(
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_sz,
+    compressed_kvcache,
+    trunk_size,
+):
+    num_sessions = trunk_size + 3
+    sessions = [SessionDescriptor(num_input_tokens=1, num_output_tokens=2) for _ in range(num_sessions)]
 
+    round_inputs_list, _round_outputs = run_page_attn_causal_multiseq(
+        sessions=sessions,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_sz=block_sz,
+        compressed_kvcache=compressed_kvcache,
+        max_num_batched_tokens=trunk_size,
+        dynamic_split_fuse=True,
+        check_acc=True,
+        return_rounds=True,
+    )
 
-@pytest.mark.parametrize("case", GENERATE_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_smoke_paged_attention_generate_only(case: PagedAttentionTestCase):
-    if requires_decode_path(case):
-        pytest.skip("generate-stage smoke cases require a decode-capable CM kernel path; current harness covers only pa_multi_token prefill path")
-
-    round_inputs, _round_output = run_paged_attention_smoke_case(case, check_acc=True, return_inputs=True)
-
-    assert tuple(round_inputs.subsequences) == case.subsequences
-    assert int(round_inputs.max_context_len) == max(subsequence.total_seq_len for subsequence in case.subsequences)
-    assert round_inputs.past_lens.tolist() == [subsequence.past_len for subsequence in case.subsequences]
-    assert_generate_stage_inputs(round_inputs)
-
-
-@pytest.mark.parametrize("case", MIXED_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
-    if requires_decode_path(case):
-        pytest.skip("mixed-stage smoke cases require decode support; current harness covers only pa_multi_token prefill path")
-
-    round_inputs, _round_output = run_paged_attention_smoke_case(case, check_acc=True, return_inputs=True)
-
-    assert tuple(round_inputs.subsequences) == case.subsequences
-    assert int(round_inputs.max_context_len) == max(subsequence.total_seq_len for subsequence in case.subsequences)
-    assert round_inputs.past_lens.tolist() == [subsequence.past_len for subsequence in case.subsequences]
-
-    has_prefill = any(subsequence.past_len == 0 and subsequence.num_tokens > 1 for subsequence in case.subsequences)
-    has_generate = any(subsequence.past_len >= 1 for subsequence in case.subsequences)
-    assert has_prefill and has_generate
-    assert int(round_inputs.query.shape[0]) != int(round_inputs.past_lens.numel())
+    expected_num_generate_rounds = DIV_UP(num_sessions, trunk_size)
+    assert_generate_stage_rounds(round_inputs_list)
+    generate_rounds = [
+        round_inputs
+        for round_inputs in round_inputs_list
+        if int(round_inputs.query.shape[0]) == int(round_inputs.past_lens.numel())
+    ]
+    assert len(generate_rounds) == expected_num_generate_rounds
+    for round_inputs in generate_rounds:
+        assert round_inputs.query.shape[0] <= trunk_size
+        for subsequence in round_inputs.subsequences:
+            assert subsequence.num_tokens == 1
+            assert subsequence.past_len >= 1
 
 # '''
 # Usage:
@@ -632,10 +871,10 @@ def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
 # python -m py_compile test_pa_multiseq.py
 
 # # `-q` for quieter pytest output, and `-k` to select the specific test to run.
-# python -m pytest -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_generate_only and 1x10'
+# python -m pytest -q test_pa_multiseq.py -k test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1
 
 # # `-s` to show captured print statement for debugging purposes.
-# python -m pytest -s test_pa_multiseq.py -k 'generate_only or mixed_only'
+# python -m pytest -s test_pa_multiseq.py -k test_pa_multiseq_pytest_prefill_batch_size_in_sequences_1
 
 # '''
 
