@@ -130,6 +130,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     // Single-token path uses the latest token from each subsequence.
     const uint q_token_idx = subseq_q_end - 1;
     const uint kv_len = past_lens[seq_idx] + subseq_q_len;
+    const uint seq_kv_partition_num = (kv_len + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
 
     const uint block_begin = block_indices_begins[seq_idx];
     const uint block_end = block_indices_begins[seq_idx + 1];
@@ -140,6 +141,20 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
 
     if(kv_partition_idx * KV_PARTITION_SIZE >= kv_len || start_block_idx >= block_end) {
+        // For sequences shorter than global kv_partition_num, this partition is inactive.
+        // Write neutral values so reduction kernel can safely process all partitions.
+        #pragma unroll
+        for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+            matrix<float, REG_M, REG_N> zero = 0.0f;
+            uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
+            #pragma unroll
+            for (int k = 0; k < HEAD_SIZE; k += REG_N) {
+                cm_svm_block_write<float, REG_N>((svmptr_t)(output + o_offset + k), zero.format<float>());
+            }
+
+            uint lse_offset = seq_idx * HEADS_NUM * kv_partition_num + (head_num_idx + qi) * kv_partition_num + wg_thread_id;
+            lse[lse_offset] = -3e38f;
+        }
         return;
     }
     constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
@@ -159,7 +174,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     uint block_num = blocks_per_partition;
 
     uint leftover_size = 0;
-    if(kv_partition_idx == kv_partition_num - 1) {
+    if(kv_partition_idx == seq_kv_partition_num - 1) {
         // last partition
         leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
     }
