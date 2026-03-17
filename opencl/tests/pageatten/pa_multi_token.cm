@@ -114,6 +114,22 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     kv_seq_len = subseq_q_len + past_q_lens;
 
     int q_start_local = (mapped_wg_id * local_size + wg_local_id) * q_step;
+#if CMPA_KVCACHE_U8
+    // U8 path uses workgroup-level barriers in `pa_lsc_u8`, so every lane in
+    // the workgroup must participate. For out-of-range lanes, pass q_len_sg=0
+    // so no output is written while still participating in synchronization.
+    bool lane_active = (q_start_local < subseq_q_len);
+    q_start_sg = subseq_q_begin + q_start_local;
+    q_len_sg = q_step;
+    if (lane_active) {
+        if (q_start_local + q_len_sg > subseq_q_len) {
+            q_len_sg = subseq_q_len - q_start_local;
+        }
+    } else {
+        q_start_sg = subseq_q_begin + subseq_q_len;
+        q_len_sg = 0;
+    }
+#else
     if (q_start_local >= subseq_q_len) {
         return;
     }
@@ -122,6 +138,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     if (q_start_local + q_len_sg > subseq_q_len) {
         q_len_sg = subseq_q_len - q_start_local;
     }
+#endif
 
     // qkv is fused
     int kv_stop = kv_seq_len;
