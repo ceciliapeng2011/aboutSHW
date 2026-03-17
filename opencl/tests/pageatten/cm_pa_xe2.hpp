@@ -314,11 +314,7 @@ void pa_lsc_u8(
                     matrix<float, kv_step, q_step> St = ugemm_KQ(slm_K, rQ, slm_offset);
 
                     if constexpr (use_causal_mask) {
-                        if (causal_left == 0) {
-                            apply_causal_mask<1>(St);
-                        } else if (causal_left < 0) {
-                            St = -3.4e38f;
-                        }
+                        apply_causal_mask_with_offset(St, causal_left);
                         causal_left -= kv_step;
                     } else {
                         int kv_tokens = kv_stop - kv_pos;
@@ -480,11 +476,7 @@ void pa_lsc_u8(
             matrix<float, kv_step, q_step> St = ugemm_KQ(slm_K, rQ, slm_offset);
 
             if constexpr (use_causal_mask) {
-                if (causal_left == 0) {
-                    apply_causal_mask<1>(St);
-                } else if (causal_left < 0) {
-                    St = -3.4e38f;
-                }
+                apply_causal_mask_with_offset(St, causal_left);
                 causal_left -= kv_step;
             } else {
                 int kv_tokens = kv_stop - kv_pos;
@@ -696,12 +688,7 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
         if constexpr (use_causal_mask) {
-            // since kv_step == q_step == 16, causal_left is n*kv_step
-            if (causal_left == 0) {
-                apply_causal_mask<1>(St);
-            } else if (causal_left < 0) {
-                St = -3.4e38f;
-            }
+            apply_causal_mask_with_offset(St, causal_left);
             causal_left -= kv_step;
         } else {
             int kv_tokens = kv_stop - kv_pos;
@@ -845,12 +832,7 @@ void pa_kernel_lsc_prefetch_f16(
             }
         }
         if constexpr (use_causal_mask) {
-            // since kv_step == q_step == 16, causal_left is n*kv_step
-            if (causal_left == 0) {
-                apply_causal_mask<1>(St);
-            } else if (causal_left < 0) {
-                St = -3.4e38f;
-            }
+            apply_causal_mask_with_offset(St, causal_left);
             causal_left -= kv_step;
         } else {
             int kv_tokens = kv_stop - kv_pos;

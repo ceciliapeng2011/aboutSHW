@@ -18,7 +18,6 @@ from pa_test_common import (
     check_close,
     create_paged_attention_inputs,
     create_subsequence_tensors,
-    flash_attn_vlen_ref,
     get_attention_mask,
     get_cm_grf_width,
     get_sequence_ranges,
@@ -549,6 +548,7 @@ class PagedAttentionRunner:
                 self.multi_token_runner.block_sz,
                 self.multi_token_runner.compressed_kvcache,
             )
+
             attention_mask = get_attention_mask(
                 q_len,
                 context_len,
@@ -558,15 +558,16 @@ class PagedAttentionRunner:
                 past_len=past_len,
                 is_causal=self.multi_token_runner.is_causal,
             )
-            ref = flash_attn_vlen_ref(
-                q,
-                key_context,
-                value_context,
-                [],
-                self.multi_token_runner.is_causal,
-                attention_mask,
+
+            ref = F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0).to(torch.float16),
+                key_context.transpose(0, 1).unsqueeze(0).to(torch.float16),
+                value_context.transpose(0, 1).unsqueeze(0).to(torch.float16),
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                enable_gqa=(self.multi_token_runner.num_kv_heads != self.multi_token_runner.num_heads),
             )
-            refs.append(ref.reshape(q_len, -1))
+            refs.append(ref.squeeze(0).transpose(0, 1).reshape(q_len, -1).to(q.dtype))
 
         return torch.cat(refs, dim=0)
 
@@ -805,7 +806,7 @@ def test_pa_smoke_paged_attention_prefill_only(case: PagedAttentionTestCase):
 def test_pa_smoke_paged_attention_generate_only(case: PagedAttentionTestCase):
     print(f"{Colors.GREEN}[testcase] generate_only id={make_smoke_case_id(case)}{Colors.END}")
 
-    kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=False)
+    kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=True)
     max_context_len = int(kern_attn_inputs["max_context_len"])
     past_lens = kern_attn_inputs["past_lens"]
     assert isinstance(past_lens, torch.Tensor)
@@ -820,7 +821,7 @@ def test_pa_smoke_paged_attention_generate_only(case: PagedAttentionTestCase):
 def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
     print(f"{Colors.GREEN}[testcase] mixed_only id={make_smoke_case_id(case)}{Colors.END}")
 
-    kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=False)
+    kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=True)
     max_context_len = int(kern_attn_inputs["max_context_len"])
     past_lens = kern_attn_inputs["past_lens"]
     query = kern_attn_inputs["query"]
@@ -851,6 +852,11 @@ def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
 # # `-s` to show captured print statement for debugging purposes.
 # python -m pytest -s test_pa_multiseq.py -k 'generate_only or mixed_only'
 # python -m pytest -s "test_pa_multiseq.py::test_pa_smoke_paged_attention_generate_only[1x10__h2_kv2_khs64_vhs64_bls16_cmpr1_qmBY_TOKEN]"
+
+# `-vv` for more verbose pytest output, to show the full test case ID and parameters.
+# timeout 120s python -m pytest -q test_pa_multiseq.py -vv
+
+# timeout 180s python -m pytest -q test_pa_multiseq.py -vv -k 'cmpr0 and (generate_only or mixed_only)'
 
 # '''
 
