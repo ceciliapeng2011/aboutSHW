@@ -5,6 +5,7 @@ import math
 import torch
 import functools
 import numpy as np
+import pytest
 
 from clops import cl
 from clops import compare
@@ -321,7 +322,7 @@ class ContinuousBatchKVCacheGenerator:
                 #     block_head_data_f16[i,:] = (block_head_data_f16[i,:] - block_head_zp[i,0]) * block_head_scale[i,0]
                 # print('dequant_data_f16: shape = ', block_head_data_f16.shape, '\n', block_head_data_f16)
 
-def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_head_size=64, v_head_size=64, block_size=16, enable_kvcache_compress=True, check_perf=False):   
+def run_pa_kv_cache_update_case(num_tokens:list, past_lens:list, num_kv_heads=1, k_head_size=64, v_head_size=64, block_size=16, enable_kvcache_compress=True, check_perf=False):   
     cb_kvcache_gnr = ContinuousBatchKVCacheGenerator(num_tokens, past_lens, num_kv_heads, k_head_size, v_head_size, block_size, enable_kvcache_compress)
     subsequence_begins, block_indices, block_indices_begins = cb_kvcache_gnr.get_block_table()
 
@@ -362,6 +363,36 @@ def test_pa_kv_cache_update(num_tokens:list, past_lens:list, num_kv_heads=1, k_h
         compare(key_cache_ref.detach().numpy(), out_key_cache)
         compare(value_cache_ref.detach().numpy(), out_value_cache)
     print(f'{Colors.GREEN}kv_cache_update passed{Colors.END}')
+
+
+@pytest.mark.parametrize("enable_kvcache_compress", [False, True])
+def test_pa_kv_cache_update_multi_subsequence(enable_kvcache_compress):
+    torch.manual_seed(7)
+    run_pa_kv_cache_update_case(
+        num_tokens=[3, 5, 2],
+        past_lens=[4, 1, 0],
+        num_kv_heads=2,
+        k_head_size=16,
+        v_head_size=16,
+        block_size=8,
+        enable_kvcache_compress=enable_kvcache_compress,
+        check_perf=False,
+    )
+
+
+@pytest.mark.parametrize("enable_kvcache_compress", [False, True])
+def test_pa_kv_cache_update_multi_subsequence_mixed_boundaries(enable_kvcache_compress):
+    torch.manual_seed(11)
+    run_pa_kv_cache_update_case(
+        num_tokens=[1, 9, 4, 7],
+        past_lens=[15, 0, 6, 3],
+        num_kv_heads=2,
+        k_head_size=16,
+        v_head_size=16,
+        block_size=8,
+        enable_kvcache_compress=enable_kvcache_compress,
+        check_perf=False,
+    )
 
 # reference impl
 # // # cur_kv_data:     [batch_size_in_tokens, num_kv_heads * head_size]
@@ -471,18 +502,22 @@ if __name__ == "__main__":
     
     for compress_kvcache in [False, True]:
         # test_pa_kv_cache_update([1024, 16, 17], [16, 0, 1])
-        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
-        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=96, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
-        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=48, v_head_size=48, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
-        test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=48, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
-        # test_pa_kv_cache_update([64*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-        # test_pa_kv_cache_update([128*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-        test_pa_kv_cache_update([32*1024], [4*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-        # test_pa_kv_cache_update([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+        run_pa_kv_cache_update_case([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+        run_pa_kv_cache_update_case([32*1024], [0], num_kv_heads=8, k_head_size=96, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+        run_pa_kv_cache_update_case([32*1024], [0], num_kv_heads=8, k_head_size=48, v_head_size=48, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+        run_pa_kv_cache_update_case([32*1024], [0], num_kv_heads=8, k_head_size=48, v_head_size=96, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+        run_pa_kv_cache_update_case([64*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+        run_pa_kv_cache_update_case([128*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+        run_pa_kv_cache_update_case([32*1024], [4*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+        run_pa_kv_cache_update_case([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
 
-        test_pa_kv_cache_update([16], [0], num_kv_heads=1, k_head_size=16, v_head_size=16, block_size=16, enable_kvcache_compress=compress_kvcache, check_perf=False)
+        run_pa_kv_cache_update_case([16], [0], num_kv_heads=1, k_head_size=16, v_head_size=16, block_size=16, enable_kvcache_compress=compress_kvcache, check_perf=False)
         
-        # test_pa_kv_cache_update([1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
-        # test_pa_kv_cache_update([1], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=False)
-        # test_pa_kv_cache_update([1024], [0], num_kv_heads=2, k_head_size=16, v_head_size=16, block_size=32, check_perf=False)
-        # test_pa_kv_cache_update([129], [0], num_kv_heads=2, k_head_size=64, v_head_size=64, block_size=16, check_perf=True)
+        run_pa_kv_cache_update_case([1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
+        run_pa_kv_cache_update_case([1], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=False)
+        run_pa_kv_cache_update_case([1024], [0], num_kv_heads=2, k_head_size=16, v_head_size=16, block_size=32, check_perf=False)
+        run_pa_kv_cache_update_case([129], [0], num_kv_heads=2, k_head_size=64, v_head_size=64, block_size=16, check_perf=True)
+        
+# Usage:
+# python -m pytest -q test_kvcache_update.py -k "multi_subsequence_mixed_boundaries"
+# python -m pytest -q test_kvcache_update.py -k "multi_subsequence"
