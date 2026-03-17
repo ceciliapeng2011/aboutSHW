@@ -120,18 +120,32 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     const uint kv_partition_num = cm_group_count(2);
     const uint kv_partition_idx = cm_group_id(2);
 
-    const uint kv_len = past_lens[seq_idx] + 1;
-    // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
-    const uint start_block_idx = block_indices_begins[seq_idx] + kv_partition_idx * (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
-
-    if(kv_partition_idx * KV_PARTITION_SIZE > kv_len) {
+    const uint subseq_q_begin = subsequence_begins[seq_idx];
+    const uint subseq_q_end = subsequence_begins[seq_idx + 1];
+    const uint subseq_q_len = subseq_q_end - subseq_q_begin;
+    if (subseq_q_len == 0) {
         return;
     }
-    const uint total_blocks_num = (kv_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+
+    // Single-token path uses the latest token from each subsequence.
+    const uint q_token_idx = subseq_q_end - 1;
+    const uint kv_len = past_lens[seq_idx] + subseq_q_len;
+
+    const uint block_begin = block_indices_begins[seq_idx];
+    const uint block_end = block_indices_begins[seq_idx + 1];
+    const uint total_blocks_num = block_end - block_begin;
+
+    // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
+    const uint blocks_per_partition = (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
+    const uint start_block_idx = block_begin + kv_partition_idx * blocks_per_partition;
+
+    if(kv_partition_idx * KV_PARTITION_SIZE >= kv_len || start_block_idx >= block_end) {
+        return;
+    }
     constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
 
     //# Load Q into register(as dpas-A tile)
-    const uint qo_offset = (seq_idx * HEADS_NUM * q_len + head_num_idx) * HEAD_SIZE;
+    const uint qo_offset = (q_token_idx * HEADS_NUM + head_num_idx) * HEAD_SIZE;
 
     matrix <half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
     cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
@@ -142,15 +156,15 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     #else
         constexpr uint per_k_block_element_num = KV_HEADS_NUM * HEAD_SIZE * (KV_BLOCK_SIZE + KV_SCALE_ZP_SIZE); // 4 bytes: scale/zp
     #endif
-    uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
+    uint block_num = blocks_per_partition;
 
     uint leftover_size = 0;
     if(kv_partition_idx == kv_partition_num - 1) {
         // last partition
         leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
     }
-    if(block_num > total_blocks_num - start_block_idx) {
-        block_num = total_blocks_num - start_block_idx;
+    if(block_num > block_end - start_block_idx) {
+        block_num = block_end - start_block_idx;
     }
 
     //# rS = Q @ Kt
@@ -637,6 +651,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
     float* input [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
+    int* subsequence_begins [[type("svmptr_t")]],
     int kv_partition_num
     ) {
         auto batch = cm_global_id(0);
@@ -691,6 +706,12 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
 
         out_mat = cm_mul<half>(out_mat_f32, (float)1.0f);
         // write output
-        uint output_offset = batch * HEADS_NUM * HEAD_SIZE + head * HEAD_SIZE + offset;
+        uint q_begin = subsequence_begins[batch];
+        uint q_end = subsequence_begins[batch + 1];
+        if (q_end <= q_begin) {
+            return;
+        }
+        uint q_token_idx = q_end - 1;
+        uint output_offset = q_token_idx * HEADS_NUM * HEAD_SIZE + head * HEAD_SIZE + offset;
         cm_svm_block_write<half, REDUCE_SPLIT_SIZE>((svmptr_t)(output + output_offset), out_mat.format<half>());
     }

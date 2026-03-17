@@ -1,7 +1,5 @@
 import functools
 import os
-from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 import pytest
@@ -10,304 +8,32 @@ import torch.nn.functional as F
 
 from clops import cl
 from clops.utils import Colors
+from pa_test_common import (
+    CacheQuantMode,
+    DIV_UP,
+    KVCacheTable,
+    KVCacheUpdater,
+    KernelInputs,
+    PagedAttentionTestCase,
+    check_close,
+    create_paged_attention_inputs,
+    create_subsequence_tensors,
+    flash_attn_vlen_ref,
+    get_attention_mask,
+    get_cm_grf_width,
+    get_sequence_ranges,
+    ss,
+)
 
 cl.profiling(True)
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
 
-def get_cm_grf_width():
-    cm_kernels = cl.kernels(r'''
-    extern "C" _GENX_MAIN_ void cm_get_grf_width(int * info [[type("svmptr_t")]]) {
-        info[0] = CM_GRF_WIDTH;
-    }''', "-cmc")
-    t_info = cl.tensor([2], np.dtype(np.int32))
-    cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
-    return t_info.numpy()[0]
-
-
 CM_GRF_WIDTH = get_cm_grf_width()
 print(f"{CM_GRF_WIDTH=}")
 
 
-def quan_per_token(kv: torch.Tensor) -> torch.Tensor:
-    """Per-token affine quantization for KV cache blocks.
-
-    Input layout: [num_blocks, num_kv_heads, block_size, head_size] (fp16).
-    Output layout: [num_blocks, num_kv_heads, block_size * (head_size + 4)] (u8),
-    where each token stores:
-        - quantized data: head_size bytes
-        - dequant scale: 2 bytes (fp16)
-        - zero-point:    2 bytes (fp16)
-    """
-    blk_num, kv_heads, blksz, *_ = kv.shape
-    kv_max = kv.amax(dim=-1, keepdim=True)
-    kv_min = kv.amin(dim=-1, keepdim=True)
-    qrange = kv_max - kv_min
-    zero_range_mask = qrange == 0
-
-    int_max = 255.0
-    int_min = 0.0
-    int_range = int_max - int_min
-    safe_qrange = torch.where(zero_range_mask, torch.ones_like(qrange), qrange)
-    kv_scale = (int_range / safe_qrange).to(dtype=torch.half)
-    kv_zp = ((0.0 - kv_min) * kv_scale + int_min).to(dtype=torch.half)
-
-    # For constant-value tokens (including zero-padding), force a finite affine map
-    # to avoid inf/nan in quant/dequant metadata.
-    kv_scale = torch.where(zero_range_mask, torch.ones_like(kv_scale), kv_scale)
-    kv_zp = torch.where(zero_range_mask, (-kv_min).to(dtype=torch.half), kv_zp)
-
-    # Quantized payload is uint8; clamp guards against small numerical overshoot.
-    kv_int8 = torch.round(kv * kv_scale + kv_zp).clamp(int_min, int_max).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-
-    # Store dequant parameters as raw fp16 bytes in uint8 tensor tail.
-    dq_scale = (1.0 / kv_scale).view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    return torch.concat((kv_int8, dq_scale, kv_zp), dim=-1)
-
-
-def DIV_UP(x, y):
-    return (x + y - 1) // y
-
-
-def ss(num_tokens: int, past_len: int = 0) -> "SubsequenceDescriptor":
-    return SubsequenceDescriptor(num_tokens=num_tokens, past_len=past_len)
-
-
-@dataclass(frozen=True)
-class SubsequenceDescriptor:
-    num_tokens: int
-    past_len: int = 0
-
-    def __post_init__(self):
-        if self.num_tokens <= 0:
-            raise ValueError(f"num_tokens must be positive, got {self.num_tokens}")
-        if self.past_len < 0:
-            raise ValueError(f"past_len must be non-negative, got {self.past_len}")
-
-    @property
-    def total_seq_len(self) -> int:
-        return self.past_len + self.num_tokens
-
-
-class CacheQuantMode(str, Enum):
-    BY_TOKEN = "BY_TOKEN"
-
-
-@dataclass(frozen=True)
-class PagedAttentionTestCase:
-    subsequences: tuple[SubsequenceDescriptor, ...]
-    num_heads: int = 2
-    num_kv_heads: int = 2
-    k_head_size: int = 64
-    v_head_size: int = 64
-    block_size: int = 16
-    kv_cache_compression: bool = False
-    key_cache_quant_mode: CacheQuantMode = CacheQuantMode.BY_TOKEN
-
-# Helper dataclasses for test input generation,
-# simulating the tensor shapes and data that would be generated
-# in a real multi-sequence attention scenario with KV cache updates.
-# All are in uncompressed fp16 format, as the KV cache updater will
-# handle quantization if enabled.
-@dataclass(frozen=True)
-class SubsequenceTensors:
-    q_cur: torch.Tensor
-    k_cur: torch.Tensor
-    v_cur: torch.Tensor
-    k_past: torch.Tensor
-    v_past: torch.Tensor
-
-@dataclass(frozen=True)
-class KVCacheTable:
-    block_indices: torch.Tensor
-    block_indices_begins: torch.Tensor
-    key_cache: torch.Tensor
-    value_cache: torch.Tensor
-
-
-KernelInputs = dict[str, object]
-
-
-class KVCacheUpdater:
-    def __init__(
-        self,
-        num_heads: int,
-        num_kv_heads: int,
-        head_size: int,
-        block_sz: int,
-        compressed_kvcache: bool,
-        is_causal: bool = True,
-    ):
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.block_sz = block_sz
-        self.compressed_kvcache = compressed_kvcache
-        self.is_causal = is_causal
-
-    def _build_sequence_cache_blocks(self, key: torch.Tensor, value: torch.Tensor, context_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        padded_context_len = DIV_UP(context_len, self.block_sz) * self.block_sz
-        if padded_context_len != context_len:
-            padding_tokens = padded_context_len - context_len
-            pad_dims = (0, 0, 0, 0, 0, padding_tokens)
-            padded_key = F.pad(key[:context_len], pad_dims, "constant", 0)
-            padded_value = F.pad(value[:context_len], pad_dims, "constant", 0)
-        else:
-            padded_key = key[:context_len]
-            padded_value = value[:context_len]
-
-        key_blocks = padded_key.reshape(-1, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
-        value_blocks = padded_value.reshape(-1, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
-        return key_blocks, value_blocks
-
-    def update_cache_for_subsequence(
-        self,
-        current_key: torch.Tensor,
-        current_value: torch.Tensor,
-        past_len: int,
-        context_len: int,
-        past_key_cache_blocks: torch.Tensor,
-        past_value_cache_blocks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Local KV cache table slice for this subsequence.
-        local_num_blocks = int(past_key_cache_blocks.shape[0])
-        local_block_indices = torch.arange(local_num_blocks, dtype=torch.long)
-
-        if self.compressed_kvcache:
-            past_key_cache_blocks = quan_per_token(past_key_cache_blocks)
-            past_value_cache_blocks = quan_per_token(past_value_cache_blocks)
-
-        # Simulate kv_cache_update input stage: dequantize/recover past tokens from cache.
-        k_past = self.recover_context_from_cache(
-            past_key_cache_blocks[local_block_indices].contiguous(),
-            past_len,
-            self.num_kv_heads,
-            self.head_size,
-            self.block_sz,
-            self.compressed_kvcache,
-        )
-        v_past = self.recover_context_from_cache(
-            past_value_cache_blocks[local_block_indices].contiguous(),
-            past_len,
-            self.num_kv_heads,
-            self.head_size,
-            self.block_sz,
-            self.compressed_kvcache,
-        )
-
-        # Simulate kv_cache_update behavior: decode/dequantize past cache, append current KV,
-        # then write back to cache layout (and quantize if compression is enabled).
-        k_cache_source = torch.cat((k_past, current_key), dim=0).contiguous()
-        v_cache_source = torch.cat((v_past, current_value), dim=0).contiguous()
-        sequence_key_cache, sequence_value_cache = self._build_sequence_cache_blocks(k_cache_source, v_cache_source, context_len)
-        if self.compressed_kvcache:
-            sequence_key_cache = quan_per_token(sequence_key_cache)
-            sequence_value_cache = quan_per_token(sequence_value_cache)
-        return sequence_key_cache, sequence_value_cache
-
-    @staticmethod
-    def recover_context_from_cache(
-        cache_blocks: torch.Tensor,
-        context_len: int,
-        num_kv_heads: int,
-        head_size: int,
-        block_size: int,
-        compressed_kvcache: bool,
-    ) -> torch.Tensor:
-        if compressed_kvcache:
-            cache_blocks = dequant_cache_per_token(cache_blocks, block_size, head_size)
-        return cache_blocks.transpose(1, 2).reshape(-1, num_kv_heads, head_size)[:context_len].contiguous()
-
-    def __call__(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        past_lens: list[int],
-        subsequence_begins: list[int],
-        block_indices: torch.Tensor,
-        block_indices_begins: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-    ) -> KernelInputs:
-        num_sequences = len(past_lens)
-        if len(subsequence_begins) != num_sequences + 1:
-            raise ValueError("subsequence_begins must have len(past_lens) + 1 entries")
-
-        total_tokens = int(subsequence_begins[-1])
-        if int(key.shape[0]) != total_tokens or int(value.shape[0]) != total_tokens:
-            raise ValueError("packed key/value token dimensions must match subsequence_begins")
-        if int(key.shape[1]) != self.num_kv_heads * self.head_size:
-            raise ValueError("packed key feature dimension must be num_kv_heads * head_size")
-        if int(value.shape[1]) != self.num_kv_heads * self.head_size:
-            raise ValueError("packed value feature dimension must be num_kv_heads * head_size")
-
-        key_cache_blocks: list[torch.Tensor] = []
-        value_cache_blocks: list[torch.Tensor] = []
-        out_past_lens: list[int] = []
-        num_total_blocks = int(block_indices.numel())
-        max_context_len = 0
-
-        if int(subsequence_begins[0]) != 0:
-            raise ValueError("subsequence_begins must start from 0")
-
-        for sequence_id in range(num_sequences):
-            past_len = int(past_lens[sequence_id])
-            begin = int(subsequence_begins[sequence_id])
-            end = int(subsequence_begins[sequence_id + 1])
-            if end <= begin:
-                raise ValueError("subsequence_begins must be strictly increasing")
-            num_tokens = end - begin
-            if num_tokens <= 0:
-                raise ValueError("num_tokens must be positive")
-
-            k_slice = key[begin:end].reshape(num_tokens, self.num_kv_heads, self.head_size).contiguous()
-            v_slice = value[begin:end].reshape(num_tokens, self.num_kv_heads, self.head_size).contiguous()
-            context_len = past_len + num_tokens
-
-            blk_start = int(block_indices_begins[sequence_id].item())
-            blk_end = int(block_indices_begins[sequence_id + 1].item())
-            sequence_physical_blocks = block_indices[blk_start:blk_end].to(dtype=torch.long)
-            past_key_cache_blocks = key_cache[sequence_physical_blocks].contiguous()
-            past_value_cache_blocks = value_cache[sequence_physical_blocks].contiguous()
-            num_sequence_blocks = int(sequence_physical_blocks.numel())
-
-            sequence_key_cache, sequence_value_cache = self.update_cache_for_subsequence(
-                k_slice,
-                v_slice,
-                past_len,
-                context_len,
-                past_key_cache_blocks,
-                past_value_cache_blocks,
-            )
-            if int(sequence_key_cache.shape[0]) != num_sequence_blocks:
-                raise ValueError("Per-subsequence KV cache table size does not match cache block count")
-
-            key_cache_blocks.append(sequence_key_cache)
-            value_cache_blocks.append(sequence_value_cache)
-
-            out_past_lens.append(past_len)
-            if context_len > max_context_len:
-                max_context_len = context_len
-
-        key_cache = torch.cat(key_cache_blocks, dim=0).contiguous()
-        value_cache = torch.cat(value_cache_blocks, dim=0).contiguous()
-        if int(key_cache.shape[0]) != num_total_blocks:
-            raise ValueError("Global KV cache table size does not match total cache blocks")
-
-        return {
-            "query": torch.empty((total_tokens, self.num_heads * self.head_size), dtype=key.dtype),
-            "key_cache": key_cache,
-            "value_cache": value_cache,
-            "past_lens": torch.tensor(out_past_lens, dtype=torch.int32),
-            "subsequence_begins": torch.tensor(subsequence_begins, dtype=torch.int32),
-            "block_indices": block_indices.to(dtype=torch.int32),
-            "block_indices_begins": block_indices_begins.to(dtype=torch.int32),
-            "max_context_len": max_context_len,
-        }
-
-
-class AttentionExecutor:
+class PaMultiTokenRunner:
     def __init__(
         self,
         num_heads,
@@ -358,7 +84,7 @@ class AttentionExecutor:
             f" -DCMPA_KVCACHE_U8={int(self.compressed_kvcache)}"
         )
 
-        # Generic dynamic path (uses runtime local size to derive wg_seq_len in kernel).
+        # Generic dynamic path (uses pa_runner local size to derive wg_seq_len in kernel).
         dynamic_options = base_options
         self.kernels_dynamic = cl.kernels(src1, dynamic_options)
 
@@ -380,7 +106,7 @@ class AttentionExecutor:
         sparse_block_size=1,
         enable_hybrid_dispatch=True,
     ):
-        return AttentionExecutor(
+        return PaMultiTokenRunner(
             num_heads,
             num_kv_heads,
             head_size,
@@ -497,7 +223,189 @@ class AttentionExecutor:
         return output
 
 
-class PagedAttentionRuntime:
+class PaSingleTokenRunner:
+    def __init__(
+        self,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        kv_cache_compression: bool,
+    ):
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.block_size = block_size
+        self.kv_cache_compression = kv_cache_compression
+        self.kvcache_quantization_by_token = 1
+
+        self.cm_grf_width = get_cm_grf_width()
+        self.xe_arch = 1 if self.cm_grf_width == 256 else 2
+        self.kv_step = 8 if self.xe_arch == 1 else 16
+
+        self.k_partition_block_num = 1
+        self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
+        self.reduce_split_step = 8
+
+        max_repeat_count = 8
+        q_heads_per_kv_head = self.num_heads // self.num_kv_heads
+        self.q_head_chunks_per_kv_head = (q_heads_per_kv_head + (max_repeat_count - 1)) // max_repeat_count
+        self.q_head_chunk_size = self.num_heads // (self.num_kv_heads * self.q_head_chunks_per_kv_head)
+        self.scale_factor = 1.0 / (self.head_size ** 0.5)
+
+    @staticmethod
+    @functools.cache
+    def create_instance(
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        kv_cache_compression: bool,
+    ):
+        return PaSingleTokenRunner(
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            kv_cache_compression,
+        )
+
+    @staticmethod
+    @functools.cache
+    def _create_kernels_cached(
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        kv_step: int,
+        block_size: int,
+        kv_partition_size: int,
+        reduce_split_step: int,
+        clean_unused_kvcache: int,
+        kv_cache_compression: int,
+        kv_cache_compression_by_token: int,
+        xe_arch: int,
+        q_head_chunks_per_kv_head: int,
+        q_head_chunk_size: int,
+        scale_factor: float,
+    ):
+        src = r'''#include "pa_single_token.cm"'''
+        cwd = os.path.dirname(os.path.realpath(__file__))
+        return cl.kernels(src, f'''-cmc -Qxcm_jit_option=""
+                            -mCM_printregusage -mdump_asm -g2
+                            -Qxcm_register_file_size=256 -I{cwd}
+                            -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
+                            -DQ_STEP=32 -DKV_STEP={kv_step}
+                            -DWG_SIZE=1 -DKV_BLOCK_SIZE={block_size}
+                            -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
+                            -DCLEAN_UNUSED_KVCACHE={clean_unused_kvcache}
+                            -DKV_CACHE_COMPRESSION={kv_cache_compression}
+                            -DKV_CACHE_COMPRESSION_BY_TOKEN={kv_cache_compression_by_token}
+                            -DXE_ARCH={xe_arch}
+                            -DQ_head_chunks_per_kv_head={q_head_chunks_per_kv_head}
+                            -DQ_head_chunk_size={q_head_chunk_size}
+                            -DSCALE_FACTOR={scale_factor}''')
+
+    def _create_kernels(self):
+        return self._create_kernels_cached(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.kv_step,
+            self.block_size,
+            self.kv_partition_size,
+            self.reduce_split_step,
+            1,
+            int(self.kv_cache_compression),
+            self.kvcache_quantization_by_token,
+            self.xe_arch,
+            int(self.q_head_chunks_per_kv_head),
+            int(self.q_head_chunk_size),
+            self.scale_factor,
+        )
+
+    def __call__(self, kern_attn_inputs: KernelInputs, n_repeats: int = 1) -> torch.Tensor:
+        query = kern_attn_inputs["query"]
+        past_lens_t = kern_attn_inputs["past_lens"]
+        block_indices_t = kern_attn_inputs["block_indices"]
+        block_indices_begins_t = kern_attn_inputs["block_indices_begins"]
+        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
+        key_cache_t = kern_attn_inputs["key_cache"]
+        value_cache_t = kern_attn_inputs["value_cache"]
+
+        assert isinstance(query, torch.Tensor)
+        assert isinstance(past_lens_t, torch.Tensor)
+        assert isinstance(block_indices_t, torch.Tensor)
+        assert isinstance(block_indices_begins_t, torch.Tensor)
+        assert isinstance(subsequence_begins_t, torch.Tensor)
+        assert isinstance(key_cache_t, torch.Tensor)
+        assert isinstance(value_cache_t, torch.Tensor)
+
+        batch_size = int(past_lens_t.numel())
+        if int(query.shape[0]) != batch_size:
+            raise ValueError("pa_single_token path expects one query token per sequence")
+
+        token_counts = torch.diff(subsequence_begins_t)
+        if token_counts.numel() and not torch.all(token_counts == 1).item():
+            raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
+
+        max_context_len = int(kern_attn_inputs["max_context_len"])
+        kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
+        q_tokens = query.reshape(batch_size, self.num_heads, self.head_size).contiguous()
+
+        output = torch.zeros(batch_size, self.num_heads * self.head_size, dtype=torch.float16)
+
+        kernels = self._create_kernels()
+        gws = [batch_size, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
+        lws = [1, 1, 1]
+        gws_2 = [batch_size, self.num_heads, self.head_size // self.reduce_split_step]
+        lws_2 = [1, 1, 1]
+
+        for _ in range(n_repeats):
+            t_q = cl.tensor(q_tokens.detach().numpy())
+            t_k = cl.tensor(key_cache_t.detach().numpy())
+            t_v = cl.tensor(value_cache_t.detach().numpy())
+            t_past_lens = cl.tensor(past_lens_t.detach().numpy())
+            t_block_indices = cl.tensor(block_indices_t.detach().numpy())
+            t_block_indices_begins = cl.tensor(block_indices_begins_t.detach().numpy())
+            t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
+            t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
+            t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
+            t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
+
+            print(f"{Colors.GREEN}[enqueue single] gws={gws} lws={lws}{Colors.END}")
+
+            kernels.enqueue(
+                "cm_sdpa_2nd",
+                gws,
+                lws,
+                t_q,
+                t_k,
+                t_v,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                t_lse,
+                1,
+            )
+            kernels.enqueue(
+                "cm_sdpa_2nd_reduce",
+                gws_2,
+                lws_2,
+                t_out,
+                t_out_final,
+                t_lse,
+                t_subsequence_begins,
+                kv_partition_num,
+            )
+            cl.finish()
+            output = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
+
+        assert torch.isfinite(output).all().item()
+        return output
+
+class PagedAttentionRunner:
     def __init__(
         self,
         num_heads: int,
@@ -515,7 +423,7 @@ class PagedAttentionRuntime:
             kv_cache_compression,
             is_causal,
         )
-        self.attn_executor = AttentionExecutor.create_instance(
+        self.multi_token_runner = PaMultiTokenRunner.create_instance(
             num_heads,
             num_kv_heads,
             head_size,
@@ -523,8 +431,15 @@ class PagedAttentionRuntime:
             kv_cache_compression,
             is_causal,
         )
+        self.single_token_runner = PaSingleTokenRunner.create_instance(
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            kv_cache_compression,
+        )
 
-    def stage_kvcache_update(
+    def kvcache_update(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -543,294 +458,117 @@ class PagedAttentionRuntime:
             kvcache_table.value_cache,
         )
 
-    def stage_attention(
+    def multi_token_attention(
         self,
         kern_attn_inputs: KernelInputs,
     ) -> torch.Tensor:
-        attn_outputs = self.attn_executor(kern_attn_inputs)
+        attn_outputs = self.multi_token_runner(kern_attn_inputs)
         return attn_outputs
 
+    def single_token_attention(
+        self,
+        kern_attn_inputs: KernelInputs,
+    ) -> torch.Tensor:
+        attn_outputs = self.single_token_runner(kern_attn_inputs)
+        return attn_outputs
 
-def create_subsequence_tensors(
-    subsequence: SubsequenceDescriptor,
-    num_heads,
-    num_kv_heads,
-    head_size,
-    act_dtype=torch.float16,
-) -> SubsequenceTensors:
-    low = -1
-    high = 2
-    q_cur = torch.randint(low, high, [subsequence.num_tokens, num_heads, head_size]).to(dtype=act_dtype)
-
-    # Current KV are always uncompressed fp16 tensors.
-    k_cur = torch.rand(subsequence.num_tokens, num_kv_heads, head_size).to(dtype=act_dtype)
-    v_cur = torch.rand(subsequence.num_tokens, num_kv_heads, head_size).to(dtype=act_dtype) / high
-
-    # Past KV are uncompressed fp16 token tensors of past_len.
-    k_past = torch.rand(subsequence.past_len, num_kv_heads, head_size).to(dtype=act_dtype)
-    v_past = torch.rand(subsequence.past_len, num_kv_heads, head_size).to(dtype=act_dtype) / high
-
-    return SubsequenceTensors(
-        q_cur=q_cur,
-        k_cur=k_cur,
-        v_cur=v_cur,
-        k_past=k_past,
-        v_past=v_past,
-    )
-
-
-def create_kvcache_table(
-    subsequences: tuple[SubsequenceDescriptor, ...],
-    subsequence_tensors: list[SubsequenceTensors],
-    num_kv_heads: int,
-    head_size: int,
-    block_size: int,
-    keep_order=False,
-) -> KVCacheTable:
-    block_indices_begins = [0]
-    num_blocks_total = 0
-    sequence_key_cache_blocks: list[torch.Tensor] = []
-    sequence_value_cache_blocks: list[torch.Tensor] = []
-
-    for subsequence, tensors in zip(subsequences, subsequence_tensors):
-        num_seq_blocks = DIV_UP(subsequence.total_seq_len, block_size)
-        padded_len = num_seq_blocks * block_size
-
-        k_past_padded = torch.zeros(padded_len, num_kv_heads, head_size, dtype=tensors.k_past.dtype)
-        v_past_padded = torch.zeros(padded_len, num_kv_heads, head_size, dtype=tensors.v_past.dtype)
-        if subsequence.past_len > 0:
-            k_past_padded[:subsequence.past_len] = tensors.k_past
-            v_past_padded[:subsequence.past_len] = tensors.v_past
-
-        sequence_key_cache_blocks.append(
-            k_past_padded.reshape(num_seq_blocks, block_size, num_kv_heads, head_size).transpose(1, 2).contiguous()
+    def run(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        past_lens: list[int],
+        subsequence_begins: list[int],
+        kvcache_table: KVCacheTable,
+        query: torch.Tensor,
+    ) -> tuple[KernelInputs, torch.Tensor]:
+        kern_attn_inputs = self.kvcache_update(
+            key,
+            value,
+            past_lens,
+            subsequence_begins,
+            kvcache_table,
         )
-        sequence_value_cache_blocks.append(
-            v_past_padded.reshape(num_seq_blocks, block_size, num_kv_heads, head_size).transpose(1, 2).contiguous()
+        kern_attn_inputs["query"] = query
+
+        past_lens_t = kern_attn_inputs["past_lens"]
+        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
+        assert isinstance(past_lens_t, torch.Tensor)
+        assert isinstance(subsequence_begins_t, torch.Tensor)
+
+        batch_size_in_tokens = int(query.shape[0])
+        batch_size_in_sequences = int(past_lens_t.numel())
+        token_counts = torch.diff(subsequence_begins_t)
+        use_single_token_path = (
+            batch_size_in_tokens == batch_size_in_sequences
+            and (token_counts.numel() == 0 or torch.all(token_counts == 1).item())
         )
 
-        num_blocks_total += num_seq_blocks
-        block_indices_begins.append(num_blocks_total)
-
-    if keep_order:
-        block_indices = torch.arange(num_blocks_total, dtype=torch.int32)
-    else:
-        block_indices = torch.randperm(num_blocks_total, dtype=torch.int32)
-
-    key_cache = torch.zeros(
-        (num_blocks_total, num_kv_heads, block_size, head_size),
-        dtype=sequence_key_cache_blocks[0].dtype,
-    )
-    value_cache = torch.zeros(
-        (num_blocks_total, num_kv_heads, block_size, head_size),
-        dtype=sequence_value_cache_blocks[0].dtype,
-    )
-
-    for sequence_index, (sequence_key_blocks, sequence_value_blocks) in enumerate(zip(sequence_key_cache_blocks, sequence_value_cache_blocks)):
-        blk_start = block_indices_begins[sequence_index]
-        blk_end = block_indices_begins[sequence_index + 1]
-        physical_blocks = block_indices[blk_start:blk_end].to(dtype=torch.long)
-        key_cache[physical_blocks] = sequence_key_blocks
-        value_cache[physical_blocks] = sequence_value_blocks
-    
-    return KVCacheTable(
-        block_indices=block_indices,
-        block_indices_begins=torch.tensor(block_indices_begins, dtype=torch.int32),
-        key_cache=key_cache.contiguous(),
-        value_cache=value_cache.contiguous(),
-    )
-
-
-def create_paged_attention_inputs(
-    case: PagedAttentionTestCase,
-    subsequence_tensors: list[SubsequenceTensors],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[int], KVCacheTable]:
-    query = torch.cat([tensors.q_cur.reshape(tensors.q_cur.shape[0], -1) for tensors in subsequence_tensors], dim=0).contiguous()
-    key = torch.cat([tensors.k_cur.reshape(tensors.k_cur.shape[0], -1) for tensors in subsequence_tensors], dim=0).contiguous()
-    value = torch.cat([tensors.v_cur.reshape(tensors.v_cur.shape[0], -1) for tensors in subsequence_tensors], dim=0).contiguous()
-
-    kvcache_table = create_kvcache_table(
-        case.subsequences,
-        subsequence_tensors,
-        case.num_kv_heads,
-        case.k_head_size,
-        case.block_size,
-    )
-    past_lens = [descriptor.past_len for descriptor in case.subsequences]
-    subsequence_begins = [0]
-    for descriptor in case.subsequences:
-        subsequence_begins.append(subsequence_begins[-1] + descriptor.num_tokens)
-
-    # Primitive-facing flattened input shapes after staging are:
-    # query: [batch_size_in_tokens, num_heads * head_size]
-    # key:   [batch_size_in_tokens, num_kv_heads * head_size]
-    # value: [batch_size_in_tokens, num_kv_heads * head_size]
-    return query, key, value, past_lens, subsequence_begins, kvcache_table
-
-
-def dequant_cache_per_token(cache: torch.Tensor, block_size: int, head_size: int) -> torch.Tensor:
-    if cache.dtype != torch.uint8:
-        raise ValueError("dequant_cache_per_token expects uint8 cache")
-
-    data_size = block_size * head_size
-    scale_size = block_size * 2
-    data = cache[:, :, :data_size].reshape(cache.shape[0], cache.shape[1], block_size, head_size).to(dtype=torch.float16)
-    dq_scale = cache[:, :, data_size:data_size + scale_size].reshape(cache.shape[0], cache.shape[1], block_size, 2).contiguous().view(dtype=torch.float16)
-    zp = cache[:, :, data_size + scale_size:].reshape(cache.shape[0], cache.shape[1], block_size, 2).contiguous().view(dtype=torch.float16)
-
-    return (data - zp) * dq_scale
-
-
-def get_attention_mask(q_len: int, kv_len: int, num_heads: int, q_dtype: torch.dtype, q_device: torch.device, past_len: int, is_causal=True):
-    attention_mask = torch.full([num_heads, q_len, kv_len], True, dtype=torch.bool, device=q_device)
-    if is_causal:
-        query_positions = past_len + torch.arange(q_len, device=q_device).unsqueeze(1)
-        key_positions = torch.arange(kv_len, device=q_device).unsqueeze(0)
-        causal_pattern = key_positions <= query_positions
-        causal_pattern = causal_pattern.unsqueeze(0).repeat_interleave(num_heads, dim=0)
-        attention_mask = attention_mask & causal_pattern
-    attention_mask = torch.where(attention_mask, 0, torch.finfo(q_dtype).min)
-    return attention_mask.unsqueeze(0)
-
-
-def flash_attn_vlen_ref(q, k, v, cu_seqlens, is_causal=True, attention_mask=None):
-    seq_length, num_heads, head_size = q.shape
-    kv_seq_length, num_kv_heads, head_size = k.shape
-    old_dtype = q.dtype
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
-
-    if attention_mask is not None:
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(0).to(torch.float16),
-            k.unsqueeze(0).to(torch.float16),
-            v.unsqueeze(0).to(torch.float16),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            enable_gqa=(num_kv_heads != num_heads),
-        )
-        print(".")
-        return attn_output.squeeze(0).transpose(0, 1).to(old_dtype)
-
-    if is_causal:
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(0).to(torch.float16),
-            k.unsqueeze(0).to(torch.float16),
-            v.unsqueeze(0).to(torch.float16),
-            is_causal=True,
-            dropout_p=0.0,
-            enable_gqa=(num_kv_heads != num_heads),
-        )
-    else:
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        if len(cu_seqlens):
-            for i in range(1, len(cu_seqlens)):
-                attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i], cu_seqlens[i - 1]:cu_seqlens[i]] = True
+        if use_single_token_path:
+            attn_outputs = self.single_token_attention(kern_attn_inputs)
         else:
-            attention_mask[...] = True
+            attn_outputs = self.multi_token_attention(kern_attn_inputs)
+        return kern_attn_inputs, attn_outputs
 
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(0).to(torch.float16),
-            k.unsqueeze(0).to(torch.float16),
-            v.unsqueeze(0).to(torch.float16),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            enable_gqa=(num_kv_heads != num_heads),
-        )
+    def reference_attention(self, kern_attn_inputs: KernelInputs) -> torch.Tensor:
+        query = kern_attn_inputs["query"]
+        past_lens = kern_attn_inputs["past_lens"]
+        block_indices = kern_attn_inputs["block_indices"]
+        key_cache = kern_attn_inputs["key_cache"]
+        value_cache = kern_attn_inputs["value_cache"]
+        assert isinstance(query, torch.Tensor)
+        assert isinstance(past_lens, torch.Tensor)
+        assert isinstance(block_indices, torch.Tensor)
+        assert isinstance(key_cache, torch.Tensor)
+        assert isinstance(value_cache, torch.Tensor)
 
-    print(".")
-    return attn_output.squeeze(0).transpose(0, 1).to(old_dtype)
+        refs = []
+        for sequence_index in range(int(past_lens.numel())):
+            q_start, q_end, blk_start, blk_end = get_sequence_ranges(kern_attn_inputs, sequence_index)
+            q_len = q_end - q_start
+            past_len = int(past_lens[sequence_index].item())
+            context_len = past_len + q_len
 
+            q = query[q_start:q_end].reshape(q_len, self.multi_token_runner.num_heads, self.multi_token_runner.head_size).contiguous()
+            physical_blocks = block_indices[blk_start:blk_end]
+            key_cache_blocks = key_cache[physical_blocks].contiguous()
+            value_cache_blocks = value_cache[physical_blocks].contiguous()
 
-def check_close(input_tensor, other_tensor, atol=1e-2, rtol=1e-2):
-    print(f"[check_close] {input_tensor.shape}{input_tensor.dtype} vs {other_tensor.shape}{other_tensor.dtype}")
-    rtol_max = (((input_tensor - other_tensor).abs() - 1e-5) / other_tensor.abs())[other_tensor != 0].max()
-    atol_max = (((input_tensor - other_tensor).abs()) - 1e-5 * other_tensor.abs()).max()
-    print(f"[check_close] rtol_max: {rtol_max}")
-    print(f"[check_close] atol_max: {atol_max}")
-    if not torch.allclose(input_tensor, other_tensor, atol=atol, rtol=rtol, equal_nan=True):
-        close_check = torch.isclose(input_tensor, other_tensor, atol=atol, rtol=rtol)
-        not_close_indices = torch.where(~close_check)
-        print(f"Not close indices: {not_close_indices}")
-        print(f"    input_tensor: {input_tensor[not_close_indices]}")
-        print(f"    other_tensor: {other_tensor[not_close_indices]}")
-        raise AssertionError("Output mismatch")
+            key_context = KVCacheUpdater.recover_context_from_cache(
+                key_cache_blocks,
+                context_len,
+                self.multi_token_runner.num_kv_heads,
+                self.multi_token_runner.head_size,
+                self.multi_token_runner.block_sz,
+                self.multi_token_runner.compressed_kvcache,
+            )
+            value_context = KVCacheUpdater.recover_context_from_cache(
+                value_cache_blocks,
+                context_len,
+                self.multi_token_runner.num_kv_heads,
+                self.multi_token_runner.head_size,
+                self.multi_token_runner.block_sz,
+                self.multi_token_runner.compressed_kvcache,
+            )
+            attention_mask = get_attention_mask(
+                q_len,
+                context_len,
+                self.multi_token_runner.num_heads,
+                q.dtype,
+                q.device,
+                past_len=past_len,
+                is_causal=self.multi_token_runner.is_causal,
+            )
+            ref = flash_attn_vlen_ref(
+                q,
+                key_context,
+                value_context,
+                [],
+                self.multi_token_runner.is_causal,
+                attention_mask,
+            )
+            refs.append(ref.reshape(q_len, -1))
 
-
-def get_sequence_ranges(kern_attn_inputs: KernelInputs, sequence_index: int) -> tuple[int, int, int, int]:
-    subsequence_begins = kern_attn_inputs["subsequence_begins"]
-    block_indices_begins = kern_attn_inputs["block_indices_begins"]
-    assert isinstance(subsequence_begins, torch.Tensor)
-    assert isinstance(block_indices_begins, torch.Tensor)
-    q_start = int(subsequence_begins[sequence_index].item())
-    q_end = int(subsequence_begins[sequence_index + 1].item())
-    blk_start = int(block_indices_begins[sequence_index].item())
-    blk_end = int(block_indices_begins[sequence_index + 1].item())
-    return q_start, q_end, blk_start, blk_end
-
-
-def reference_attention(
-    kern_attn_inputs: KernelInputs,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    block_size: int,
-    compressed_kvcache: bool,
-    is_causal: bool,
-) -> torch.Tensor:
-    query = kern_attn_inputs["query"]
-    past_lens = kern_attn_inputs["past_lens"]
-    block_indices = kern_attn_inputs["block_indices"]
-    key_cache = kern_attn_inputs["key_cache"]
-    value_cache = kern_attn_inputs["value_cache"]
-    assert isinstance(query, torch.Tensor)
-    assert isinstance(past_lens, torch.Tensor)
-    assert isinstance(block_indices, torch.Tensor)
-    assert isinstance(key_cache, torch.Tensor)
-    assert isinstance(value_cache, torch.Tensor)
-
-    refs = []
-    for sequence_index in range(int(past_lens.numel())):
-        q_start, q_end, blk_start, blk_end = get_sequence_ranges(kern_attn_inputs, sequence_index)
-        q_len = q_end - q_start
-        past_len = int(past_lens[sequence_index].item())
-        context_len = past_len + q_len
-
-        q = query[q_start:q_end].reshape(q_len, num_heads, head_size).contiguous()
-        physical_blocks = block_indices[blk_start:blk_end]
-        key_cache_blocks = key_cache[physical_blocks].contiguous()
-        value_cache_blocks = value_cache[physical_blocks].contiguous()
-
-        key_context = KVCacheUpdater.recover_context_from_cache(
-            key_cache_blocks,
-            context_len,
-            num_kv_heads,
-            head_size,
-            block_size,
-            compressed_kvcache,
-        )
-        value_context = KVCacheUpdater.recover_context_from_cache(
-            value_cache_blocks,
-            context_len,
-            num_kv_heads,
-            head_size,
-            block_size,
-            compressed_kvcache,
-        )
-        attention_mask = get_attention_mask(
-            q_len,
-            context_len,
-            num_heads,
-            q.dtype,
-            q.device,
-            past_len=past_len,
-            is_causal=is_causal,
-        )
-        ref = flash_attn_vlen_ref(q, key_context, value_context, [], is_causal, attention_mask)
-        refs.append(ref.reshape(q_len, -1))
-
-    return torch.cat(refs, dim=0)
+        return torch.cat(refs, dim=0)
 
 
 def run_paged_attention_smoke_case(case: PagedAttentionTestCase, check_acc=True) -> KernelInputs:
@@ -858,7 +596,7 @@ def run_paged_attention_smoke_case(case: PagedAttentionTestCase, check_acc=True)
         subsequence_tensors,
     )
 
-    runtime = PagedAttentionRuntime(
+    pa_runner = PagedAttentionRunner(
         case.num_heads,
         case.num_kv_heads,
         case.k_head_size,
@@ -867,20 +605,17 @@ def run_paged_attention_smoke_case(case: PagedAttentionTestCase, check_acc=True)
         True,
     )
 
-    kern_attn_inputs = runtime.stage_kvcache_update(key, value, past_lens, subsequence_begins, kvcache_table)
-    kern_attn_inputs["query"] = query
-    attn_outputs = runtime.stage_attention(kern_attn_inputs)
+    kern_attn_inputs, attn_outputs = pa_runner.run(
+        key,
+        value,
+        past_lens,
+        subsequence_begins,
+        kvcache_table,
+        query,
+    )
 
     if check_acc:
-        round_ref = reference_attention(
-            kern_attn_inputs,
-            num_heads=case.num_heads,
-            num_kv_heads=case.num_kv_heads,
-            head_size=case.k_head_size,
-            block_size=case.block_size,
-            compressed_kvcache=case.kv_cache_compression,
-            is_causal=True,
-        )
+        round_ref = pa_runner.reference_attention(kern_attn_inputs)
         check_close(round_ref, attn_outputs)
     else:
         assert torch.isfinite(attn_outputs).all().item()
