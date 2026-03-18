@@ -1,5 +1,6 @@
 import functools
 import os
+import time
 
 import numpy as np
 import pytest
@@ -221,6 +222,109 @@ class PaMultiTokenRunner:
 
         return output
 
+    def run_perf(
+        self,
+        kern_attn_inputs: KernelInputs,
+        n_warmup: int = 5,
+        n_iters: int = 20,
+    ) -> tuple[torch.Tensor, list[int], float, str]:
+        query = kern_attn_inputs["query"]
+        key_cache = kern_attn_inputs["key_cache"]
+        value_cache = kern_attn_inputs["value_cache"]
+        past_lens = kern_attn_inputs["past_lens"]
+        block_indices = kern_attn_inputs["block_indices"]
+        block_indices_begins = kern_attn_inputs["block_indices_begins"]
+        subsequence_begins = kern_attn_inputs["subsequence_begins"]
+
+        assert isinstance(query, torch.Tensor)
+        assert isinstance(key_cache, torch.Tensor)
+        assert isinstance(value_cache, torch.Tensor)
+        assert isinstance(past_lens, torch.Tensor)
+        assert isinstance(block_indices, torch.Tensor)
+        assert isinstance(block_indices_begins, torch.Tensor)
+        assert isinstance(subsequence_begins, torch.Tensor)
+
+        batch_size_in_tokens = query.shape[0]
+        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
+
+        q_tensor = query.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
+        kernel_key_cache = self._format_cache_for_kernel(key_cache.contiguous())
+        kernel_value_cache = self._format_cache_for_kernel(value_cache.contiguous())
+        out_shape = (batch_size_in_tokens, self.num_heads, self.head_size)
+
+        t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
+        t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
+        t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
+        t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
+        t_past_lens = cl.tensor(past_lens.detach().numpy())
+        t_block_indices = cl.tensor(block_indices.detach().numpy())
+        t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
+        t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+
+        q_step = self.q_step
+        wg_size = self.max_wg_size
+        wg_seq_len = wg_size * q_step
+
+        wg_count = 0
+        for sequence_index in range(int(past_lens.numel())):
+            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
+            subsequence_q_len = q_end - q_start
+            wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
+        gws = [1, self.num_heads, int(wg_count * wg_size)]
+        lws = [1, 1, wg_size]
+
+        use_optimized_dispatch = (
+            self.enable_hybrid_dispatch
+            and self.kernels_optimized is not None
+            and self.sparse_block_size in (128, 256)
+            and wg_size == self.max_wg_size
+            and self.optimized_wg_seq_len == self.sparse_block_size
+        )
+        selected_kernels = self.kernels_optimized if use_optimized_dispatch else self.kernels_dynamic
+        dispatch_mode = "optimized" if use_optimized_dispatch else "dynamic"
+
+        cl.finish()
+
+        for _ in range(n_warmup):
+            selected_kernels.enqueue(
+                "cm_page_attention",
+                gws,
+                lws,
+                t_q,
+                t_key_cache,
+                t_value_cache,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                batch_size_in_tokens,
+            )
+        cl.finish()
+
+        t0 = time.perf_counter()
+        for _ in range(n_iters):
+            selected_kernels.enqueue(
+                "cm_page_attention",
+                gws,
+                lws,
+                t_q,
+                t_key_cache,
+                t_value_cache,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                batch_size_in_tokens,
+            )
+        gpu_latency_ns = cl.finish()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        output = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
+        assert torch.isfinite(output).all().item()
+        return output, gpu_latency_ns, elapsed_ms, dispatch_mode
+
 
 class PaSingleTokenRunner:
     def __init__(
@@ -404,6 +508,121 @@ class PaSingleTokenRunner:
         assert torch.isfinite(output).all().item()
         return output
 
+    def run_perf(
+        self,
+        kern_attn_inputs: KernelInputs,
+        n_warmup: int = 5,
+        n_iters: int = 20,
+    ) -> tuple[torch.Tensor, list[int], float]:
+        query = kern_attn_inputs["query"]
+        past_lens_t = kern_attn_inputs["past_lens"]
+        block_indices_t = kern_attn_inputs["block_indices"]
+        block_indices_begins_t = kern_attn_inputs["block_indices_begins"]
+        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
+        key_cache_t = kern_attn_inputs["key_cache"]
+        value_cache_t = kern_attn_inputs["value_cache"]
+
+        assert isinstance(query, torch.Tensor)
+        assert isinstance(past_lens_t, torch.Tensor)
+        assert isinstance(block_indices_t, torch.Tensor)
+        assert isinstance(block_indices_begins_t, torch.Tensor)
+        assert isinstance(subsequence_begins_t, torch.Tensor)
+        assert isinstance(key_cache_t, torch.Tensor)
+        assert isinstance(value_cache_t, torch.Tensor)
+
+        batch_size = int(past_lens_t.numel())
+        if int(query.shape[0]) != batch_size:
+            raise ValueError("pa_single_token path expects one query token per sequence")
+
+        token_counts = torch.diff(subsequence_begins_t)
+        if token_counts.numel() and not torch.all(token_counts == 1).item():
+            raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
+
+        max_context_len = int(kern_attn_inputs["max_context_len"])
+        kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
+        q_tokens = query.reshape(batch_size, self.num_heads, self.head_size).contiguous()
+
+        kernels = self._create_kernels()
+        gws = [batch_size, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
+        lws = [1, 1, 1]
+        gws_2 = [batch_size, self.num_heads, self.head_size // self.reduce_split_step]
+        lws_2 = [1, 1, 1]
+
+        t_q = cl.tensor(q_tokens.detach().numpy())
+        t_k = cl.tensor(key_cache_t.detach().numpy())
+        t_v = cl.tensor(value_cache_t.detach().numpy())
+        t_past_lens = cl.tensor(past_lens_t.detach().numpy())
+        t_block_indices = cl.tensor(block_indices_t.detach().numpy())
+        t_block_indices_begins = cl.tensor(block_indices_begins_t.detach().numpy())
+        t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
+        t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
+        t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
+        t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
+
+        cl.finish()
+
+        for _ in range(n_warmup):
+            kernels.enqueue(
+                "cm_sdpa_2nd",
+                gws,
+                lws,
+                t_q,
+                t_k,
+                t_v,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                t_lse,
+                1,
+            )
+            kernels.enqueue(
+                "cm_sdpa_2nd_reduce",
+                gws_2,
+                lws_2,
+                t_out,
+                t_out_final,
+                t_lse,
+                t_subsequence_begins,
+                kv_partition_num,
+            )
+        cl.finish()
+
+        t0 = time.perf_counter()
+        for _ in range(n_iters):
+            kernels.enqueue(
+                "cm_sdpa_2nd",
+                gws,
+                lws,
+                t_q,
+                t_k,
+                t_v,
+                t_past_lens,
+                t_block_indices,
+                t_block_indices_begins,
+                t_subsequence_begins,
+                t_out,
+                t_lse,
+                1,
+            )
+            kernels.enqueue(
+                "cm_sdpa_2nd_reduce",
+                gws_2,
+                lws_2,
+                t_out,
+                t_out_final,
+                t_lse,
+                t_subsequence_begins,
+                kv_partition_num,
+            )
+        gpu_latency_ns = cl.finish()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        output = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
+        assert torch.isfinite(output).all().item()
+        return output, gpu_latency_ns, elapsed_ms
+
 class PagedAttentionRunner:
     def __init__(
         self,
@@ -436,6 +655,39 @@ class PagedAttentionRunner:
             head_size,
             block_size,
             kv_cache_compression,
+        )
+
+    def _prepare_kern_attn_inputs(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        past_lens: list[int],
+        subsequence_begins: list[int],
+        kvcache_table: KVCacheTable,
+        query: torch.Tensor,
+    ) -> KernelInputs:
+        kern_attn_inputs = self.kvcache_update(
+            key,
+            value,
+            past_lens,
+            subsequence_begins,
+            kvcache_table,
+        )
+        kern_attn_inputs["query"] = query
+        return kern_attn_inputs
+
+    @staticmethod
+    def _should_use_single_token_path(
+        query: torch.Tensor,
+        past_lens_t: torch.Tensor,
+        subsequence_begins_t: torch.Tensor,
+    ) -> bool:
+        batch_size_in_tokens = int(query.shape[0])
+        batch_size_in_sequences = int(past_lens_t.numel())
+        token_counts = torch.diff(subsequence_begins_t)
+        return (
+            batch_size_in_tokens == batch_size_in_sequences
+            and (token_counts.numel() == 0 or torch.all(token_counts == 1).item())
         )
 
     def kvcache_update(
@@ -480,33 +732,69 @@ class PagedAttentionRunner:
         kvcache_table: KVCacheTable,
         query: torch.Tensor,
     ) -> tuple[KernelInputs, torch.Tensor]:
-        kern_attn_inputs = self.kvcache_update(
+        kern_attn_inputs = self._prepare_kern_attn_inputs(
             key,
             value,
             past_lens,
             subsequence_begins,
             kvcache_table,
+            query,
         )
-        kern_attn_inputs["query"] = query
 
         past_lens_t = kern_attn_inputs["past_lens"]
         subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
         assert isinstance(past_lens_t, torch.Tensor)
         assert isinstance(subsequence_begins_t, torch.Tensor)
 
-        batch_size_in_tokens = int(query.shape[0])
-        batch_size_in_sequences = int(past_lens_t.numel())
-        token_counts = torch.diff(subsequence_begins_t)
-        use_single_token_path = (
-            batch_size_in_tokens == batch_size_in_sequences
-            and (token_counts.numel() == 0 or torch.all(token_counts == 1).item())
-        )
+        use_single_token_path = self._should_use_single_token_path(query, past_lens_t, subsequence_begins_t)
 
         if use_single_token_path:
             attn_outputs = self.single_token_attention(kern_attn_inputs)
         else:
             attn_outputs = self.multi_token_attention(kern_attn_inputs)
         return kern_attn_inputs, attn_outputs
+
+    def run_perf(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        past_lens: list[int],
+        subsequence_begins: list[int],
+        kvcache_table: KVCacheTable,
+        query: torch.Tensor,
+        n_warmup: int = 5,
+        n_iters: int = 20,
+    ) -> tuple[KernelInputs, torch.Tensor, list[int], float, str, int]:
+        kern_attn_inputs = self._prepare_kern_attn_inputs(
+            key,
+            value,
+            past_lens,
+            subsequence_begins,
+            kvcache_table,
+            query,
+        )
+
+        past_lens_t = kern_attn_inputs["past_lens"]
+        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
+        assert isinstance(past_lens_t, torch.Tensor)
+        assert isinstance(subsequence_begins_t, torch.Tensor)
+
+        use_single_token_path = self._should_use_single_token_path(query, past_lens_t, subsequence_begins_t)
+
+        if use_single_token_path:
+            attn_outputs, gpu_latency_ns, elapsed_ms = self.single_token_runner.run_perf(
+                kern_attn_inputs,
+                n_warmup=n_warmup,
+                n_iters=n_iters,
+            )
+            return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, "single_token", 2
+
+        attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_mode = self.multi_token_runner.run_perf(
+            kern_attn_inputs,
+            n_warmup=n_warmup,
+            n_iters=n_iters,
+        )
+        return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, f"multi_token/{dispatch_mode}", 1
 
     def reference_attention(self, kern_attn_inputs: KernelInputs) -> torch.Tensor:
         query = kern_attn_inputs["query"]
