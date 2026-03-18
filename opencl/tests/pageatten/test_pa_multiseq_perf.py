@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -70,9 +71,33 @@ def _prepare_case(perf_case: PerfCase):
     return runner, query, key, value, past_lens, subsequence_begins, kvcache_table
 
 
-def _run_case_perf(perf_case: PerfCase):
-    runner, query, key, value, past_lens, subsequence_begins, kvcache_table = _prepare_case(perf_case)
+@contextmanager
+def _temp_env(var_name: str, value: str | None):
+    old_value = os.getenv(var_name)
+    try:
+        if value is None:
+            os.environ.pop(var_name, None)
+        else:
+            os.environ[var_name] = value
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(var_name, None)
+        else:
+            os.environ[var_name] = old_value
 
+
+def _run_one_mode(
+    runner: PagedAttentionRunner,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    past_lens,
+    subsequence_begins,
+    kvcache_table,
+    warmup: int,
+    iters: int,
+):
     _, out, gpu_latency_ns, elapsed_ms, dispatch_path, kernels_per_iter = runner.run_perf(
         key,
         value,
@@ -80,16 +105,12 @@ def _run_case_perf(perf_case: PerfCase):
         subsequence_begins,
         kvcache_table,
         query,
-        n_warmup=perf_case.warmup,
-        n_iters=perf_case.iters,
+        n_warmup=warmup,
+        n_iters=iters,
     )
     assert torch.isfinite(out).all().item()
 
-    avg_host_ms = elapsed_ms / perf_case.iters
-    q_tokens = int(query.shape[0])
-    q_tok_per_s = (q_tokens * perf_case.iters * 1000.0) / elapsed_ms
-    max_ctx = max(s.total_seq_len for s in perf_case.case.subsequences)
-
+    avg_host_ms = elapsed_ms / iters
     if len(gpu_latency_ns) % kernels_per_iter != 0:
         raise AssertionError("Unexpected GPU profiling sample count")
     iter_gpu_ms = [
@@ -100,12 +121,88 @@ def _run_case_perf(perf_case: PerfCase):
     min_gpu_ms = min(iter_gpu_ms)
     max_gpu_ms = max(iter_gpu_ms)
 
+    return {
+        "out": out,
+        "dispatch_path": dispatch_path,
+        "avg_host_ms": avg_host_ms,
+        "avg_gpu_ms": avg_gpu_ms,
+        "min_gpu_ms": min_gpu_ms,
+        "max_gpu_ms": max_gpu_ms,
+    }
+
+
+def _run_case_perf(perf_case: PerfCase):
+    runner, query, key, value, past_lens, subsequence_begins, kvcache_table = _prepare_case(perf_case)
+    q_tokens = int(query.shape[0])
+    max_ctx = max(s.total_seq_len for s in perf_case.case.subsequences)
+
+    mode = os.getenv("PA_MIXED_ROUTING_MODE", "multi").strip().lower()
+    with _temp_env("PA_MIXED_ROUTING_MODE", mode):
+        stats = _run_one_mode(
+            runner,
+            query,
+            key,
+            value,
+            past_lens,
+            subsequence_begins,
+            kvcache_table,
+            perf_case.warmup,
+            perf_case.iters,
+        )
+
+    out = stats["out"]
+    dispatch_path = stats["dispatch_path"]
+    avg_host_ms = stats["avg_host_ms"]
+    avg_gpu_ms = stats["avg_gpu_ms"]
+    min_gpu_ms = stats["min_gpu_ms"]
+    max_gpu_ms = stats["max_gpu_ms"]
+
+    q_tokens = int(query.shape[0])
+    q_tok_per_s = q_tokens / (avg_host_ms * 1e-3)
+
     print(
         f"{Colors.GREEN}[perf] type={perf_case.perf_type} name={perf_case.name} "
         f"path={dispatch_path} iters={perf_case.iters} q_tokens={q_tokens} max_ctx={max_ctx} "
         f"host_avg_ms={avg_host_ms:.3f} gpu_avg_ms={avg_gpu_ms:.3f} "
         f"gpu_min_ms={min_gpu_ms:.3f} gpu_max_ms={max_gpu_ms:.3f} q_tok_s={q_tok_per_s:.1f}{Colors.END}"
     )
+
+    if os.getenv("PA_MIXED_COMPARE", "0") == "1" and perf_case.perf_type == "mixed_only":
+        with _temp_env("PA_MIXED_ROUTING_MODE", "multi"):
+            multi_stats = _run_one_mode(
+                runner,
+                query,
+                key,
+                value,
+                past_lens,
+                subsequence_begins,
+                kvcache_table,
+                perf_case.warmup,
+                perf_case.iters,
+            )
+        with _temp_env("PA_MIXED_ROUTING_MODE", "split"):
+            split_stats = _run_one_mode(
+                runner,
+                query,
+                key,
+                value,
+                past_lens,
+                subsequence_begins,
+                kvcache_table,
+                perf_case.warmup,
+                perf_case.iters,
+            )
+
+        torch.testing.assert_close(multi_stats["out"], split_stats["out"], atol=5e-2, rtol=2e-1)
+
+        speedup_gpu = multi_stats["avg_gpu_ms"] / split_stats["avg_gpu_ms"] if split_stats["avg_gpu_ms"] > 0 else float("inf")
+        speedup_host = multi_stats["avg_host_ms"] / split_stats["avg_host_ms"] if split_stats["avg_host_ms"] > 0 else float("inf")
+        print(
+            f"{Colors.GREEN}[mixed compare] name={perf_case.name} "
+            f"multi(path={multi_stats['dispatch_path']}) gpu_ms={multi_stats['avg_gpu_ms']:.3f} host_ms={multi_stats['avg_host_ms']:.3f} | "
+            f"split(path={split_stats['dispatch_path']}) gpu_ms={split_stats['avg_gpu_ms']:.3f} host_ms={split_stats['avg_host_ms']:.3f} | "
+            f"speedup_gpu={speedup_gpu:.3f}x speedup_host={speedup_host:.3f}x{Colors.END}"
+        )
 
 
 def _make_perf_case(
