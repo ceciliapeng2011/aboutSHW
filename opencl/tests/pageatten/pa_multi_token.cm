@@ -39,8 +39,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int32_t* block_indices [[type("svmptr_t")]],
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
-    int32_t* selected_sequence_ids [[type("svmptr_t")]],
-    int32_t selected_sequence_count,
+    int32_t* blocked_q_starts_and_subseq_mapping [[type("svmptr_t")]],
     half* output [[type("svmptr_t")]],
     int q_len
 #if SPARSE_BLOCK_SIZE > 1
@@ -72,7 +71,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     auto batch = cm_group_id(0);
     auto h = cm_group_id(1);
     auto hkv = h / (num_heads/num_kv_heads);
-    auto wg_id = cm_group_id(2); // each work-group handles a sequence
+    auto wg_id = cm_group_id(2);
     auto wg_local_id = cm_local_id(2);
     int local_size = cm_local_size(2);
 
@@ -88,39 +87,27 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 #else
     const int wg_seq_len = local_size * q_step;
 #endif
-    int mapped_wg_id = wg_id;
-    int local_subsequence_id = 0;
-    int subsequence_id = 0;
-    int subseq_q_begin = 0;
-    int subseq_q_end = q_len;
-    int subseq_q_len = q_len;
-    while (true) {
-        if (local_subsequence_id >= selected_sequence_count) {
-            return;
-        }
-        subsequence_id = selected_sequence_ids[local_subsequence_id];
-        subseq_q_begin = subsequence_begins[subsequence_id];
-        if (subseq_q_begin >= q_len) {
-            return;
-        }
-        subseq_q_end = subsequence_begins[subsequence_id + 1];
-        if (subseq_q_end > q_len) {
-            subseq_q_end = q_len;
-        }
-        subseq_q_len = subseq_q_end - subseq_q_begin;
-        int subseq_wg_count = (subseq_q_len + wg_seq_len - 1) / wg_seq_len;
-        if (mapped_wg_id < subseq_wg_count) {
-            break;
-        }
-        mapped_wg_id -= subseq_wg_count;
-        local_subsequence_id++;
+    const int blocked_query_idx = wg_id * 2;
+    int block_start_pos = blocked_q_starts_and_subseq_mapping[blocked_query_idx];
+    int subsequence_id = blocked_q_starts_and_subseq_mapping[blocked_query_idx + 1];
+    int subseq_q_begin = subsequence_begins[subsequence_id];
+    if (subseq_q_begin >= q_len) {
+        return;
+    }
+    int subseq_q_end = subsequence_begins[subsequence_id + 1];
+    if (subseq_q_end > q_len) {
+        subseq_q_end = q_len;
+    }
+    int subseq_q_len = subseq_q_end - subseq_q_begin;
+    if (subseq_q_len <= 0) {
+        return;
     }
 
     int past_q_lens = past_lens[subsequence_id];
     kv_start = 0;
     kv_seq_len = subseq_q_len + past_q_lens;
 
-    int q_start_local = (mapped_wg_id * local_size + wg_local_id) * q_step;
+    int q_start_local = (block_start_pos - subseq_q_begin) + (wg_local_id * q_step);
 #if CMPA_KVCACHE_U8
     // U8 path uses workgroup-level barriers in `pa_lsc_u8`, so every lane in
     // the workgroup must participate. For out-of-range lanes, pass q_len_sg=0
@@ -174,7 +161,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         //todo:kv_stop is wg level, should we change to sg level?
                sglevel would cause sgs in one wg diverge. so leave for now. also one wg has same kvstop makes eaiser for kv copying/loading into SLM/cache.
     */
-        kv_stop = (mapped_wg_id + 1) * wg_seq_len + past_q_lens;
+        kv_stop = (block_start_pos - subseq_q_begin) + wg_seq_len + past_q_lens;
         if (kv_stop > kv_seq_len) kv_stop = kv_seq_len;
     }
 

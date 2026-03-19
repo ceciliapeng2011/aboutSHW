@@ -145,6 +145,8 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
     def run_perf(
         self,
         kern_attn_inputs: KernelInputs,
+        prefill_seq_indices: list[int],
+        out: torch.Tensor | None = None,
         n_warmup: int = 5,
         n_iters: int = 20,
     ) -> tuple[torch.Tensor, list[int], float, str]:
@@ -164,18 +166,14 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         assert isinstance(block_indices_begins, torch.Tensor)
         assert isinstance(subsequence_begins, torch.Tensor)
 
-        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
-        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
-        if not isinstance(selected_sequence_ids, torch.Tensor):
-            raise TypeError("selected_sequence_ids must be a torch.Tensor")
-        if selected_sequence_ids.dtype != torch.int32:
-            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
-        if not isinstance(selected_sequence_count, int):
-            raise TypeError("selected_sequence_count must be an int")
+        if len(prefill_seq_indices) == 0:
+            raise ValueError("prefill_seq_indices must be non-empty")
+        selected_sequence_ids = torch.tensor(prefill_seq_indices, dtype=torch.int32)
+        prefill_seq_count = int(selected_sequence_ids.numel())
 
         batch_size_in_tokens = query.shape[0]
         kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
-        use_subset_execution = selected_sequence_count != int(past_lens.numel())
+        use_subset_execution = prefill_seq_count != int(past_lens.numel())
 
         q_tensor = query.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
         kernel_key_cache = self._format_cache_for_kernel(key_cache.contiguous())
@@ -183,10 +181,19 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         out_shape = (batch_size_in_tokens, self.num_heads, self.head_size)
 
         t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
-        if use_subset_execution:
-            t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
+        if out is not None:
+            expected_shape = (batch_size_in_tokens, self.num_heads * self.head_size)
+            if tuple(out.shape) != expected_shape:
+                raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
+            if out.dtype != torch.float16:
+                raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
+            out_3d = out.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
+            t_out = cl.tensor(out_3d.detach().numpy())
         else:
-            t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
+            if use_subset_execution:
+                t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
+            else:
+                t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
         t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
         t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
         t_past_lens = cl.tensor(past_lens.detach().numpy())
@@ -199,12 +206,15 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         wg_size = self.max_wg_size
         wg_seq_len = wg_size * q_step
 
-        wg_count = 0
-        for sequence_id in selected_sequence_ids.tolist():
-            sequence_index = int(sequence_id)
-            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
-            subsequence_q_len = q_end - q_start
-            wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
+        blocked_q_starts_and_subseq_mapping, wg_count = self._build_wg_block_start_and_subseq_mapping(
+            kern_attn_inputs,
+            selected_sequence_ids,
+            wg_seq_len,
+        )
+        if wg_count <= 0:
+            raise ValueError("Invalid blocked query mapping: wg_count must be positive")
+
+        t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
         gws = [1, self.num_heads, int(wg_count * wg_size)]
         lws = [1, 1, wg_size]
 
@@ -232,8 +242,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
-                t_selected_sequence_ids,
-                selected_sequence_count,
+                t_blocked_q_starts_and_subseq_mapping,
                 t_out,
                 batch_size_in_tokens,
             )
@@ -252,8 +261,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
-                t_selected_sequence_ids,
-                selected_sequence_count,
+                t_blocked_q_starts_and_subseq_mapping,
                 t_out,
                 batch_size_in_tokens,
             )
@@ -261,6 +269,9 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         output = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
+        if out is not None:
+            out.copy_(output)
+            output = out
         assert torch.isfinite(output).all().item()
         return output, gpu_latency_ns, elapsed_ms, dispatch_mode
 
@@ -286,6 +297,8 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
     def run_perf(
         self,
         kern_attn_inputs: KernelInputs,
+        decode_seq_indices: list[int],
+        out: torch.Tensor | None = None,
         n_warmup: int = 5,
         n_iters: int = 20,
     ) -> tuple[torch.Tensor, list[int], float]:
@@ -305,24 +318,20 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
         assert isinstance(key_cache_t, torch.Tensor)
         assert isinstance(value_cache_t, torch.Tensor)
 
-        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
-        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
-        if not isinstance(selected_sequence_ids, torch.Tensor):
-            raise TypeError("selected_sequence_ids must be a torch.Tensor")
-        if selected_sequence_ids.dtype != torch.int32:
-            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
-        if not isinstance(selected_sequence_count, int):
-            raise TypeError("selected_sequence_count must be an int")
+        if len(decode_seq_indices) == 0:
+            raise ValueError("decode_seq_indices must be non-empty")
+        selected_sequence_ids = torch.tensor(decode_seq_indices, dtype=torch.int32)
+        decode_seq_count = int(selected_sequence_ids.numel())
 
         token_counts = torch.diff(subsequence_begins_t)
-        if token_counts.numel() and selected_sequence_count > 0:
+        if token_counts.numel() and decode_seq_count > 0:
             selected_token_counts = token_counts[selected_sequence_ids.to(dtype=torch.long)]
         else:
             selected_token_counts = token_counts
         if selected_token_counts.numel() and not torch.all(selected_token_counts == 1).item():
             raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
 
-        batch_size = selected_sequence_count
+        batch_size = decode_seq_count
         max_context_len = int(kern_attn_inputs["max_context_len"])
         kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
         q_tokens = query.reshape(int(query.shape[0]), self.num_heads, self.head_size).contiguous()
@@ -344,10 +353,19 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
         t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
         t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
         t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
-        if use_subset_execution:
-            t_out_final = cl.tensor(np.zeros((output_tokens, 1, self.num_heads, self.head_size), dtype=np.float16))
+        if out is not None:
+            expected_shape = (output_tokens, self.num_heads * self.head_size)
+            if tuple(out.shape) != expected_shape:
+                raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
+            if out.dtype != torch.float16:
+                raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
+            out_4d = out.reshape(output_tokens, 1, self.num_heads, self.head_size).contiguous()
+            t_out_final = cl.tensor(out_4d.detach().numpy())
         else:
-            t_out_final = cl.tensor([output_tokens, 1, self.num_heads, self.head_size], np.dtype(np.float16))
+            if use_subset_execution:
+                t_out_final = cl.tensor(np.zeros((output_tokens, 1, self.num_heads, self.head_size), dtype=np.float16))
+            else:
+                t_out_final = cl.tensor([output_tokens, 1, self.num_heads, self.head_size], np.dtype(np.float16))
         t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
 
         cl.finish()
@@ -365,7 +383,7 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 t_out,
                 t_lse,
                 1,
@@ -379,7 +397,7 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_lse,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 kv_partition_num,
             )
         cl.finish()
@@ -398,7 +416,7 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 t_out,
                 t_lse,
                 1,
@@ -412,13 +430,16 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_lse,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 kv_partition_num,
             )
         gpu_latency_ns = cl.finish()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         output = torch.from_numpy(t_out_final.numpy().reshape(output_tokens, -1))
+        if out is not None:
+            out.copy_(output)
+            output = out
         assert torch.isfinite(output).all().item()
         return output, gpu_latency_ns, elapsed_ms
 
@@ -476,32 +497,33 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
     def _run_perf_mixed_route_split(
         self,
         kern_attn_inputs: KernelInputs,
+        decode_seq_indices: list[int],
+        prefill_seq_indices: list[int],
+        shared_out: torch.Tensor,
         n_warmup: int,
         n_iters: int,
     ) -> tuple[torch.Tensor, list[int], float, str, int]:
         query = kern_attn_inputs["query"]
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
         assert isinstance(query, torch.Tensor)
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-
-        decode_seq_indices, prefill_seq_indices = self._sequence_groups_by_q_len(subsequence_begins_t)
         assert len(decode_seq_indices) > 0 and len(prefill_seq_indices) > 0, (
             "mixed_route_split requires both decode and prefill sequences; route gating should enforce this"
         )
 
         elapsed_ms_total = 0.0
 
-        decode_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, decode_seq_indices)
-        decode_out, decode_gpu_ns, decode_elapsed_ms = self.single_token_runner.run_perf(
-            decode_inputs,
+        _, decode_gpu_ns, decode_elapsed_ms = self.single_token_runner.run_perf(
+            kern_attn_inputs,
+            decode_seq_indices=decode_seq_indices,
+            out=shared_out,
             n_warmup=n_warmup,
             n_iters=n_iters,
         )
         elapsed_ms_total += decode_elapsed_ms
 
-        prefill_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, prefill_seq_indices)
-        prefill_out, prefill_gpu_ns, prefill_elapsed_ms, _ = self.multi_token_runner.run_perf(
-            prefill_inputs,
+        _, prefill_gpu_ns, prefill_elapsed_ms, _ = self.multi_token_runner.run_perf(
+            kern_attn_inputs,
+            prefill_seq_indices=prefill_seq_indices,
+            out=shared_out,
             n_warmup=n_warmup,
             n_iters=n_iters,
         )
@@ -510,8 +532,8 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
         decode_iter_ns = self._group_gpu_ns_per_iter(decode_gpu_ns, kernels_per_iter=2, n_iters=n_iters)
         prefill_iter_ns = self._group_gpu_ns_per_iter(prefill_gpu_ns, kernels_per_iter=1, n_iters=n_iters)
         total_iter_ns = [decode_iter_ns[i] + prefill_iter_ns[i] for i in range(n_iters)]
-        output = decode_out + prefill_out
-        return output, total_iter_ns, elapsed_ms_total, "mixed_route_split/selected_sequence_ids/single+multi", 1
+        output = shared_out
+        return output, total_iter_ns, elapsed_ms_total, "mixed_route_split/decode+prefill_indices/single+multi", 1
 
     def run_perf(
         self,
@@ -539,26 +561,55 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
         assert isinstance(past_lens_t, torch.Tensor)
         assert isinstance(subsequence_begins_t, torch.Tensor)
 
-        route_mode, _, _ = self._get_route_mode(query, past_lens_t, subsequence_begins_t, mixed_route_mode)
+        output_tokens = int(query.shape[0])
+        shared_out = torch.zeros(
+            output_tokens,
+            self.multi_token_runner.num_heads * self.multi_token_runner.head_size,
+            dtype=torch.float16,
+        )
+
+        route_mode, decode_seq_indices, prefill_seq_indices = self._get_route_mode(
+            query,
+            past_lens_t,
+            subsequence_begins_t,
+            mixed_route_mode,
+        )
 
         if route_mode == "mixed_route_split":
             attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_path, kernels_per_iter = self._run_perf_mixed_route_split(
                 kern_attn_inputs,
+                decode_seq_indices=decode_seq_indices,
+                prefill_seq_indices=prefill_seq_indices,
+                shared_out=shared_out,
                 n_warmup=n_warmup,
                 n_iters=n_iters,
             )
             return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_path, kernels_per_iter
 
         if route_mode == "single":
+            kern_attn_inputs["max_context_len"] = self._get_max_context_len_for_sequences(
+                kern_attn_inputs,
+                decode_seq_indices,
+            )
             attn_outputs, gpu_latency_ns, elapsed_ms = self.single_token_runner.run_perf(
                 kern_attn_inputs,
+                decode_seq_indices=decode_seq_indices,
+                out=shared_out,
                 n_warmup=n_warmup,
                 n_iters=n_iters,
             )
             return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, "single_token", 2
 
+        if len(decode_seq_indices) > 0:
+            prefill_seq_indices = decode_seq_indices + prefill_seq_indices
+        kern_attn_inputs["max_context_len"] = self._get_max_context_len_for_sequences(
+            kern_attn_inputs,
+            prefill_seq_indices,
+        )
         attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_mode = self.multi_token_runner.run_perf(
             kern_attn_inputs,
+            prefill_seq_indices=prefill_seq_indices,
+            out=shared_out,
             n_warmup=n_warmup,
             n_iters=n_iters,
         )

@@ -122,10 +122,31 @@ class PaMultiTokenRunner:
             return cache.contiguous()
         return cache.reshape(cache.shape[0], self.num_kv_heads, -1).contiguous()
 
+    @staticmethod
+    def _build_wg_block_start_and_subseq_mapping(
+        kern_attn_inputs: KernelInputs,
+        selected_sequence_ids: torch.Tensor,
+        wg_seq_len: int,
+    ) -> tuple[torch.Tensor, int]:
+        blocked_q_starts_and_subseq_mapping: list[int] = []
+
+        for sequence_id in selected_sequence_ids.tolist():
+            sequence_index = int(sequence_id)
+            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
+            subsequence_q_len = q_end - q_start
+            subseq_wg_count = DIV_UP(subsequence_q_len, wg_seq_len)
+            for mapped_wg_id in range(subseq_wg_count):
+                blocked_q_starts_and_subseq_mapping.append(q_start + mapped_wg_id * wg_seq_len)
+                blocked_q_starts_and_subseq_mapping.append(sequence_index)
+
+        wg_count = len(blocked_q_starts_and_subseq_mapping) // 2
+        return torch.tensor(blocked_q_starts_and_subseq_mapping, dtype=torch.int32), wg_count
+
     def __call__(
         self,
         kern_attn_inputs: KernelInputs,
         out: torch.Tensor,
+        prefill_seq_indices: list[int],
         n_repeats: int = 1,
     ) -> torch.Tensor:
         query = kern_attn_inputs["query"]
@@ -144,14 +165,11 @@ class PaMultiTokenRunner:
         assert isinstance(block_indices_begins, torch.Tensor)
         assert isinstance(subsequence_begins, torch.Tensor)
 
-        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
-        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
-        if not isinstance(selected_sequence_ids, torch.Tensor):
-            raise TypeError("selected_sequence_ids must be a torch.Tensor")
-        if selected_sequence_ids.dtype != torch.int32:
-            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
-        if not isinstance(selected_sequence_count, int):
-            raise TypeError("selected_sequence_count must be an int")
+        if len(prefill_seq_indices) == 0:
+            raise ValueError("prefill_seq_indices must be non-empty")
+
+        selected_sequence_ids = torch.tensor(prefill_seq_indices, dtype=torch.int32)
+        prefill_seq_count = int(selected_sequence_ids.numel())
 
         batch_size_in_tokens = query.shape[0]
         expected_shape = (batch_size_in_tokens, self.num_heads * self.head_size)
@@ -179,26 +197,20 @@ class PaMultiTokenRunner:
             t_block_indices = cl.tensor(block_indices.detach().numpy())
             t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
-            t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
-
-            max_subsequence_q_len = 0
-            for sequence_id in selected_sequence_ids.tolist():
-                sequence_index = int(sequence_id)
-                q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
-                subsequence_q_len = q_end - q_start
-                if subsequence_q_len > max_subsequence_q_len:
-                    max_subsequence_q_len = subsequence_q_len
 
             q_step = self.q_step
             wg_size = self.max_wg_size
             wg_seq_len = wg_size * q_step
 
-            wg_count = 0
-            for sequence_id in selected_sequence_ids.tolist():
-                sequence_index = int(sequence_id)
-                q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
-                subsequence_q_len = q_end - q_start
-                wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
+            blocked_q_starts_and_subseq_mapping, wg_count = self._build_wg_block_start_and_subseq_mapping(
+                kern_attn_inputs,
+                selected_sequence_ids,
+                wg_seq_len,
+            )
+            if wg_count <= 0:
+                raise ValueError("Invalid blocked query mapping: wg_count must be positive")
+
+            t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
             gws = [1, self.num_heads, int(wg_count * wg_size)]
             lws = [1, 1, wg_size]
 
@@ -223,8 +235,8 @@ class PaMultiTokenRunner:
             print("[enqueue] block_indices=", block_indices.tolist())
             print("[enqueue] block_indices_begins=", block_indices_begins.tolist())
             print("[enqueue] subsequence_begins=", subsequence_begins.tolist())
-            print("[enqueue] selected_sequence_ids=", selected_sequence_ids.tolist())
-            print("[enqueue] selected_sequence_count=", selected_sequence_count)
+            print("[enqueue] prefill_seq_indices=", prefill_seq_indices)
+            print("[enqueue] prefill_seq_count=", prefill_seq_count)
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
 
             selected_kernels.enqueue(
@@ -238,8 +250,7 @@ class PaMultiTokenRunner:
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
-                t_selected_sequence_ids,
-                selected_sequence_count,
+                t_blocked_q_starts_and_subseq_mapping,
                 t_out,
                 batch_size_in_tokens,
             )
@@ -354,6 +365,7 @@ class PaSingleTokenRunner:
         self,
         kern_attn_inputs: KernelInputs,
         out: torch.Tensor,
+        decode_seq_indices: list[int],
         n_repeats: int = 1,
     ) -> torch.Tensor:
         query = kern_attn_inputs["query"]
@@ -372,29 +384,25 @@ class PaSingleTokenRunner:
         assert isinstance(key_cache_t, torch.Tensor)
         assert isinstance(value_cache_t, torch.Tensor)
 
-        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
-        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
-        if not isinstance(selected_sequence_ids, torch.Tensor):
-            raise TypeError("selected_sequence_ids must be a torch.Tensor")
-        if selected_sequence_ids.dtype != torch.int32:
-            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
-        if not isinstance(selected_sequence_count, int):
-            raise TypeError("selected_sequence_count must be an int")
+        if len(decode_seq_indices) == 0:
+            raise ValueError("decode_seq_indices must be non-empty")
+
+        selected_sequence_ids = torch.tensor(decode_seq_indices, dtype=torch.int32)
+        decode_seq_count = int(selected_sequence_ids.numel())
 
         token_counts = torch.diff(subsequence_begins_t)
-        if token_counts.numel() and selected_sequence_count > 0:
+        if token_counts.numel() and decode_seq_count > 0:
             selected_token_counts = token_counts[selected_sequence_ids.to(dtype=torch.long)]
         else:
             selected_token_counts = token_counts
         if selected_token_counts.numel() and not torch.all(selected_token_counts == 1).item():
             raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
 
-        batch_size = selected_sequence_count
+        batch_size = decode_seq_count
         max_context_len = int(kern_attn_inputs["max_context_len"])
         kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
         q_tokens = query.reshape(int(query.shape[0]), self.num_heads, self.head_size).contiguous()
         output_tokens = int(query.shape[0])
-        use_subset_execution = output_tokens != batch_size
 
         expected_shape = (output_tokens, self.num_heads * self.head_size)
         if tuple(out.shape) != expected_shape:
@@ -437,7 +445,7 @@ class PaSingleTokenRunner:
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 t_out,
                 t_lse,
                 1,
@@ -451,7 +459,7 @@ class PaSingleTokenRunner:
                 t_lse,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
+                decode_seq_count,
                 kv_partition_num,
             )
             cl.finish()
@@ -551,16 +559,13 @@ class PagedAttentionRunner:
         past_lens_t = kern_attn_inputs["past_lens"]
         if not isinstance(past_lens_t, torch.Tensor):
             raise TypeError("past_lens must be a torch.Tensor")
-        full_sequence_count = int(past_lens_t.numel())
-        kern_attn_inputs["selected_sequence_ids"] = torch.arange(full_sequence_count, dtype=torch.int32)
-        kern_attn_inputs["selected_sequence_count"] = full_sequence_count
         return kern_attn_inputs
 
     @staticmethod
-    def build_selected_sequence_inputs(
+    def _get_max_context_len_for_sequences(
         kern_attn_inputs: KernelInputs,
         sequence_indices: list[int],
-    ) -> KernelInputs:
+    ) -> int:
         past_lens_t = kern_attn_inputs["past_lens"]
         if not isinstance(past_lens_t, torch.Tensor):
             raise TypeError("past_lens must be a torch.Tensor")
@@ -572,10 +577,6 @@ class PagedAttentionRunner:
         if int(selected_sequence_ids.min().item()) < 0 or int(selected_sequence_ids.max().item()) >= batch_size_in_sequences:
             raise ValueError("sequence_indices contains out-of-range sequence ids")
 
-        selected_inputs: KernelInputs = dict(kern_attn_inputs)
-        selected_inputs["selected_sequence_ids"] = selected_sequence_ids
-        selected_inputs["selected_sequence_count"] = int(selected_sequence_ids.numel())
-
         max_context_len = 0
         for sequence_index in selected_sequence_ids.tolist():
             q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, int(sequence_index))
@@ -584,22 +585,7 @@ class PagedAttentionRunner:
             context_len = past_len + q_len
             if context_len > max_context_len:
                 max_context_len = context_len
-        selected_inputs["max_context_len"] = max_context_len
-        return selected_inputs
-
-    @staticmethod
-    def _should_use_single_token_path(
-        query: torch.Tensor,
-        past_lens_t: torch.Tensor,
-        subsequence_begins_t: torch.Tensor,
-    ) -> bool:
-        batch_size_in_tokens = int(query.shape[0])
-        batch_size_in_sequences = int(past_lens_t.numel())
-        token_counts = torch.diff(subsequence_begins_t)
-        return (
-            batch_size_in_tokens == batch_size_in_sequences
-            and (token_counts.numel() == 0 or torch.all(token_counts == 1).item())
-        )
+        return max_context_len
 
     @staticmethod
     def _get_route_mode(
@@ -608,11 +594,14 @@ class PagedAttentionRunner:
         subsequence_begins_t: torch.Tensor,
         mixed_route_mode: str,
     ) -> tuple[str, list[int], list[int]]:
-        use_single_token_path = PagedAttentionRunner._should_use_single_token_path(query, past_lens_t, subsequence_begins_t)
-        decode_seq_indices, prefill_seq_indices = PagedAttentionRunner._sequence_groups_by_q_len(subsequence_begins_t)
         if mixed_route_mode not in ("multi", "split"):
             raise ValueError(f"Unsupported mixed_route_mode={mixed_route_mode}. Expected 'multi' or 'split'.")
+        
+        decode_seq_indices, prefill_seq_indices = PagedAttentionRunner._sequence_groups_by_q_len(subsequence_begins_t)
+        assert len(decode_seq_indices) + len(prefill_seq_indices) == int(past_lens_t.numel()), "All sequences must be classified into either decode or prefill groups"
+        assert len(decode_seq_indices) > 0 or len(prefill_seq_indices) > 0, "At least one sequence should be present for attention computation"
 
+        use_single_token_path = len(prefill_seq_indices) == 0
         if use_single_token_path:
             return "single", decode_seq_indices, prefill_seq_indices
 
@@ -637,20 +626,16 @@ class PagedAttentionRunner:
         self,
         kern_attn_inputs: KernelInputs,
         out: torch.Tensor,
+        decode_seq_indices: list[int],
+        prefill_seq_indices: list[int],
     ) -> torch.Tensor:
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-
-        decode_seq_indices, prefill_seq_indices = self._sequence_groups_by_q_len(subsequence_begins_t)
         assert len(decode_seq_indices) > 0 and len(prefill_seq_indices) > 0, (
             "mixed_route_split requires both decode and prefill sequences; route gating should enforce this"
         )
 
-        decode_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, decode_seq_indices)
-        self.single_token_attention(decode_inputs, out=out)
+        self.single_token_attention(kern_attn_inputs, out=out, decode_seq_indices=decode_seq_indices)
 
-        prefill_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, prefill_seq_indices)
-        self.multi_token_attention(prefill_inputs, out=out)
+        self.multi_token_attention(kern_attn_inputs, out=out, prefill_seq_indices=prefill_seq_indices)
         return out
 
     def kvcache_update(
@@ -676,16 +661,26 @@ class PagedAttentionRunner:
         self,
         kern_attn_inputs: KernelInputs,
         out: torch.Tensor,
+        prefill_seq_indices: list[int],
     ) -> torch.Tensor:
-        attn_outputs = self.multi_token_runner(kern_attn_inputs, out=out)
+        kern_attn_inputs["max_context_len"] = self._get_max_context_len_for_sequences(
+            kern_attn_inputs,
+            prefill_seq_indices,
+        )
+        attn_outputs = self.multi_token_runner(kern_attn_inputs, out=out, prefill_seq_indices=prefill_seq_indices)
         return attn_outputs
 
     def single_token_attention(
         self,
         kern_attn_inputs: KernelInputs,
         out: torch.Tensor,
+        decode_seq_indices: list[int],
     ) -> torch.Tensor:
-        attn_outputs = self.single_token_runner(kern_attn_inputs, out=out)
+        kern_attn_inputs["max_context_len"] = self._get_max_context_len_for_sequences(
+            kern_attn_inputs,
+            decode_seq_indices,
+        )
+        attn_outputs = self.single_token_runner(kern_attn_inputs, out=out, decode_seq_indices=decode_seq_indices)
         return attn_outputs
 
     def run(
@@ -718,16 +713,36 @@ class PagedAttentionRunner:
             dtype=torch.float16,
         )
 
-        route_mode, _, _ = self._get_route_mode(query, past_lens_t, subsequence_begins_t, mixed_route_mode)
+        route_mode, decode_seq_indices, prefill_seq_indices = self._get_route_mode(
+            query,
+            past_lens_t,
+            subsequence_begins_t,
+            mixed_route_mode,
+        )
 
         if route_mode == "mixed_route_split":
-            attn_outputs = self._run_mixed_route_split(kern_attn_inputs, out=output)
+            attn_outputs = self._run_mixed_route_split(
+                kern_attn_inputs,
+                out=output,
+                decode_seq_indices=decode_seq_indices,
+                prefill_seq_indices=prefill_seq_indices,
+            )
             return kern_attn_inputs, attn_outputs
 
         if route_mode == "single":
-            attn_outputs = self.single_token_attention(kern_attn_inputs, out=output)
+            attn_outputs = self.single_token_attention(
+                kern_attn_inputs,
+                out=output,
+                decode_seq_indices=decode_seq_indices,
+            )
         else:
-            attn_outputs = self.multi_token_attention(kern_attn_inputs, out=output)
+            if len(decode_seq_indices) > 0:
+                prefill_seq_indices = decode_seq_indices + prefill_seq_indices
+            attn_outputs = self.multi_token_attention(
+                kern_attn_inputs,
+                out=output,
+                prefill_seq_indices=prefill_seq_indices,
+            )
         return kern_attn_inputs, attn_outputs
 
     def reference_attention(self, kern_attn_inputs: KernelInputs) -> torch.Tensor:
