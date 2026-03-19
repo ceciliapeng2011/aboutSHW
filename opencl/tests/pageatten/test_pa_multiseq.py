@@ -1,6 +1,5 @@
 import functools
 import os
-import time
 
 import numpy as np
 import pytest
@@ -123,7 +122,12 @@ class PaMultiTokenRunner:
             return cache.contiguous()
         return cache.reshape(cache.shape[0], self.num_kv_heads, -1).contiguous()
 
-    def __call__(self, kern_attn_inputs: KernelInputs, n_repeats: int = 1) -> torch.Tensor:
+    def __call__(
+        self,
+        kern_attn_inputs: KernelInputs,
+        out: torch.Tensor,
+        n_repeats: int = 1,
+    ) -> torch.Tensor:
         query = kern_attn_inputs["query"]
         key_cache = kern_attn_inputs["key_cache"]
         value_cache = kern_attn_inputs["value_cache"]
@@ -140,8 +144,22 @@ class PaMultiTokenRunner:
         assert isinstance(block_indices_begins, torch.Tensor)
         assert isinstance(subsequence_begins, torch.Tensor)
 
+        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
+        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
+        if not isinstance(selected_sequence_ids, torch.Tensor):
+            raise TypeError("selected_sequence_ids must be a torch.Tensor")
+        if selected_sequence_ids.dtype != torch.int32:
+            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
+        if not isinstance(selected_sequence_count, int):
+            raise TypeError("selected_sequence_count must be an int")
+
         batch_size_in_tokens = query.shape[0]
-        output = torch.zeros(batch_size_in_tokens, self.num_heads * self.head_size, dtype=torch.float16)
+        expected_shape = (batch_size_in_tokens, self.num_heads * self.head_size)
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
+        if out.dtype != torch.float16:
+            raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
+        output = out
         kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
 
         cl.finish()
@@ -153,16 +171,19 @@ class PaMultiTokenRunner:
             out_shape = (batch_size_in_tokens, self.num_heads, self.head_size)
 
             t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
-            t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
+            output_3d = output.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
+            t_out = cl.tensor(output_3d.detach().numpy())
             t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
             t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
             t_past_lens = cl.tensor(past_lens.detach().numpy())
             t_block_indices = cl.tensor(block_indices.detach().numpy())
             t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+            t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
 
             max_subsequence_q_len = 0
-            for sequence_index in range(int(past_lens.numel())):
+            for sequence_id in selected_sequence_ids.tolist():
+                sequence_index = int(sequence_id)
                 q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
                 subsequence_q_len = q_end - q_start
                 if subsequence_q_len > max_subsequence_q_len:
@@ -173,7 +194,8 @@ class PaMultiTokenRunner:
             wg_seq_len = wg_size * q_step
 
             wg_count = 0
-            for sequence_index in range(int(past_lens.numel())):
+            for sequence_id in selected_sequence_ids.tolist():
+                sequence_index = int(sequence_id)
                 q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
                 subsequence_q_len = q_end - q_start
                 wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
@@ -201,6 +223,8 @@ class PaMultiTokenRunner:
             print("[enqueue] block_indices=", block_indices.tolist())
             print("[enqueue] block_indices_begins=", block_indices_begins.tolist())
             print("[enqueue] subsequence_begins=", subsequence_begins.tolist())
+            print("[enqueue] selected_sequence_ids=", selected_sequence_ids.tolist())
+            print("[enqueue] selected_sequence_count=", selected_sequence_count)
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
 
             selected_kernels.enqueue(
@@ -214,117 +238,17 @@ class PaMultiTokenRunner:
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
+                t_selected_sequence_ids,
+                selected_sequence_count,
                 t_out,
                 batch_size_in_tokens,
             )
 
-            output = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
+            output_from_kernel = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
+            out.copy_(output_from_kernel)
+            output = out
 
         return output
-
-    def run_perf(
-        self,
-        kern_attn_inputs: KernelInputs,
-        n_warmup: int = 5,
-        n_iters: int = 20,
-    ) -> tuple[torch.Tensor, list[int], float, str]:
-        query = kern_attn_inputs["query"]
-        key_cache = kern_attn_inputs["key_cache"]
-        value_cache = kern_attn_inputs["value_cache"]
-        past_lens = kern_attn_inputs["past_lens"]
-        block_indices = kern_attn_inputs["block_indices"]
-        block_indices_begins = kern_attn_inputs["block_indices_begins"]
-        subsequence_begins = kern_attn_inputs["subsequence_begins"]
-
-        assert isinstance(query, torch.Tensor)
-        assert isinstance(key_cache, torch.Tensor)
-        assert isinstance(value_cache, torch.Tensor)
-        assert isinstance(past_lens, torch.Tensor)
-        assert isinstance(block_indices, torch.Tensor)
-        assert isinstance(block_indices_begins, torch.Tensor)
-        assert isinstance(subsequence_begins, torch.Tensor)
-
-        batch_size_in_tokens = query.shape[0]
-        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
-
-        q_tensor = query.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
-        kernel_key_cache = self._format_cache_for_kernel(key_cache.contiguous())
-        kernel_value_cache = self._format_cache_for_kernel(value_cache.contiguous())
-        out_shape = (batch_size_in_tokens, self.num_heads, self.head_size)
-
-        t_q = cl.tensor(q_tensor.to(torch.float16).detach().numpy())
-        t_out = cl.tensor(list(out_shape), np.dtype(np.float16))
-        t_key_cache = cl.tensor(kernel_key_cache.to(kv_dtype).detach().numpy())
-        t_value_cache = cl.tensor(kernel_value_cache.to(kv_dtype).detach().numpy())
-        t_past_lens = cl.tensor(past_lens.detach().numpy())
-        t_block_indices = cl.tensor(block_indices.detach().numpy())
-        t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
-        t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
-
-        q_step = self.q_step
-        wg_size = self.max_wg_size
-        wg_seq_len = wg_size * q_step
-
-        wg_count = 0
-        for sequence_index in range(int(past_lens.numel())):
-            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
-            subsequence_q_len = q_end - q_start
-            wg_count += DIV_UP(subsequence_q_len, wg_seq_len)
-        gws = [1, self.num_heads, int(wg_count * wg_size)]
-        lws = [1, 1, wg_size]
-
-        use_optimized_dispatch = (
-            self.enable_hybrid_dispatch
-            and self.kernels_optimized is not None
-            and self.sparse_block_size in (128, 256)
-            and wg_size == self.max_wg_size
-            and self.optimized_wg_seq_len == self.sparse_block_size
-        )
-        selected_kernels = self.kernels_optimized if use_optimized_dispatch else self.kernels_dynamic
-        dispatch_mode = "optimized" if use_optimized_dispatch else "dynamic"
-
-        cl.finish()
-
-        for _ in range(n_warmup):
-            selected_kernels.enqueue(
-                "cm_page_attention",
-                gws,
-                lws,
-                t_q,
-                t_key_cache,
-                t_value_cache,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_out,
-                batch_size_in_tokens,
-            )
-        cl.finish()
-
-        t0 = time.perf_counter()
-        for _ in range(n_iters):
-            selected_kernels.enqueue(
-                "cm_page_attention",
-                gws,
-                lws,
-                t_q,
-                t_key_cache,
-                t_value_cache,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_out,
-                batch_size_in_tokens,
-            )
-        gpu_latency_ns = cl.finish()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-        output = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
-        assert torch.isfinite(output).all().item()
-        return output, gpu_latency_ns, elapsed_ms, dispatch_mode
-
 
 class PaSingleTokenRunner:
     def __init__(
@@ -426,7 +350,12 @@ class PaSingleTokenRunner:
             self.scale_factor,
         )
 
-    def __call__(self, kern_attn_inputs: KernelInputs, n_repeats: int = 1) -> torch.Tensor:
+    def __call__(
+        self,
+        kern_attn_inputs: KernelInputs,
+        out: torch.Tensor,
+        n_repeats: int = 1,
+    ) -> torch.Tensor:
         query = kern_attn_inputs["query"]
         past_lens_t = kern_attn_inputs["past_lens"]
         block_indices_t = kern_attn_inputs["block_indices"]
@@ -443,19 +372,36 @@ class PaSingleTokenRunner:
         assert isinstance(key_cache_t, torch.Tensor)
         assert isinstance(value_cache_t, torch.Tensor)
 
-        batch_size = int(past_lens_t.numel())
-        if int(query.shape[0]) != batch_size:
-            raise ValueError("pa_single_token path expects one query token per sequence")
+        selected_sequence_ids = kern_attn_inputs["selected_sequence_ids"]
+        selected_sequence_count = kern_attn_inputs["selected_sequence_count"]
+        if not isinstance(selected_sequence_ids, torch.Tensor):
+            raise TypeError("selected_sequence_ids must be a torch.Tensor")
+        if selected_sequence_ids.dtype != torch.int32:
+            raise TypeError(f"selected_sequence_ids dtype must be torch.int32, got {selected_sequence_ids.dtype}")
+        if not isinstance(selected_sequence_count, int):
+            raise TypeError("selected_sequence_count must be an int")
 
         token_counts = torch.diff(subsequence_begins_t)
-        if token_counts.numel() and not torch.all(token_counts == 1).item():
+        if token_counts.numel() and selected_sequence_count > 0:
+            selected_token_counts = token_counts[selected_sequence_ids.to(dtype=torch.long)]
+        else:
+            selected_token_counts = token_counts
+        if selected_token_counts.numel() and not torch.all(selected_token_counts == 1).item():
             raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
 
+        batch_size = selected_sequence_count
         max_context_len = int(kern_attn_inputs["max_context_len"])
         kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
-        q_tokens = query.reshape(batch_size, self.num_heads, self.head_size).contiguous()
+        q_tokens = query.reshape(int(query.shape[0]), self.num_heads, self.head_size).contiguous()
+        output_tokens = int(query.shape[0])
+        use_subset_execution = output_tokens != batch_size
 
-        output = torch.zeros(batch_size, self.num_heads * self.head_size, dtype=torch.float16)
+        expected_shape = (output_tokens, self.num_heads * self.head_size)
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
+        if out.dtype != torch.float16:
+            raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
+        output = out
 
         kernels = self._create_kernels()
         gws = [batch_size, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
@@ -471,8 +417,10 @@ class PaSingleTokenRunner:
             t_block_indices = cl.tensor(block_indices_t.detach().numpy())
             t_block_indices_begins = cl.tensor(block_indices_begins_t.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
+            t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
             t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
-            t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
+            output_4d = output.reshape(output_tokens, 1, self.num_heads, self.head_size).contiguous()
+            t_out_final = cl.tensor(output_4d.detach().numpy())
             t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
 
             print(f"{Colors.GREEN}[enqueue single] gws={gws} lws={lws}{Colors.END}")
@@ -488,6 +436,8 @@ class PaSingleTokenRunner:
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
+                t_selected_sequence_ids,
+                selected_sequence_count,
                 t_out,
                 t_lse,
                 1,
@@ -500,130 +450,53 @@ class PaSingleTokenRunner:
                 t_out_final,
                 t_lse,
                 t_subsequence_begins,
+                t_selected_sequence_ids,
+                selected_sequence_count,
                 kv_partition_num,
             )
             cl.finish()
-            output = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
+            output_from_kernel = torch.from_numpy(t_out_final.numpy().reshape(output_tokens, -1))
+            out.copy_(output_from_kernel)
+            output = out
 
         assert torch.isfinite(output).all().item()
         return output
 
-    def run_perf(
-        self,
-        kern_attn_inputs: KernelInputs,
-        n_warmup: int = 5,
-        n_iters: int = 20,
-    ) -> tuple[torch.Tensor, list[int], float]:
-        query = kern_attn_inputs["query"]
-        past_lens_t = kern_attn_inputs["past_lens"]
-        block_indices_t = kern_attn_inputs["block_indices"]
-        block_indices_begins_t = kern_attn_inputs["block_indices_begins"]
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-        key_cache_t = kern_attn_inputs["key_cache"]
-        value_cache_t = kern_attn_inputs["value_cache"]
-
-        assert isinstance(query, torch.Tensor)
-        assert isinstance(past_lens_t, torch.Tensor)
-        assert isinstance(block_indices_t, torch.Tensor)
-        assert isinstance(block_indices_begins_t, torch.Tensor)
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-        assert isinstance(key_cache_t, torch.Tensor)
-        assert isinstance(value_cache_t, torch.Tensor)
-
-        batch_size = int(past_lens_t.numel())
-        if int(query.shape[0]) != batch_size:
-            raise ValueError("pa_single_token path expects one query token per sequence")
-
-        token_counts = torch.diff(subsequence_begins_t)
-        if token_counts.numel() and not torch.all(token_counts == 1).item():
-            raise ValueError("pa_single_token path expects num_tokens == 1 for every subsequence")
-
-        max_context_len = int(kern_attn_inputs["max_context_len"])
-        kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
-        q_tokens = query.reshape(batch_size, self.num_heads, self.head_size).contiguous()
-
-        kernels = self._create_kernels()
-        gws = [batch_size, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
-        lws = [1, 1, 1]
-        gws_2 = [batch_size, self.num_heads, self.head_size // self.reduce_split_step]
-        lws_2 = [1, 1, 1]
-
-        t_q = cl.tensor(q_tokens.detach().numpy())
-        t_k = cl.tensor(key_cache_t.detach().numpy())
-        t_v = cl.tensor(value_cache_t.detach().numpy())
-        t_past_lens = cl.tensor(past_lens_t.detach().numpy())
-        t_block_indices = cl.tensor(block_indices_t.detach().numpy())
-        t_block_indices_begins = cl.tensor(block_indices_begins_t.detach().numpy())
-        t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
-        t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
-        t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
-        t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
-
-        cl.finish()
-
-        for _ in range(n_warmup):
-            kernels.enqueue(
-                "cm_sdpa_2nd",
-                gws,
-                lws,
-                t_q,
-                t_k,
-                t_v,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_out,
-                t_lse,
-                1,
-            )
-            kernels.enqueue(
-                "cm_sdpa_2nd_reduce",
-                gws_2,
-                lws_2,
-                t_out,
-                t_out_final,
-                t_lse,
-                t_subsequence_begins,
-                kv_partition_num,
-            )
-        cl.finish()
-
-        t0 = time.perf_counter()
-        for _ in range(n_iters):
-            kernels.enqueue(
-                "cm_sdpa_2nd",
-                gws,
-                lws,
-                t_q,
-                t_k,
-                t_v,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_out,
-                t_lse,
-                1,
-            )
-            kernels.enqueue(
-                "cm_sdpa_2nd_reduce",
-                gws_2,
-                lws_2,
-                t_out,
-                t_out_final,
-                t_lse,
-                t_subsequence_begins,
-                kv_partition_num,
-            )
-        gpu_latency_ns = cl.finish()
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-        output = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
-        assert torch.isfinite(output).all().item()
-        return output, gpu_latency_ns, elapsed_ms
-
 class PagedAttentionRunner:
+    @staticmethod
+    def _create_multi_token_runner(
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        kv_cache_compression: bool,
+        is_causal: bool,
+    ) -> PaMultiTokenRunner:
+        return PaMultiTokenRunner.create_instance(
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            kv_cache_compression,
+            is_causal,
+        )
+
+    @staticmethod
+    def _create_single_token_runner(
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        kv_cache_compression: bool,
+    ) -> PaSingleTokenRunner:
+        return PaSingleTokenRunner.create_instance(
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            kv_cache_compression,
+        )
+
     def __init__(
         self,
         num_heads: int,
@@ -641,7 +514,7 @@ class PagedAttentionRunner:
             kv_cache_compression,
             is_causal,
         )
-        self.multi_token_runner = PaMultiTokenRunner.create_instance(
+        self.multi_token_runner = self._create_multi_token_runner(
             num_heads,
             num_kv_heads,
             head_size,
@@ -649,20 +522,13 @@ class PagedAttentionRunner:
             kv_cache_compression,
             is_causal,
         )
-        self.single_token_runner = PaSingleTokenRunner.create_instance(
+        self.single_token_runner = self._create_single_token_runner(
             num_heads,
             num_kv_heads,
             head_size,
             block_size,
             kv_cache_compression,
         )
-
-    @staticmethod
-    def _get_mixed_routing_mode() -> str:
-        mode = os.getenv("PA_MIXED_ROUTING_MODE", "multi").strip().lower()
-        if mode not in ("multi", "split"):
-            raise ValueError(f"Unsupported PA_MIXED_ROUTING_MODE={mode}. Expected 'multi' or 'split'.")
-        return mode
 
     def _prepare_kern_attn_inputs(
         self,
@@ -681,7 +547,45 @@ class PagedAttentionRunner:
             kvcache_table,
         )
         kern_attn_inputs["query"] = query
+
+        past_lens_t = kern_attn_inputs["past_lens"]
+        if not isinstance(past_lens_t, torch.Tensor):
+            raise TypeError("past_lens must be a torch.Tensor")
+        full_sequence_count = int(past_lens_t.numel())
+        kern_attn_inputs["selected_sequence_ids"] = torch.arange(full_sequence_count, dtype=torch.int32)
+        kern_attn_inputs["selected_sequence_count"] = full_sequence_count
         return kern_attn_inputs
+
+    @staticmethod
+    def build_selected_sequence_inputs(
+        kern_attn_inputs: KernelInputs,
+        sequence_indices: list[int],
+    ) -> KernelInputs:
+        past_lens_t = kern_attn_inputs["past_lens"]
+        if not isinstance(past_lens_t, torch.Tensor):
+            raise TypeError("past_lens must be a torch.Tensor")
+        if len(sequence_indices) == 0:
+            raise ValueError("sequence_indices must be non-empty")
+
+        selected_sequence_ids = torch.tensor(sequence_indices, dtype=torch.int32)
+        batch_size_in_sequences = int(past_lens_t.numel())
+        if int(selected_sequence_ids.min().item()) < 0 or int(selected_sequence_ids.max().item()) >= batch_size_in_sequences:
+            raise ValueError("sequence_indices contains out-of-range sequence ids")
+
+        selected_inputs: KernelInputs = dict(kern_attn_inputs)
+        selected_inputs["selected_sequence_ids"] = selected_sequence_ids
+        selected_inputs["selected_sequence_count"] = int(selected_sequence_ids.numel())
+
+        max_context_len = 0
+        for sequence_index in selected_sequence_ids.tolist():
+            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, int(sequence_index))
+            q_len = q_end - q_start
+            past_len = int(past_lens_t[int(sequence_index)].item())
+            context_len = past_len + q_len
+            if context_len > max_context_len:
+                max_context_len = context_len
+        selected_inputs["max_context_len"] = max_context_len
+        return selected_inputs
 
     @staticmethod
     def _should_use_single_token_path(
@@ -697,21 +601,23 @@ class PagedAttentionRunner:
             and (token_counts.numel() == 0 or torch.all(token_counts == 1).item())
         )
 
-    def _get_routing_mode(
-        self,
+    @staticmethod
+    def _get_route_mode(
         query: torch.Tensor,
         past_lens_t: torch.Tensor,
         subsequence_begins_t: torch.Tensor,
+        mixed_route_mode: str,
     ) -> tuple[str, list[int], list[int]]:
-        use_single_token_path = self._should_use_single_token_path(query, past_lens_t, subsequence_begins_t)
-        decode_seq_indices, prefill_seq_indices = self._sequence_groups_by_q_len(subsequence_begins_t)
-        mixed_routing_mode = self._get_mixed_routing_mode()
+        use_single_token_path = PagedAttentionRunner._should_use_single_token_path(query, past_lens_t, subsequence_begins_t)
+        decode_seq_indices, prefill_seq_indices = PagedAttentionRunner._sequence_groups_by_q_len(subsequence_begins_t)
+        if mixed_route_mode not in ("multi", "split"):
+            raise ValueError(f"Unsupported mixed_route_mode={mixed_route_mode}. Expected 'multi' or 'split'.")
 
         if use_single_token_path:
             return "single", decode_seq_indices, prefill_seq_indices
 
-        if mixed_routing_mode == "split" and len(decode_seq_indices) > 0 and len(prefill_seq_indices) > 0:
-            return "mixed_split", decode_seq_indices, prefill_seq_indices
+        if mixed_route_mode == "split" and len(decode_seq_indices) > 0 and len(prefill_seq_indices) > 0:
+            return "mixed_route_split", decode_seq_indices, prefill_seq_indices
 
         return "multi", decode_seq_indices, prefill_seq_indices
 
@@ -727,161 +633,25 @@ class PagedAttentionRunner:
                 prefill_seq_indices.append(sequence_index)
         return decode_seq_indices, prefill_seq_indices
 
-    def _build_sequence_group_inputs(
+    def _run_mixed_route_split(
         self,
         kern_attn_inputs: KernelInputs,
-        sequence_indices: list[int],
-    ) -> tuple[KernelInputs, torch.Tensor]:
-        query = kern_attn_inputs["query"]
-        key_cache = kern_attn_inputs["key_cache"]
-        value_cache = kern_attn_inputs["value_cache"]
-        past_lens_t = kern_attn_inputs["past_lens"]
-        block_indices = kern_attn_inputs["block_indices"]
-        block_indices_begins = kern_attn_inputs["block_indices_begins"]
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-
-        assert isinstance(query, torch.Tensor)
-        assert isinstance(key_cache, torch.Tensor)
-        assert isinstance(value_cache, torch.Tensor)
-        assert isinstance(past_lens_t, torch.Tensor)
-        assert isinstance(block_indices, torch.Tensor)
-        assert isinstance(block_indices_begins, torch.Tensor)
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-
-        if len(sequence_indices) == 0:
-            raise ValueError("sequence_indices must be non-empty")
-
-        query_chunks: list[torch.Tensor] = []
-        output_token_indices: list[int] = []
-        new_past_lens: list[int] = []
-        new_subsequence_begins = [0]
-        new_block_indices_begins = [0]
-        key_cache_chunks: list[torch.Tensor] = []
-        value_cache_chunks: list[torch.Tensor] = []
-        max_context_len = 0
-
-        for sequence_index in sequence_indices:
-            q_start, q_end, blk_start, blk_end = get_sequence_ranges(kern_attn_inputs, sequence_index)
-            q_len = q_end - q_start
-            past_len = int(past_lens_t[sequence_index].item())
-            context_len = past_len + q_len
-
-            query_chunks.append(query[q_start:q_end].contiguous())
-            output_token_indices.extend(range(q_start, q_end))
-            new_past_lens.append(past_len)
-            new_subsequence_begins.append(new_subsequence_begins[-1] + q_len)
-
-            physical_blocks = block_indices[blk_start:blk_end].to(dtype=torch.long)
-            key_cache_chunks.append(key_cache[physical_blocks].contiguous())
-            value_cache_chunks.append(value_cache[physical_blocks].contiguous())
-            new_block_indices_begins.append(new_block_indices_begins[-1] + int(physical_blocks.numel()))
-
-            if context_len > max_context_len:
-                max_context_len = context_len
-
-        grouped_query = torch.cat(query_chunks, dim=0).contiguous()
-        grouped_key_cache = torch.cat(key_cache_chunks, dim=0).contiguous()
-        grouped_value_cache = torch.cat(value_cache_chunks, dim=0).contiguous()
-        grouped_block_indices = torch.arange(int(grouped_key_cache.shape[0]), dtype=torch.int32)
-
-        grouped_inputs: KernelInputs = {
-            "query": grouped_query,
-            "key_cache": grouped_key_cache,
-            "value_cache": grouped_value_cache,
-            "past_lens": torch.tensor(new_past_lens, dtype=torch.int32),
-            "subsequence_begins": torch.tensor(new_subsequence_begins, dtype=torch.int32),
-            "block_indices": grouped_block_indices,
-            "block_indices_begins": torch.tensor(new_block_indices_begins, dtype=torch.int32),
-            "max_context_len": max_context_len,
-        }
-        return grouped_inputs, torch.tensor(output_token_indices, dtype=torch.long)
-
-    @staticmethod
-    def _group_gpu_ns_per_iter(gpu_latency_ns: list[int], kernels_per_iter: int, n_iters: int) -> list[int]:
-        if kernels_per_iter <= 0:
-            raise ValueError("kernels_per_iter must be positive")
-        if len(gpu_latency_ns) != n_iters * kernels_per_iter:
-            raise ValueError(
-                f"Unexpected gpu latency sample count: got {len(gpu_latency_ns)}, expected {n_iters * kernels_per_iter}"
-            )
-        grouped = []
-        for iter_index in range(n_iters):
-            start = iter_index * kernels_per_iter
-            end = start + kernels_per_iter
-            grouped.append(int(sum(gpu_latency_ns[start:end])))
-        return grouped
-
-    def _run_mixed_split(
-        self,
-        kern_attn_inputs: KernelInputs,
+        out: torch.Tensor,
     ) -> torch.Tensor:
-        query = kern_attn_inputs["query"]
         subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-        assert isinstance(query, torch.Tensor)
         assert isinstance(subsequence_begins_t, torch.Tensor)
 
         decode_seq_indices, prefill_seq_indices = self._sequence_groups_by_q_len(subsequence_begins_t)
-        if len(decode_seq_indices) == 0 or len(prefill_seq_indices) == 0:
-            return self.multi_token_attention(kern_attn_inputs)
-
-        output = torch.empty_like(query)
-
-        decode_inputs, decode_token_indices = self._build_sequence_group_inputs(kern_attn_inputs, decode_seq_indices)
-        decode_out = self.single_token_attention(decode_inputs)
-        output[decode_token_indices] = decode_out
-
-        prefill_inputs, prefill_token_indices = self._build_sequence_group_inputs(kern_attn_inputs, prefill_seq_indices)
-        prefill_out = self.multi_token_attention(prefill_inputs)
-        output[prefill_token_indices] = prefill_out
-
-        return output
-
-    def _run_perf_mixed_split(
-        self,
-        kern_attn_inputs: KernelInputs,
-        n_warmup: int,
-        n_iters: int,
-    ) -> tuple[torch.Tensor, list[int], float, str, int]:
-        query = kern_attn_inputs["query"]
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-        assert isinstance(query, torch.Tensor)
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-
-        decode_seq_indices, prefill_seq_indices = self._sequence_groups_by_q_len(subsequence_begins_t)
-        if len(decode_seq_indices) == 0 or len(prefill_seq_indices) == 0:
-            attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_mode = self.multi_token_runner.run_perf(
-                kern_attn_inputs,
-                n_warmup=n_warmup,
-                n_iters=n_iters,
-            )
-            return attn_outputs, gpu_latency_ns, elapsed_ms, f"multi_token/{dispatch_mode}", 1
-
-        output = torch.empty_like(query)
-        elapsed_ms_total = 0.0
-
-        decode_inputs, decode_token_indices = self._build_sequence_group_inputs(kern_attn_inputs, decode_seq_indices)
-        decode_out, decode_gpu_ns, decode_elapsed_ms = self.single_token_runner.run_perf(
-            decode_inputs,
-            n_warmup=n_warmup,
-            n_iters=n_iters,
+        assert len(decode_seq_indices) > 0 and len(prefill_seq_indices) > 0, (
+            "mixed_route_split requires both decode and prefill sequences; route gating should enforce this"
         )
-        output[decode_token_indices] = decode_out
-        elapsed_ms_total += decode_elapsed_ms
 
-        prefill_inputs, prefill_token_indices = self._build_sequence_group_inputs(kern_attn_inputs, prefill_seq_indices)
-        prefill_out, prefill_gpu_ns, prefill_elapsed_ms, _ = self.multi_token_runner.run_perf(
-            prefill_inputs,
-            n_warmup=n_warmup,
-            n_iters=n_iters,
-        )
-        output[prefill_token_indices] = prefill_out
-        elapsed_ms_total += prefill_elapsed_ms
+        decode_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, decode_seq_indices)
+        self.single_token_attention(decode_inputs, out=out)
 
-        decode_iter_ns = self._group_gpu_ns_per_iter(decode_gpu_ns, kernels_per_iter=2, n_iters=n_iters)
-        prefill_iter_ns = self._group_gpu_ns_per_iter(prefill_gpu_ns, kernels_per_iter=1, n_iters=n_iters)
-        total_iter_ns = [decode_iter_ns[i] + prefill_iter_ns[i] for i in range(n_iters)]
-
-        return output, total_iter_ns, elapsed_ms_total, "mixed_split/single+multi", 1
+        prefill_inputs = self.build_selected_sequence_inputs(kern_attn_inputs, prefill_seq_indices)
+        self.multi_token_attention(prefill_inputs, out=out)
+        return out
 
     def kvcache_update(
         self,
@@ -905,15 +675,17 @@ class PagedAttentionRunner:
     def multi_token_attention(
         self,
         kern_attn_inputs: KernelInputs,
+        out: torch.Tensor,
     ) -> torch.Tensor:
-        attn_outputs = self.multi_token_runner(kern_attn_inputs)
+        attn_outputs = self.multi_token_runner(kern_attn_inputs, out=out)
         return attn_outputs
 
     def single_token_attention(
         self,
         kern_attn_inputs: KernelInputs,
+        out: torch.Tensor,
     ) -> torch.Tensor:
-        attn_outputs = self.single_token_runner(kern_attn_inputs)
+        attn_outputs = self.single_token_runner(kern_attn_inputs, out=out)
         return attn_outputs
 
     def run(
@@ -924,6 +696,7 @@ class PagedAttentionRunner:
         subsequence_begins: list[int],
         kvcache_table: KVCacheTable,
         query: torch.Tensor,
+        mixed_route_mode: str = "multi",
     ) -> tuple[KernelInputs, torch.Tensor]:
         kern_attn_inputs = self._prepare_kern_attn_inputs(
             key,
@@ -939,67 +712,23 @@ class PagedAttentionRunner:
         assert isinstance(past_lens_t, torch.Tensor)
         assert isinstance(subsequence_begins_t, torch.Tensor)
 
-        routing_mode, _, _ = self._get_routing_mode(query, past_lens_t, subsequence_begins_t)
+        output = torch.zeros(
+            int(query.shape[0]),
+            self.multi_token_runner.num_heads * self.multi_token_runner.head_size,
+            dtype=torch.float16,
+        )
 
-        if routing_mode == "mixed_split":
-            attn_outputs = self._run_mixed_split(kern_attn_inputs)
+        route_mode, _, _ = self._get_route_mode(query, past_lens_t, subsequence_begins_t, mixed_route_mode)
+
+        if route_mode == "mixed_route_split":
+            attn_outputs = self._run_mixed_route_split(kern_attn_inputs, out=output)
             return kern_attn_inputs, attn_outputs
 
-        if routing_mode == "single":
-            attn_outputs = self.single_token_attention(kern_attn_inputs)
+        if route_mode == "single":
+            attn_outputs = self.single_token_attention(kern_attn_inputs, out=output)
         else:
-            attn_outputs = self.multi_token_attention(kern_attn_inputs)
+            attn_outputs = self.multi_token_attention(kern_attn_inputs, out=output)
         return kern_attn_inputs, attn_outputs
-
-    def run_perf(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        past_lens: list[int],
-        subsequence_begins: list[int],
-        kvcache_table: KVCacheTable,
-        query: torch.Tensor,
-        n_warmup: int = 5,
-        n_iters: int = 20,
-    ) -> tuple[KernelInputs, torch.Tensor, list[int], float, str, int]:
-        kern_attn_inputs = self._prepare_kern_attn_inputs(
-            key,
-            value,
-            past_lens,
-            subsequence_begins,
-            kvcache_table,
-            query,
-        )
-
-        past_lens_t = kern_attn_inputs["past_lens"]
-        subsequence_begins_t = kern_attn_inputs["subsequence_begins"]
-        assert isinstance(past_lens_t, torch.Tensor)
-        assert isinstance(subsequence_begins_t, torch.Tensor)
-
-        routing_mode, _, _ = self._get_routing_mode(query, past_lens_t, subsequence_begins_t)
-
-        if routing_mode == "mixed_split":
-            attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_path, kernels_per_iter = self._run_perf_mixed_split(
-                kern_attn_inputs,
-                n_warmup=n_warmup,
-                n_iters=n_iters,
-            )
-            return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_path, kernels_per_iter
-
-        if routing_mode == "single":
-            attn_outputs, gpu_latency_ns, elapsed_ms = self.single_token_runner.run_perf(
-                kern_attn_inputs,
-                n_warmup=n_warmup,
-                n_iters=n_iters,
-            )
-            return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, "single_token", 2
-
-        attn_outputs, gpu_latency_ns, elapsed_ms, dispatch_mode = self.multi_token_runner.run_perf(
-            kern_attn_inputs,
-            n_warmup=n_warmup,
-            n_iters=n_iters,
-        )
-        return kern_attn_inputs, attn_outputs, gpu_latency_ns, elapsed_ms, f"multi_token/{dispatch_mode}", 1
 
     def reference_attention(self, kern_attn_inputs: KernelInputs) -> torch.Tensor:
         query = kern_attn_inputs["query"]
@@ -1068,8 +797,7 @@ class PagedAttentionRunner:
 def run_paged_attention_smoke_case(
     case: PagedAttentionTestCase,
     check_acc=True,
-    mixed_routing_mode: str | None = None,
-    compare_mixed_paths: bool = False,
+    mixed_route_mode: str | None = None,
 ) -> KernelInputs:
     if case.key_cache_quant_mode != CacheQuantMode.BY_TOKEN:
         raise ValueError("Only CacheQuantMode.BY_TOKEN is supported in this test harness")
@@ -1104,61 +832,21 @@ def run_paged_attention_smoke_case(
         True,
     )
 
-    old_mixed_mode = os.getenv("PA_MIXED_ROUTING_MODE")
-    if mixed_routing_mode is not None:
-        os.environ["PA_MIXED_ROUTING_MODE"] = mixed_routing_mode
-
-    try:
-        kern_attn_inputs, attn_outputs = pa_runner.run(
-            key,
-            value,
-            past_lens,
-            subsequence_begins,
-            kvcache_table,
-            query,
-        )
-    finally:
-        if mixed_routing_mode is not None:
-            if old_mixed_mode is None:
-                os.environ.pop("PA_MIXED_ROUTING_MODE", None)
-            else:
-                os.environ["PA_MIXED_ROUTING_MODE"] = old_mixed_mode
+    kern_attn_inputs, attn_outputs = pa_runner.run(
+        key,
+        value,
+        past_lens,
+        subsequence_begins,
+        kvcache_table,
+        query,
+        mixed_route_mode="multi" if mixed_route_mode is None else mixed_route_mode,
+    )
 
     if check_acc:
         round_ref = pa_runner.reference_attention(kern_attn_inputs)
         check_close(round_ref, attn_outputs)
     else:
         assert torch.isfinite(attn_outputs).all().item()
-
-    if compare_mixed_paths:
-        old_mode = os.getenv("PA_MIXED_ROUTING_MODE")
-        try:
-            os.environ["PA_MIXED_ROUTING_MODE"] = "multi"
-            _, out_multi = pa_runner.run(
-                key,
-                value,
-                past_lens,
-                subsequence_begins,
-                kvcache_table,
-                query,
-            )
-
-            os.environ["PA_MIXED_ROUTING_MODE"] = "split"
-            _, out_split = pa_runner.run(
-                key,
-                value,
-                past_lens,
-                subsequence_begins,
-                kvcache_table,
-                query,
-            )
-        finally:
-            if old_mode is None:
-                os.environ.pop("PA_MIXED_ROUTING_MODE", None)
-            else:
-                os.environ["PA_MIXED_ROUTING_MODE"] = old_mode
-
-        check_close(out_multi, out_split)
 
     return kern_attn_inputs
 
@@ -1356,11 +1044,21 @@ def test_pa_smoke_paged_attention_generate_only(case: PagedAttentionTestCase):
 
 
 
+@pytest.mark.parametrize("mixed_route_mode", ("multi", "split"), ids=("route_multi", "route_split"))
 @pytest.mark.parametrize("case", MIXED_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
-    print(f"{Colors.GREEN}[testcase] mixed_only id={make_smoke_case_id(case)}{Colors.END}")
+def test_pa_smoke_paged_attention_mixed_only_route_matches_reference(
+    case: PagedAttentionTestCase,
+    mixed_route_mode: str,
+):
+    print(
+        f"{Colors.GREEN}[testcase] mixed_only case={make_smoke_case_id(case)} route={mixed_route_mode}{Colors.END}"
+    )
 
-    kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=True)
+    kern_attn_inputs = run_paged_attention_smoke_case(
+        case,
+        check_acc=True,
+        mixed_route_mode=mixed_route_mode,
+    )
     max_context_len = int(kern_attn_inputs["max_context_len"])
     past_lens = kern_attn_inputs["past_lens"]
     query = kern_attn_inputs["query"]
@@ -1376,120 +1074,17 @@ def test_pa_smoke_paged_attention_mixed_only(case: PagedAttentionTestCase):
     assert int(query.shape[0]) != int(past_lens.numel())
 
 
-@pytest.mark.parametrize("case", MIXED_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_smoke_paged_attention_mixed_only_split_vs_multi(case: PagedAttentionTestCase):
-    print(f"{Colors.GREEN}[testcase] mixed_only_split_compare id={make_smoke_case_id(case)}{Colors.END}")
-    run_paged_attention_smoke_case(case, check_acc=True, compare_mixed_paths=True)
-
-
-@pytest.mark.parametrize("case", MIXED_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
-def test_pa_perf_compare_mixed_routing(case: PagedAttentionTestCase):
-    if os.getenv("PA_MIXED_PERF", "0") != "1":
-        pytest.skip("Set PA_MIXED_PERF=1 to enable mixed routing perf comparison")
-
-    if case.key_cache_quant_mode != CacheQuantMode.BY_TOKEN:
-        raise ValueError("Only CacheQuantMode.BY_TOKEN is supported in this test harness")
-    if case.k_head_size != case.v_head_size:
-        raise ValueError("k_head_size must equal v_head_size in this CM paged-attention harness")
-
-    subsequence_tensors = [
-        create_subsequence_tensors(
-            descriptor,
-            case.num_heads,
-            case.num_kv_heads,
-            case.k_head_size,
-        )
-        for descriptor in case.subsequences
-    ]
-    query, key, value, past_lens, subsequence_begins, kvcache_table = create_paged_attention_inputs(
-        case,
-        subsequence_tensors,
-    )
-
-    pa_runner = PagedAttentionRunner(
-        case.num_heads,
-        case.num_kv_heads,
-        case.k_head_size,
-        case.block_size,
-        case.kv_cache_compression,
-        True,
-    )
-
-    n_warmup = 3
-    n_iters = 10
-    old_mode = os.getenv("PA_MIXED_ROUTING_MODE")
-    try:
-        os.environ["PA_MIXED_ROUTING_MODE"] = "multi"
-        _, out_multi, gpu_multi_ns, elapsed_multi_ms, path_multi, kernels_multi = pa_runner.run_perf(
-            key,
-            value,
-            past_lens,
-            subsequence_begins,
-            kvcache_table,
-            query,
-            n_warmup=n_warmup,
-            n_iters=n_iters,
-        )
-
-        os.environ["PA_MIXED_ROUTING_MODE"] = "split"
-        _, out_split, gpu_split_ns, elapsed_split_ms, path_split, kernels_split = pa_runner.run_perf(
-            key,
-            value,
-            past_lens,
-            subsequence_begins,
-            kvcache_table,
-            query,
-            n_warmup=n_warmup,
-            n_iters=n_iters,
-        )
-    finally:
-        if old_mode is None:
-            os.environ.pop("PA_MIXED_ROUTING_MODE", None)
-        else:
-            os.environ["PA_MIXED_ROUTING_MODE"] = old_mode
-
-    check_close(out_multi, out_split)
-
-    def avg_gpu_ms(gpu_latency_ns: list[int], kernels_per_iter: int, iters: int) -> float:
-        if len(gpu_latency_ns) != kernels_per_iter * iters:
-            raise AssertionError("Unexpected perf sample count")
-        return (sum(gpu_latency_ns) * 1e-6) / iters
-
-    avg_multi_gpu_ms = avg_gpu_ms(gpu_multi_ns, kernels_multi, n_iters)
-    avg_split_gpu_ms = avg_gpu_ms(gpu_split_ns, kernels_split, n_iters)
-    avg_multi_host_ms = elapsed_multi_ms / n_iters
-    avg_split_host_ms = elapsed_split_ms / n_iters
-
-    speedup_gpu = avg_multi_gpu_ms / avg_split_gpu_ms if avg_split_gpu_ms > 0 else float("inf")
-    speedup_host = avg_multi_host_ms / avg_split_host_ms if avg_split_host_ms > 0 else float("inf")
-    print(
-        f"{Colors.GREEN}[mixed perf compare] id={make_smoke_case_id(case)} "
-        f"multi(path={path_multi}) gpu_ms={avg_multi_gpu_ms:.3f} host_ms={avg_multi_host_ms:.3f} | "
-        f"split(path={path_split}) gpu_ms={avg_split_gpu_ms:.3f} host_ms={avg_split_host_ms:.3f} | "
-        f"speedup_gpu={speedup_gpu:.3f}x speedup_host={speedup_host:.3f}x{Colors.END}"
-    )
-
-
-# '''
 # Usage:
-
-# # `py_compile` to verify syntax correctness of the test file before running pytest.
-# python -m py_compile test_pa_multiseq.py
-
-# list all tests in the file without executing them, to verify that pytest can discover the tests correctly.
-# python -m pytest --collect-only -q test_pa_multiseq.py | grep 'test_pa_smoke_paged_attention_generate_only'
-
-# # `-q` for quieter pytest output, and `-k` to select the specific test to run.
-# python -m pytest -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_generate_only and 1x10'
-
-# # `-s` to show captured print statement for debugging purposes.
-# python -m pytest -s test_pa_multiseq.py -k 'generate_only or mixed_only'
-# python -m pytest -s "test_pa_multiseq.py::test_pa_smoke_paged_attention_generate_only[1x10__h2_kv2_khs64_vhs64_bls16_cmpr1_qmBY_TOKEN]"
-
-# `-vv` for more verbose pytest output, to show the full test case ID and parameters.
-# timeout 120s python -m pytest -q test_pa_multiseq.py -vv
-
-# timeout 180s python -m pytest -q test_pa_multiseq.py -vv -k 'cmpr0 and (generate_only or mixed_only)'
-
-# '''
+#   python -m py_compile test_pa_multiseq.py
+#   python -m pytest --collect-only -q test_pa_multiseq.py | grep 'test_pa_smoke_paged_attention_mixed_only_route_matches_reference'
+#   python -m pytest -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_generate_only and 1x10'
+#   python -m pytest -s test_pa_multiseq.py -k 'generate_only or mixed_only'
+#   python -m pytest -s -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_mixed_only_route_matches_reference and route_split'
+#   python -m pytest -s -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_mixed_only_route_matches_reference and route_multi'
+#   timeout 120s python -m pytest -q test_pa_multiseq.py -vv
+#   timeout 120s python -m pytest -q test_pa_multiseq.py -vv -k 'cmpr0 and (generate_only or mixed_only)'
+#
+# Notes:
+#   - Mixed routing is selected explicitly by the parametrized `mixed_route_mode` test argument.
+#   - Use `-k 'route_multi'` or `-k 'route_split'` to run just one mixed routing mode.
 

@@ -73,6 +73,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     int* block_indices [[type("svmptr_t")]],
     int* block_indices_begins [[type("svmptr_t")]],
     int* subsequence_begins [[type("svmptr_t")]],
+    int* selected_sequence_ids [[type("svmptr_t")]],
+    int selected_sequence_count,
     float* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
     int q_len// 1
@@ -113,6 +115,10 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     //# Each WG processes a partition, which is KV_PARTITION_SIZE long and multiple of KV_BLOCK_SIZE.
     //# KV_BLOCK_SIZE can be 32/64/128/256, etc.
     const uint seq_idx = cm_global_id(0);
+    if (seq_idx >= selected_sequence_count) {
+        return;
+    }
+    const uint orig_seq_idx = selected_sequence_ids[seq_idx];
     const uint kv_head_num_idx = cm_global_id(1) / Q_head_chunks_per_kv_head;
     const uint head_num_idx = cm_global_id(1) * Q_head_chunk_size;
     //# KV_PARTITION_SIZE --> EU thread
@@ -120,8 +126,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
     const uint kv_partition_num = cm_group_count(2);
     const uint kv_partition_idx = cm_group_id(2);
 
-    const uint subseq_q_begin = subsequence_begins[seq_idx];
-    const uint subseq_q_end = subsequence_begins[seq_idx + 1];
+    const uint subseq_q_begin = subsequence_begins[orig_seq_idx];
+    const uint subseq_q_end = subsequence_begins[orig_seq_idx + 1];
     const uint subseq_q_len = subseq_q_end - subseq_q_begin;
     if (subseq_q_len == 0) {
         return;
@@ -129,11 +135,11 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd(
 
     // Single-token path uses the latest token from each subsequence.
     const uint q_token_idx = subseq_q_end - 1;
-    const uint kv_len = past_lens[seq_idx] + subseq_q_len;
+    const uint kv_len = past_lens[orig_seq_idx] + subseq_q_len;
     const uint seq_kv_partition_num = (kv_len + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
 
-    const uint block_begin = block_indices_begins[seq_idx];
-    const uint block_end = block_indices_begins[seq_idx + 1];
+    const uint block_begin = block_indices_begins[orig_seq_idx];
+    const uint block_end = block_indices_begins[orig_seq_idx + 1];
     const uint total_blocks_num = block_end - block_begin;
 
     // The code here requires KV_PARTITION_SIZE to be an integer multiple of KV_BLOCK_SIZE.
@@ -667,9 +673,15 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
     half* output [[type("svmptr_t")]],
     float* lse [[type("svmptr_t")]],
     int* subsequence_begins [[type("svmptr_t")]],
+    int* selected_sequence_ids [[type("svmptr_t")]],
+    int selected_sequence_count,
     int kv_partition_num
     ) {
         auto batch = cm_global_id(0);
+        if (batch >= selected_sequence_count) {
+            return;
+        }
+        auto orig_batch = selected_sequence_ids[batch];
         auto head = cm_global_id(1);
         auto offset = cm_group_id(2) * REDUCE_SPLIT_SIZE;
         const int total_partition_num = (kv_partition_num * HEADS_NUM);
@@ -721,8 +733,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_reduce(
 
         out_mat = cm_mul<half>(out_mat_f32, (float)1.0f);
         // write output
-        uint q_begin = subsequence_begins[batch];
-        uint q_end = subsequence_begins[batch + 1];
+        uint q_begin = subsequence_begins[orig_batch];
+        uint q_end = subsequence_begins[orig_batch + 1];
         if (q_end <= q_begin) {
             return;
         }

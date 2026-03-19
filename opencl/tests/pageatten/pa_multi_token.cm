@@ -39,6 +39,8 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int32_t* block_indices [[type("svmptr_t")]],
     int32_t* block_indices_begins [[type("svmptr_t")]],
     int32_t* subsequence_begins [[type("svmptr_t")]],
+    int32_t* selected_sequence_ids [[type("svmptr_t")]],
+    int32_t selected_sequence_count,
     half* output [[type("svmptr_t")]],
     int q_len
 #if SPARSE_BLOCK_SIZE > 1
@@ -87,11 +89,16 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     const int wg_seq_len = local_size * q_step;
 #endif
     int mapped_wg_id = wg_id;
+    int local_subsequence_id = 0;
     int subsequence_id = 0;
     int subseq_q_begin = 0;
     int subseq_q_end = q_len;
     int subseq_q_len = q_len;
     while (true) {
+        if (local_subsequence_id >= selected_sequence_count) {
+            return;
+        }
+        subsequence_id = selected_sequence_ids[local_subsequence_id];
         subseq_q_begin = subsequence_begins[subsequence_id];
         if (subseq_q_begin >= q_len) {
             return;
@@ -106,7 +113,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
             break;
         }
         mapped_wg_id -= subseq_wg_count;
-        subsequence_id++;
+        local_subsequence_id++;
     }
 
     int past_q_lens = past_lens[subsequence_id];
