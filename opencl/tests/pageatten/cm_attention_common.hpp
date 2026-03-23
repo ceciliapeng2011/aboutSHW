@@ -1,18 +1,7 @@
-/*******************************************************************************
- * Copyright (c) 2022-2025 Intel Corporation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *******************************************************************************/
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
 #include <cm/cm.h>
 #include <cm/cmtl.h>
 
@@ -59,15 +48,6 @@ void show(const matrix<T, M, N> mat, bool isfloat=true) {
 
         }
         printf("],\n");
-    }
-    printf("]\n");
-}
-
-template<typename T, int N>
-void show(vector<T, N> vec) {
-    printf("\t[");
-    for(int n = 0; n < N; n ++) {
-        printf("%8.4f,", vec[n]);
     }
     printf("]\n");
 }
@@ -158,6 +138,28 @@ CM_INLINE void cm_load_2d(matrix_ref<half, M, N> out, SurfaceIndex base, uint of
     #pragma unroll
     for(int i = 0; i < out.n_rows(); i++) {
         out.row(i).format<uint>() = cm_load<uint, N/2>(base, offset + i * pitch);
+    }
+}
+
+template <int M, int N, int num_elem>
+CM_INLINE void cm_load_2d_with_tail(matrix_ref<uint, M, N> out, SurfaceIndex base, uint offset, uint pitch) {
+    #pragma unroll
+    for(int i = 0; i < out.n_rows(); i++) {
+        auto row_data = out.row(i).format<uint>();
+        row_data = 0;
+        auto src = cm_load<uint, N>(base, offset + i * pitch);
+        row_data.select<num_elem, 1>(0) = src.select<num_elem, 1>(0);
+    }
+}
+
+template <int M, int N, int num_elem>
+CM_INLINE void cm_load_2d_with_tail(matrix_ref<half, M, N> out, SurfaceIndex base, uint offset, uint pitch) {
+    #pragma unroll
+    for(int i = 0; i < out.n_rows(); i++) {
+        auto row_data = out.row(i).format<uint>();
+        row_data = 0;
+        auto src = cm_load<uint, N/2>(base, offset + i * pitch);
+        row_data.select<num_elem/2, 1>(0) = src.select<num_elem/2, 1>(0);
     }
 }
 
@@ -319,65 +321,64 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     #define cm_load_transpose cm_load<lsc::Transpose>
     #define cm_load_vnni cm_load<lsc::VNNI>
     #define cm_store_normal cm_store
-#else
-    // simulation of LSC API using SVM API
-    template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
-    inline void cm_load_normal(vector_ref<T, NBlocks*BlockH*BlockW> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
-        static_assert(NBlocks == 1);
-        auto pitch = Desc.get_pitch() + 1;
-        auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
-        #pragma unroll
-        for(int i = 0; i < BlockH; i++) {
-            cm_svm_block_read(base + i * pitch, Res.select<BlockW, 1>(i*BlockW));
-        }
-    }
+    // // simulation of LSC API using SVM API
+    // template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
+    // inline void cm_load_normal(vector_ref<T, NBlocks*BlockH*BlockW> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
+    //     static_assert(NBlocks == 1);
+    //     auto pitch = Desc.get_pitch() + 1;
+    //     auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
+    //     #pragma unroll
+    //     for(int i = 0; i < BlockH; i++) {
+    //         cm_svm_block_read(base + i * pitch, Res.select<BlockW, 1>(i*BlockW));
+    //     }
+    // }
 
-    template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
-    inline void cm_load_transpose(vector_ref<T, NBlocks*BlockW*BlockH> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
-        static_assert(NBlocks == 1);
-        auto pitch = Desc.get_pitch() + 1;
-        auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
-        matrix<T, BlockH, BlockW> temp;
-        #pragma unroll
-        for(int i = 0; i < BlockH; i++) {
-            cm_svm_block_read(base + i * pitch, temp[i]);
-        }
-        Transpose2DMatrix(temp, Res.format<T, BlockW, BlockH>());
-    }
+    // template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
+    // inline void cm_load_transpose(vector_ref<T, NBlocks*BlockW*BlockH> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
+    //     static_assert(NBlocks == 1);
+    //     auto pitch = Desc.get_pitch() + 1;
+    //     auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
+    //     matrix<T, BlockH, BlockW> temp;
+    //     #pragma unroll
+    //     for(int i = 0; i < BlockH; i++) {
+    //         cm_svm_block_read(base + i * pitch, temp[i]);
+    //     }
+    //     Transpose2DMatrix(temp, Res.format<T, BlockW, BlockH>());
+    // }
 
-    // in VNNI case, NBlocks is increasing along X dimension (increase cache-line usage)
-    template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
-    inline void cm_load_vnni(vector_ref<T, NBlocks*BlockW*BlockH> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
-        static_assert(NBlocks == 1 || NBlocks == 2);
-        // each block must be a full XMX B matrix
-        static_assert(BlockH == REG_K);
-        static_assert(BlockW == REG_N);
-        auto pitch = Desc.get_pitch() + 1;
-        auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
-        matrix<T, BlockH, NBlocks * BlockW> temp;
-        #pragma unroll
-        for(int i = 0; i < BlockH; i++) {
-            cm_svm_block_read(base + i * pitch, temp[i]);
-        }
+    // // in VNNI case, NBlocks is increasing along X dimension (increase cache-line usage)
+    // template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
+    // inline void cm_load_vnni(vector_ref<T, NBlocks*BlockW*BlockH> Res, const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, int16_t Pred = 1) {
+    //     static_assert(NBlocks == 1 || NBlocks == 2);
+    //     // each block must be a full XMX B matrix
+    //     static_assert(BlockH == REG_K);
+    //     static_assert(BlockW == REG_N);
+    //     auto pitch = Desc.get_pitch() + 1;
+    //     auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
+    //     matrix<T, BlockH, NBlocks * BlockW> temp;
+    //     #pragma unroll
+    //     for(int i = 0; i < BlockH; i++) {
+    //         cm_svm_block_read(base + i * pitch, temp[i]);
+    //     }
 
-        auto out_vnni = Res.format<T, NBlocks * (BlockH/2), 2*BlockW>();
-        #pragma unroll
-        for(int i = 0; i < NBlocks; i ++) {
-            out_vnni.select<BlockH/2, 1, BlockW, 2>(i*(BlockH/2), 0) = temp.select<BlockH/2, 2, BlockW, 1>(0, i*BlockW);
-            out_vnni.select<BlockH/2, 1, BlockW, 2>(i*(BlockH/2), 1) = temp.select<BlockH/2, 2, BlockW, 1>(1, i*BlockW);
-        }
-    }
+    //     auto out_vnni = Res.format<T, NBlocks * (BlockH/2), 2*BlockW>();
+    //     #pragma unroll
+    //     for(int i = 0; i < NBlocks; i ++) {
+    //         out_vnni.select<BlockH/2, 1, BlockW, 2>(i*(BlockH/2), 0) = temp.select<BlockH/2, 2, BlockW, 1>(0, i*BlockW);
+    //         out_vnni.select<BlockH/2, 1, BlockW, 2>(i*(BlockH/2), 1) = temp.select<BlockH/2, 2, BlockW, 1>(1, i*BlockW);
+    //     }
+    // }
 
-    template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
-    inline void cm_store_normal(const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, vector_ref<T, NBlocks*BlockW*BlockH> Res) {
-        static_assert(NBlocks == 1);
-        auto pitch = Desc.get_pitch() + 1;
-        auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
-        #pragma unroll
-        for(int i = 0; i < BlockH; i++) {
-            cm_svm_block_write(base + i * pitch, Res.select<BlockW, 1>(i*BlockW));
-        }
-    }
+    // template <typename T = int, unsigned NBlocks = 1, unsigned BlockH = 1, unsigned BlockW = 1>
+    // inline void cm_store_normal(const lsc::block_2d_desc<T, NBlocks, BlockH, BlockW> &Desc, vector_ref<T, NBlocks*BlockW*BlockH> Res) {
+    //     static_assert(NBlocks == 1);
+    //     auto pitch = Desc.get_pitch() + 1;
+    //     auto base = reinterpret_cast<svmptr_t>(Desc.get_base() + Desc.get_block_y()*pitch + Desc.get_block_x() * sizeof(T));
+    //     #pragma unroll
+    //     for(int i = 0; i < BlockH; i++) {
+    //         cm_svm_block_write(base + i * pitch, Res.select<BlockW, 1>(i*BlockW));
+    //     }
+    // }
 #endif
 
 //===============================================================================================

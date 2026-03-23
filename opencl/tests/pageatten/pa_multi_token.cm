@@ -87,6 +87,7 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 #else
     const int wg_seq_len = local_size * q_step;
 #endif
+
     const int blocked_query_idx = wg_id * 2;
     int block_start_pos = blocked_q_starts_and_subseq_mapping[blocked_query_idx];
     int subsequence_id = blocked_q_starts_and_subseq_mapping[blocked_query_idx + 1];
