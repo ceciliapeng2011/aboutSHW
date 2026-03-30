@@ -970,6 +970,9 @@ while len(all_layers) < loop_cnt and mem_size < 8e9:
     mem_size += v.numel() * v.element_size()
     # print(f"nlayers={len(all_layers)} mem_size={mem_size*1e-9:.3f} GB")
 
+# Clear previously recorded profiling events before timed loop.
+cl.finish()
+
 for i in range(loop_cnt):
     j  = i % len(all_layers)
     cm_kernels.enqueue("cm_sdpa_2nd", GWS, LWS,
@@ -982,41 +985,54 @@ for i in range(loop_cnt):
     cm_kernels.enqueue("cm_sdpa_2nd_reduce", GWS_2, LWS_2, all_layers[j][3],all_layers[j][4], t_lse, kv_partition_num)
 
 latency = cl.finish()
-first_kernel = 1
 if enable_kvcache_compression:
     kvcache_size = new_kv_len * num_kv_heads * head_size * 1 * 2
 else:
     kvcache_size = new_kv_len * num_kv_heads * head_size * 2 * 2
 intermedia_size = batch * num_heads * kv_partition_num * (head_size + 1) * 4
 
-kvcache_total_time=0
-intermedia_total_time=0
+cm_sdpa_2nd_total_time=0
+cm_sdpa_2nd_reduce_total_time=0
 num_runs = 0
-num_warmup = 0
-for iter, ns in enumerate(latency):
-    if first_kernel:
-        if num_warmup <= 4:
-            num_warmup += 1
-        else:
-            kvcache_total_time += ns
-            num_runs += 1
-        print(f" {iter} {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s, kvcache_size = {kvcache_size*1e-6:.1f} MB")
-        #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {kvcache_size/(ns):.3f} GB/s")
-    else:
-        if num_warmup <= 4:
-            num_warmup += 1
-        else:
-            intermedia_total_time += ns
-        #print(f"  {ns*1e-6:.3f} ms,  Bandwidth = {intermedia_size/(ns):.3f} GB/s, intermedia = {intermedia_size*1e-6:.1f} MB")
-    first_kernel =  1 - first_kernel
+num_warmup = 5
+max_valid_ns = int(1e12)  # 1000s, defensive cap for bogus timestamps
+
+# latency is expected as [cm_sdpa_2nd, cm_sdpa_2nd_reduce, ...] for this loop.
+expected_event_count = 2 * loop_cnt
+if len(latency) < expected_event_count:
+    raise RuntimeError(f"Expected at least {expected_event_count} events, got {len(latency)}")
+
+for pair_idx in range(loop_cnt):
+    kv_ns = int(latency[2 * pair_idx])
+    inter_ns = int(latency[2 * pair_idx + 1])
+
+    # Ignore invalid/overflowed samples occasionally observed in the first events.
+    if kv_ns <= 0 or inter_ns <= 0 or kv_ns > max_valid_ns or inter_ns > max_valid_ns:
+        continue
+
+    if pair_idx < num_warmup:
+        continue
+
+    cm_sdpa_2nd_total_time += kv_ns
+    cm_sdpa_2nd_reduce_total_time += inter_ns
+    num_runs += 1
+
+    print(
+        f" pair={pair_idx} kv={kv_ns*1e-6:.3f} ms, "
+        f"Bandwidth = {kvcache_size/kv_ns:.3f} GB/s, "
+        f"kvcache_size = {kvcache_size*1e-6:.1f} MB"
+    )
 
 
 print()
-print("intermedia_total_time = ", intermedia_total_time*1e-6, "ms")
-print("kvcache_total_time = ", kvcache_total_time*1e-6, "ms")
+print("cm_sdpa_2nd_reduce_total_time = ", cm_sdpa_2nd_reduce_total_time*1e-6, "ms")
+print("cm_sdpa_2nd_total_time = ", cm_sdpa_2nd_total_time*1e-6, "ms")
 
-print(f"num_runs = {num_runs}, avg kvcache = {kvcache_size*num_runs/kvcache_total_time:.3f} GB/s, avg intermedia = {intermedia_size*num_runs/(intermedia_total_time):.3f} GB/s")
-print(f"num_runs = {num_runs}, avg pa kernel time for Qwen3-8B = {(kvcache_total_time + intermedia_total_time) * 1e-6 / num_runs * 36:.3f} ms")
+if num_runs == 0 or cm_sdpa_2nd_total_time <= 0 or cm_sdpa_2nd_reduce_total_time <= 0:
+    raise RuntimeError("No valid latency samples collected for bandwidth measurement")
+
+print(f"num_runs = {num_runs}, avg cm_sdpa_2nd = {kvcache_size*num_runs/cm_sdpa_2nd_total_time:.3f} GB/s, avg cm_sdpa_2nd_reduce = {intermedia_size*num_runs/(cm_sdpa_2nd_reduce_total_time):.3f} GB/s")
+print(f"num_runs = {num_runs}, avg pa kernel time for Qwen3-8B = {(cm_sdpa_2nd_total_time + cm_sdpa_2nd_reduce_total_time) * 1e-6 / num_runs * 36:.3f} ms")
 print()
 
 f1 = torch.from_numpy(all_layers[0][4].numpy())
