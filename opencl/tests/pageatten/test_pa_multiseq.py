@@ -1002,6 +1002,14 @@ MIXED_ONLY_SMOKE_CASES = (
         ),
         kv_cache_compression=True,
     ),
+    PagedAttentionTestCase(
+        subsequences=(
+            ss(1, 34),
+            ss(25),
+            ss(10, 34),
+        ),
+        block_size=256,
+    ),
 )
 
 
