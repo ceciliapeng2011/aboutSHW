@@ -39,14 +39,6 @@
 
 #define KV_SCALE_ZP_SIZE 0
 
-template <int NBYTES>
-CM_INLINE void tq_load_packed(vector_ref<uchar, NBYTES> out, const uint8_t* in [[type("svmptr_t")]], uint offset_bytes) {
-	#pragma unroll
-	for (int i = 0; i < NBYTES / 16; i++) {
-		out.select<16, 1>(16 * i).format<int>() = cm_ptr_load<int, 4>((int*)in, offset_bytes + i * 16);
-	}
-}
-
 extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	half* query [[type("svmptr_t")]],
 	uint8_t* key [[type("svmptr_t")]],
@@ -57,6 +49,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	int* subsequence_begins [[type("svmptr_t")]],
 	float* output [[type("svmptr_t")]],
 	float* lse [[type("svmptr_t")]],
+	const half* tq_q_t [[type("svmptr_t")]],
 	const half* tq_centroids [[type("svmptr_t")]],
 	int q_len// 1
 	) {
@@ -68,6 +61,9 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	const uint kv_partition_idx = cm_group_id(2);
 
 	const uint kv_len = past_lens[seq_idx] + 1;
+	constexpr uint K_PACKED_BYTES = (HEAD_SIZE * TQ_BITS + 7) / 8;
+	constexpr uint K_TOKEN_BYTES = K_PACKED_BYTES + 2;
+
 	const uint start_block_idx = block_indices_begins[seq_idx] + kv_partition_idx * (KV_PARTITION_SIZE / KV_BLOCK_SIZE);
 
 	if (kv_partition_idx * KV_PARTITION_SIZE > kv_len) {
@@ -75,19 +71,34 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	}
 	const uint total_blocks_num = (kv_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	constexpr uint kv_pitch = HEAD_SIZE * sizeof(half);
-	constexpr uint K_PACKED_BYTES = (HEAD_SIZE * TQ_BITS + 7) / 8;
-	constexpr uint K_TOKEN_BYTES = K_PACKED_BYTES + 2;
+	// [TurboQuant LUT preload]
+	// Load centroid table once per thread: used by packed-index dequantization.
+	vector<float, (1 << TQ_BITS)> centroid_tbl;
+	{
+		vector<half, (1 << TQ_BITS)> centroid_h;
+		cm_svm_block_read<half, (1 << TQ_BITS)>((svmptr_t)tq_centroids, centroid_h);
+		centroid_tbl = centroid_h;
+	}
 
+	// [Load Q]
+	// Q layout: [seq, head, dim] chunk for current (kv_head, q_head_chunk).
 	const uint qo_offset = (seq_idx * HEADS_NUM * q_len + head_num_idx) * HEAD_SIZE;
 	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
 	cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
 
-	matrix<float, Q_head_chunk_size, HEAD_SIZE> Qrot = 0;
+	// [Compute rotated Q]
+	// Apply TurboQuant rotation in-kernel: Qrot = Q * Q_T.
+	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qrot = 0;
 	#pragma unroll
 	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
 		#pragma unroll
 		for (int d = 0; d < HEAD_SIZE; d++) {
-			Qrot[qi][d] = (float)Qmat[qi][d];
+			float acc = 0.0f;
+			#pragma unroll
+			for (int j = 0; j < HEAD_SIZE; j++) {
+				acc += (float)Qmat[qi][j] * (float)tq_q_t[j * HEAD_SIZE + d];
+			}
+			Qrot[qi][d] = (half)acc;
 		}
 	}
 
@@ -103,10 +114,14 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		block_num = total_blocks_num - start_block_idx;
 	}
 
+	// [Q * K^T accumulator]
+	// rS stores attention logits for current KV partition.
 	matrix<float, Q_head_chunk_size, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
 
 	#pragma unroll
 	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+		// [Load K metadata]
+		// K is TurboQuant packed: per-token packed 4-bit indices + fp16 norm.
 		uint blk_indices = block_indices[start_block_idx + block_idx];
 		uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
 		const half* k_norm_base = reinterpret_cast<const half*>(key + k_base_offset + KV_BLOCK_SIZE * K_PACKED_BYTES);
@@ -119,35 +134,53 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 
 		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
 			#pragma unroll
-			for (int n = 0; n < REG_N; n++) {
-				int token_in_block = kv_pos + n;
-				if (token_in_block >= kv_pos_end) {
-					continue;
-				}
-				const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES;
-				vector<uchar, K_PACKED_BYTES> packed_u8;
-				tq_load_packed<K_PACKED_BYTES>(packed_u8, key, token_packed_off);
-				float knorm = (float)k_norm_base[token_in_block];
+			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
+				// [Dequantize K tile]
+				// Rebuild fp16 Kt tile from packed indices via centroid lookup.
+				matrix<half, REG_K, REG_N> Kt = 0;
+				const int packed_base = ri * (REG_K / 2);
 
 				#pragma unroll
-				for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-					float score = 0.0f;
+				for (int n = 0; n < REG_N; n++) {
+					int token_in_block = kv_pos + n;
+					if (token_in_block >= kv_pos_end) {
+						continue;
+					}
+
+					const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES + packed_base;
+					vector<uchar, REG_K / 2> packed8 = 0;
+					cm_svm_block_read<uchar, REG_K / 2>((svmptr_t)(key + token_packed_off), packed8);
+					float knorm = (float)k_norm_base[token_in_block];
+
 					#pragma unroll
-					for (int b = 0; b < K_PACKED_BYTES; b++) {
-						uchar packed = packed_u8[b];
+					for (int p = 0; p < REG_K / 2; p++) {
+						uchar packed = packed8[p];
 						int idx0 = (int)(packed & 0x0f);
 						int idx1 = (int)(packed >> 4);
-						int d0 = b * 2;
-						int d1 = d0 + 1;
-						score += Qrot[qi][d0] * (float)tq_centroids[idx0];
-						score += Qrot[qi][d1] * (float)tq_centroids[idx1];
+						float k0 = centroid_tbl[idx0] * knorm;
+						float k1 = centroid_tbl[idx1] * knorm;
+						// [QJL correction]
+						// Apply per-token norm (scale) after centroid lookup.
+						Kt[p * 2][n] = (half)k0;
+						Kt[p * 2 + 1][n] = (half)k1;
 					}
-					rS[qi][ki * REG_N + n] += score * knorm;
 				}
+
+				// [Q * K^T]
+				// Use DPAS (XMX) on rotated Q and dequantized K tile.
+				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qrot.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
+				matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
+				rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+							rS_data.format<float>(),
+							Kt.format<int32_t>(),
+							Qmat_data.format<int32_t>());
+				rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki * REG_N) += rS_data;
 			}
 		}
 	}
 
+	// [Softmax]
+	// Convert logits rS -> probabilities Pmat; track partition-local lse/sum.
 	vector<float, Q_head_chunk_size> cur_sum = 0.0f;
 	vector<float, Q_head_chunk_size> cur_lse = 0.0f;
 	matrix<half, Q_head_chunk_size, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
@@ -181,10 +214,14 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		cur_sum[qi] = cm_sum<float>(Pmat[qi]);
 	}
 
+	// [P * V accumulator]
+	// Omat accumulates weighted value vectors for this partition.
 	matrix<float, Q_head_chunk_size, HEAD_SIZE/REG_N * REG_M * REG_N> Omat = 0;
 
 	#pragma unroll
 	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+		// [Load V]
+		// V remains fp16 cache (no TurboQuant in value path).
 		uint blk_indices = block_indices[start_block_idx + block_idx];
 		uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
 
@@ -221,6 +258,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 
 				matrix<half, Q_head_chunk_size, REG_K> Pmat_data = Pmat.select<Q_head_chunk_size,1,REG_K,1>(0, ki * REG_K);
 				auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, ri * REG_N);
+				// [P * V]
+				// Use DPAS for weighted value aggregation.
 				Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
 							Omat_data.format<float>(),
 							Vmat.format<half, REG_K/2, REG_N*2>().format<int32_t>(),
@@ -231,6 +270,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 
 	#pragma unroll
 	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+		// [Write output]
+		// Normalize by partition sum and write partial output/lse for reduce kernel.
 		matrix<float, REG_M, REG_N> cur_O_f32;
 		uint o_offset = seq_idx * kv_partition_num * HEADS_NUM * HEAD_SIZE + kv_partition_num * (head_num_idx + qi) * HEAD_SIZE + wg_thread_id * HEAD_SIZE;
 		auto Omat_slice = Omat[qi].format<float, HEAD_SIZE/REG_N * REG_M, REG_N>();

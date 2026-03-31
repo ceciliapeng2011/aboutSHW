@@ -31,10 +31,11 @@ Please refer to the following code and documents for details of algorithm and te
 ## Task: Integrate TurboQuant into Attention decoding path
 Now apply turboquant to decoding path -
 1. Create turboquant decoding base file: Add a new file pa_single_token_turboquant.cm with a new kernel name cm_sdpa_2nd_turboquant. Copy kernel boday of cm_sdpa_2nd from pa_single_token.cm to cm_sdpa_2nd_turboquant, but only keep the code branches of `KV_CACHE_COMPRESSION==False` and `USE_LSC_BLOCK_2D_DESC==True`.
-2. Apply turboquant into attention kernel in cm_sdpa_2nd_turboquant: When turboquant_enabled, CompressedKVCache_Update_CM is used for key. Keep value use fp16 cache for now. Refer to triton_attention.py and turboquant_fused.py to know how to apply turboquant to attention, and apply it into cm_sdpa_2nd_turboquant.
+2. Apply turboquant into attention kernel in cm_sdpa_2nd_turboquant - input "query" is fp16, and "query rotation" will be applied to it in kernel boday; Input "key" is turbo-quantized by CompressedKVCache_Update_CM; Input "value" uses fp16. Refer to triton_attention.py and turboquant_fused.py to know how to apply turboquant to attention, and apply it into cm_sdpa_2nd_turboquant.
 3. PaSingleTokenRunner choose this turbo kernel if it is enabled and XE_ARCH>=2, throw exception for XE_ARCH=1.
 4. Create pytest style unit tests for it to check accuracy.
 5. Create pytest style unit tests for it which implements similar benchmark to benchmark_fused_vs_standard in triton_attention.py. 
+6. Notes: "query rotation" should be part of kernel. "key" is turbo-quantized, "value" is fp16.
 
 Please refer to the following code and documents for details of algorithm and test frames -
 1. Refer to opencl/tests/pageatten/test_pa_decoding.py with KV_CACHE_COMPRESSION==False path only to understand decoding path.
@@ -42,4 +43,13 @@ Please refer to the following code and documents for details of algorithm and te
 3. Refer to triton_attention.py and turboquant_fused.py to know how to apply turboquant to attention.
 
 ## Task: Optimize TurboQuant decoding kernel
-1. Turboquant path should be faster than standard. Speedup should be larger than 1.0. If not, inspect the implementation with a specific kv_len to profile the performance and optimize the implementation untill turboquant speeds up. Refer to "GPU skills".
+1. Turboquant path should be faster than standard. Speedup should be larger than 1.0. If not, inspect the implementation with a specific kv_len to profile the performance and optimize the implementation untill turboquant speeds up. 
+2. "standard" uses "cm_dpas" to compute Q*Kt, which utilize XMX hardware, and is faster than mul+add XVE instructions.
+3. "cm_load<lsc::Transpose>" can load with transpose.
+4. Notes: "query rotation" should be part of kernel. "key" is turbo-quantized, "value" is fp16.
+
+Please refer to the following code and documents for details of optimizing -
+1. Refer to $HOME/toolbox/skills/frameworks.ai.openvino.llm.prc-skills/skills/intel-gpu-hw-info/SKILL.md for "GPU skills".
+2. Refer to Intel CM GPU progromming language document under $HOME/OCL/aboutSHW/.github/skills/CM_spec.
+3. Refer to opencl/tests/pageatten/cm_pa_xe2.hpp
+4. Check & compare/analyze asm code of CM kernels to understand further optmizing opportunities.

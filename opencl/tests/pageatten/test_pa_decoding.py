@@ -179,7 +179,7 @@ class PaSingleTokenRunner:
 
         self.k_partition_block_num = 2 if self.use_turboquant_kernel else 1
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
-        self.reduce_split_step = 16 if self.use_turboquant_kernel else 8
+        self.reduce_split_step = 8
 
         max_repeat_count = 8
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads
@@ -189,10 +189,10 @@ class PaSingleTokenRunner:
 
         if self.use_turboquant_kernel:
             tq = TurboQuantMSE_CM.create_instance(head_size=self.head_size, num_kv_heads=1, bits=self.turboquant_bits)
-            self._tq_q_t_host = tq.q_t.float().contiguous()
+            self._t_tq_q_t = cl.tensor(tq.q_t.numpy())
             self._t_tq_centroids = cl.tensor(tq.centroids.numpy())
         else:
-            self._tq_q_t_host = None
+            self._t_tq_q_t = None
             self._t_tq_centroids = None
 
     @staticmethod
@@ -347,6 +347,7 @@ class PaSingleTokenRunner:
                     t_subsequence_begins,
                     t_out,
                     t_lse,
+                    self._t_tq_q_t,
                     self._t_tq_centroids,
                     1,
                 )
@@ -412,9 +413,6 @@ def _build_single_subsequence_inputs(case: DecodingCase):
         tq = TurboQuantMSE_CM.create_instance(head_size=case.head_size, num_kv_heads=1, bits=case.turboquant_bits)
         tq_ref = tq.ref
 
-        # TurboQuant score path uses rotated query: q_rot = q @ Q_T.
-        q_bhls = torch.matmul(q_bhls.float(), tq.q_t.float()).to(torch.float16)
-
         # Build compressed key cache with the CM updater implementation.
         k_packed_bytes = (case.head_size * case.turboquant_bits + 7) // 8
         key_cache_logical = torch.zeros(
@@ -449,10 +447,33 @@ def _build_single_subsequence_inputs(case: DecodingCase):
         )
         k_cache = _k_cache_updated
 
-        token_major = k_blocks.transpose(1, 2).reshape(total_blk_num * case.block_size, case.num_kv_heads, case.head_size)
-        q = tq_ref.quantize(token_major.reshape(-1, case.head_size).float())
-        dq = tq_ref.dequantize(q).reshape(total_blk_num * case.block_size, case.num_kv_heads, case.head_size)
-        k_ref_blocks = dq.reshape(total_blk_num, case.block_size, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous().half()
+        # Build rotated-domain key reference directly from packed cache bytes.
+        k_packed_region = k_cache[:, :, : case.block_size * k_packed_bytes].reshape(
+            total_blk_num,
+            case.num_kv_heads,
+            case.block_size,
+            k_packed_bytes,
+        )
+        idx = torch.empty(
+            total_blk_num,
+            case.num_kv_heads,
+            case.block_size,
+            case.head_size,
+            dtype=torch.long,
+        )
+        idx[:, :, :, 0::2] = (k_packed_region & 0x0F).reshape(total_blk_num, case.num_kv_heads, case.block_size, case.head_size // 2).long()
+        idx[:, :, :, 1::2] = (k_packed_region >> 4).reshape(total_blk_num, case.num_kv_heads, case.block_size, case.head_size // 2).long()
+
+        k_norms = (
+            k_cache[:, :, case.block_size * k_packed_bytes : case.block_size * (k_packed_bytes + 2)]
+            .view(torch.float16)
+            .reshape(total_blk_num, case.num_kv_heads, case.block_size, 1)
+            .float()
+        )
+        k_ref_blocks = (tq_ref.centroids[idx] * k_norms).to(torch.float16)
+
+        # Reference attention is computed in rotated query/key domain.
+        q_rot_blhs = torch.matmul(q_blhs.float(), tq_ref.Q_T.float()).to(torch.float16)
 
         # Keep value in fp16 cache for now.
         v_cache = v_blocks
@@ -489,12 +510,16 @@ def _build_single_subsequence_inputs(case: DecodingCase):
         value_cache[block_indices.to(dtype=torch.long)] = v_cache
 
     # Reference in logical order.
+    q_ref_bhls = q_bhls
+    if case.turboquant_enabled:
+        q_ref_bhls = q_rot_blhs.transpose(1, 2).contiguous()
+
     k_ref_bhls = k_ref_blocks.transpose(1, 2).reshape(batch, new_kv_len, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
     v_ref_bhls = v_ref_blocks.transpose(1, 2).reshape(batch, new_kv_len, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
 
     attention_mask = torch.zeros([batch, 1, q_len, case.kv_len], dtype=torch.float16)
     expected = F.scaled_dot_product_attention(
-        q_bhls,
+        q_ref_bhls,
         k_ref_bhls[:, :, : case.kv_len, :],
         v_ref_bhls[:, :, : case.kv_len, :],
         attention_mask,
@@ -705,6 +730,7 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
                 t_subsequence_begins,
                 t_out,
                 t_lse,
+                runner._t_tq_q_t,
                 runner._t_tq_centroids,
                 1,
             )
@@ -740,6 +766,7 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
     new_kv_len = int(key_cache.shape[0] * case.block_size)
     if case.turboquant_enabled:
         k_packed_bytes = (case.head_size * case.turboquant_bits + 7) // 8
+        # TurboQuant decode kernel consumes packed key (+fp16 norm) and fp16 value.
         kvcache_size = new_kv_len * case.num_kv_heads * (k_packed_bytes + 2 + case.head_size * 2)
     elif case.kv_cache_compression:
         kvcache_size = new_kv_len * case.num_kv_heads * case.head_size * 1 * 2
