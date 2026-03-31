@@ -28,7 +28,7 @@ Please refer to the following code and documents for details of algorithm and te
 3. Refer to CompressedKVCache of $HOME/3rdparty/turboquant/turboquant_fused.py
 4. Refer to $HOME/toolbox/.github/skills/PA_spec.MD for OpenVINO PagedAttention inputs/outputs definitions.
 
-## Task: Integrate TurboQuant into Attention decoding path
+## DONE: Task: Integrate TurboQuant into Attention decoding path
 Now apply turboquant to decoding path -
 1. Create turboquant decoding base file: Add a new file pa_single_token_turboquant.cm with a new kernel name cm_sdpa_2nd_turboquant. Copy kernel boday of cm_sdpa_2nd from pa_single_token.cm to cm_sdpa_2nd_turboquant, but only keep the code branches of `KV_CACHE_COMPRESSION==False` and `USE_LSC_BLOCK_2D_DESC==True`.
 2. Apply turboquant into attention kernel in cm_sdpa_2nd_turboquant - input "query" is fp16, and "query rotation" will be applied to it in kernel boday; Input "key" is turbo-quantized by CompressedKVCache_Update_CM; Input "value" uses fp16. Refer to triton_attention.py and turboquant_fused.py to know how to apply turboquant to attention, and apply it into cm_sdpa_2nd_turboquant.
@@ -45,11 +45,19 @@ Please refer to the following code and documents for details of algorithm and te
 ## Task: Optimize TurboQuant decoding kernel
 1. Turboquant path should be faster than standard. Speedup should be larger than 1.0. If not, inspect the implementation with a specific kv_len to profile the performance and optimize the implementation untill turboquant speeds up. 
 2. "standard" uses "cm_dpas" to compute Q*Kt, which utilize XMX hardware, and is faster than mul+add XVE instructions.
-3. "cm_load<lsc::Transpose>" can load with transpose.
-4. Notes: "query rotation" should be part of kernel. "key" is turbo-quantized, "value" is fp16.
+3. Notes: "query rotation" should be part of kernel. "key" is turbo-quantized, "value" is fp16. Memory usage is the key target. Any optimization should never increase kvcache memory size.
 
 Please refer to the following code and documents for details of optimizing -
 1. Refer to $HOME/toolbox/skills/frameworks.ai.openvino.llm.prc-skills/skills/intel-gpu-hw-info/SKILL.md for "GPU skills".
 2. Refer to Intel CM GPU progromming language document under $HOME/OCL/aboutSHW/.github/skills/CM_spec.
 3. Refer to opencl/tests/pageatten/cm_pa_xe2.hpp
 4. Check & compare/analyze asm code of CM kernels to understand further optmizing opportunities.
+
+Suggestions:
+1. Like multi-token kernel, compute and load Q, K in order "S = K*Qt" instead of "Q*Kt"
+2. Like opencl/tests/x_attn/estimate.hpp, hide compute time within load time, or hide load time within compute time, use like prefetch, pingpong buffer, emit next load before compute, etc.
+3. Like u8 multi-token kernel, dequantize packed key block into fp16 blocked tiles in SLM within a WG.
+4. Use LSC cm_load instead of cm_svm_block_read for 2D block read to boost performance. There are 3 mode "normal", "transpose", "vnni". Data access out of boundary is automatically handled.
+5. Fused DPAS-friendly representation. Keep the logical TurboQuant algorithm, but choose a packed key layout and decode flow that the kernel can feed into `cm_dpas` with minimal per-token repacking, without increasing KV-cache size.
+
+Benchmark each trial against the previous TurboQuant decode path and inspect the generated ASM for load-pattern improvements. You can go ahead iteratively untill the target is satisfied. Track each try with performance data in an xml output file under the working path.
