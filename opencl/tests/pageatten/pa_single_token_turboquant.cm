@@ -16,7 +16,8 @@
 
 // Dedicated TurboQuant decoding kernel file.
 // This file is independent from pa_single_token.cm and keeps only code paths:
-//   KV_CACHE_COMPRESSION == 0
+//   KV_CACHE_COMPRESSION == 1
+//   KV_CACHE_COMPRESSION_BY_TOKEN == 1
 //   USE_LSC_BLOCK_2D_DESC == 1
 
 #if XE_ARCH < 2
@@ -25,6 +26,14 @@
 
 #if TQ_BITS != 4
 #error "cm_sdpa_2nd_turboquant currently supports TQ_BITS==4"
+#endif
+
+#if !KV_CACHE_COMPRESSION
+#error "cm_sdpa_2nd_turboquant requires KV_CACHE_COMPRESSION==1"
+#endif
+
+#if !KV_CACHE_COMPRESSION_BY_TOKEN
+#error "cm_sdpa_2nd_turboquant requires KV_CACHE_COMPRESSION_BY_TOKEN==1"
 #endif
 
 #define REG_N 16
@@ -37,12 +46,13 @@
 #define REG_M RepeatCount
 #define KV_PARTITION_STEP_NUM  (KV_PARTITION_SIZE / KV_STEP)
 
-#define KV_SCALE_ZP_SIZE 0
+#define KV_SCALE_ZP_SIZE 4
+#define KV_ELEMENT_TYPE uint8_t
 
 extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	half* query [[type("svmptr_t")]],
 	uint8_t* key [[type("svmptr_t")]],
-	half* value [[type("svmptr_t")]],
+	uint8_t* value [[type("svmptr_t")]],
 	int* past_lens [[type("svmptr_t")]],
 	int* block_indices [[type("svmptr_t")]],
 	int* block_indices_begins [[type("svmptr_t")]],
@@ -70,7 +80,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		return;
 	}
 	const uint total_blocks_num = (kv_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-	constexpr uint kv_pitch = HEAD_SIZE * sizeof(half);
+	constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
 	// [TurboQuant LUT preload]
 	// Load centroid table once per thread: used by packed-index dequantization.
 	vector<float, (1 << TQ_BITS)> centroid_tbl;
@@ -202,6 +212,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 
 		auto rSv = rS_slice.format<float>();
 		float row_max = rSv[0];
+		#pragma unroll
 		for (int r = 1; r < rSv.n_elems(); r++) {
 			row_max = cm_max<float>(row_max, rSv[r]);
 		}
@@ -216,16 +227,16 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 
 	// [P * V accumulator]
 	// Omat accumulates weighted value vectors for this partition.
+	constexpr uint VALUE_TILE_NUM = 1;
 	matrix<float, Q_head_chunk_size, HEAD_SIZE/REG_N * REG_M * REG_N> Omat = 0;
 
 	#pragma unroll
 	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
-		// [Load V]
-		// V remains fp16 cache (no TurboQuant in value path).
 		uint blk_indices = block_indices[start_block_idx + block_idx];
 		uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
+		uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
-		lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(value + v_base_offset, KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(half) - 1, kv_pitch - 1, 0, 0);
+		lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(value + v_base_offset, KV_BLOCK_SIZE - 1, HEAD_SIZE * sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
 
 		uint kv_pos_end = KV_BLOCK_SIZE;
 		if (block_idx == block_num - 1 && leftover_size > 0) {
@@ -233,17 +244,58 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 			if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
 		}
 
+		// [Load V scale/zp]
+		// Per-token dequant params for this V block.
+		vector<half, KV_BLOCK_SIZE> scale_vec;
+		vector<half, KV_BLOCK_SIZE> zp_vec;
+		cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset), scale_vec);
+		cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset + KV_BLOCK_SIZE * sizeof(half)), zp_vec);
+		if (kv_pos_end < KV_BLOCK_SIZE) {
+			#pragma unroll
+			for (int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
+				scale_vec[i] = 0.0;
+				zp_vec[i] = 0.0;
+			}
+		}
+
 		#pragma unroll
 		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K, ki++) {
+			vector<half, REG_K> temp_scale = scale_vec.select<REG_K, 1>(kv_pos);
+			vector<half, REG_K> temp_zp = zp_vec.select<REG_K, 1>(kv_pos);
+			matrix<uint8_t, REG_K, REG_N * VALUE_TILE_NUM> Vt_quant;
+
 			#pragma unroll
-			for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
-				matrix<half, REG_K, REG_N> Vmat = 0;
+			for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N * VALUE_TILE_NUM, ri += VALUE_TILE_NUM) {
+				// [Dequantize V tile]
+				// Load quantized V tile, apply per-token dequantization,
+				// and pack to VNNI layout for DPAS.
+				matrix<half, REG_K, REG_N * VALUE_TILE_NUM> VmatNormal;
+				matrix<half, REG_K, REG_N * VALUE_TILE_NUM> Vmat;
+
 				b2dV.set_block_x(k);
-				cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_y(kv_pos));
+				cm_load<lsc::Normal>(Vt_quant.format<uint8_t>(), b2dV.set_block_y(kv_pos));
+
+				VmatNormal = Vt_quant;
+				#pragma unroll
+				for (int r = 0; r < REG_K; r++) {
+					VmatNormal[r] = VmatNormal[r] - temp_zp[r];
+					VmatNormal[r] = cm_mul<half>(VmatNormal[r], temp_scale[r]);
+				}
+
+				if (kv_pos_end - kv_pos < KV_STEP) {
+					#pragma unroll
+					for (int r = kv_pos_end; r < KV_STEP; r++) {
+						VmatNormal[r] = 0;
+					}
+				}
+
+				auto Vref = Vmat.format<half, REG_K/2, 2 * REG_N * VALUE_TILE_NUM>();
+				Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 0) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(0, 0);
+				Vref.select<REG_K/2, 1, REG_N * VALUE_TILE_NUM, 2>(0, 1) = VmatNormal.select<REG_K/2, 2, REG_N * VALUE_TILE_NUM, 1>(1, 0);
 
 				#if CLEAN_UNUSED_KVCACHE
 				if (kv_pos_end - kv_pos < KV_STEP) {
-					auto VmatRef = Vmat.format<half, REG_K/2, REG_N*2>();
+					auto VmatRef = Vmat.format<half, REG_K/2, REG_N * 2 * VALUE_TILE_NUM>();
 					uint valid_rows = kv_pos_end - kv_pos;
 					uint valid_rows_vnni = (valid_rows + 1) / 2;
 					#pragma unroll
@@ -251,19 +303,22 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 						VmatRef.row(r) = 0.0f;
 					}
 					if (valid_rows % 2 == 1) {
-						VmatRef.row(valid_rows_vnni - 1).select<REG_N, 2>(1) = 0.0f;
+						VmatRef.row(valid_rows_vnni - 1).select<REG_N * VALUE_TILE_NUM, 2>(1) = 0.0f;
 					}
 				}
 				#endif
 
 				matrix<half, Q_head_chunk_size, REG_K> Pmat_data = Pmat.select<Q_head_chunk_size,1,REG_K,1>(0, ki * REG_K);
-				auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, ri * REG_N);
-				// [P * V]
-				// Use DPAS for weighted value aggregation.
-				Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+				#pragma unroll
+				for (int tile = 0; tile < VALUE_TILE_NUM; tile++) {
+					auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, (ri + tile) * REG_N);
+					// [P * V]
+					// DPAS accumulation of weighted values.
+					Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
 							Omat_data.format<float>(),
-							Vmat.format<half, REG_K/2, REG_N*2>().format<int32_t>(),
+							Vmat.format<half, REG_K/2, REG_N * 2 * VALUE_TILE_NUM>().select<REG_K/2, 1, REG_N * 2, 1>(0, REG_N * 2 * tile).format<int32_t>(),
 							Pmat_data.format<int32_t>());
+				}
 			}
 		}
 	}
