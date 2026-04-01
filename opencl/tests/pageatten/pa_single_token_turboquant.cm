@@ -107,104 +107,107 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		block_num = total_blocks_num - start_block_idx;
 	}
 
-	// [Q * K^T accumulator]
-	// rS stores attention logits for current KV partition.
-	matrix<float, Q_head_chunk_size, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
-
-	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
-		// [Load K metadata]
-		// K is TurboQuant packed: per-token packed 4-bit indices + fp16 norm.
-		uint blk_indices = block_indices[start_block_idx + block_idx];
-		uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
-		const half* k_norm_base = reinterpret_cast<const half*>(key + k_base_offset + KV_BLOCK_SIZE * K_PACKED_BYTES);
-
-		uint kv_pos_end = KV_BLOCK_SIZE;
-		if (block_idx == block_num - 1 && leftover_size > 0) {
-			kv_pos_end = leftover_size % KV_BLOCK_SIZE;
-			if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
-		}
-
-		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
-			#pragma unroll
-			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
-				// [Dequantize K tile]
-				// Rebuild fp16 Kt tile from packed indices via centroid lookup.
-				matrix<half, REG_K, REG_N> Kt = 0;
-				const int packed_base = ri * (REG_K / 2);
-
-				#pragma unroll
-				for (int n = 0; n < REG_N; n++) {
-					int token_in_block = kv_pos + n;
-					if (token_in_block >= kv_pos_end) {
-						continue;
-					}
-
-					const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES + packed_base;
-					vector<uchar, REG_K / 2> packed8 = 0;
-					cm_svm_block_read<uchar, REG_K / 2>((svmptr_t)(key + token_packed_off), packed8);
-					float knorm = (float)k_norm_base[token_in_block];
-
-					#pragma unroll
-					for (int p = 0; p < REG_K / 2; p++) {
-						uchar packed = packed8[p];
-						int idx0 = (int)(packed & 0x0f);
-						int idx1 = (int)(packed >> 4);
-						float k0 = centroid_tbl[idx0] * knorm;
-						float k1 = centroid_tbl[idx1] * knorm;
-						// [QJL correction]
-						// Apply per-token norm (scale) after centroid lookup.
-						Kt[p * 2][n] = (half)k0;
-						Kt[p * 2 + 1][n] = (half)k1;
-					}
-				}
-
-				// [Q * K^T]
-				// Use DPAS (XMX) on host pre-rotated Q and dequantized K tile.
-				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
-				matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
-				rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
-							rS_data.format<float>(),
-							Kt.format<int32_t>(),
-							Qmat_data.format<int32_t>());
-				rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki * REG_N) += rS_data;
-			}
-		}
-	}
-
-	// [Softmax]
-	// Convert logits rS -> probabilities Pmat; track partition-local lse/sum.
+	// [Q * K^T + Softmax]
+	// Keep rS scoped to this block so it can be released before V accumulation.
 	vector<float, Q_head_chunk_size> cur_sum = 0.0f;
 	vector<float, Q_head_chunk_size> cur_lse = 0.0f;
 	matrix<half, Q_head_chunk_size, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
+	{
+		// [Q * K^T accumulator]
+		// rS stores attention logits for current KV partition.
+		matrix<float, Q_head_chunk_size, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
 
-	#pragma unroll
-	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-		auto rS_slice = rS[qi].format<float, KV_PARTITION_STEP_NUM, REG_N>();
-		rS_slice = cm_mul<float>(rS_slice, (float)SCALE_FACTOR);
+		for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+			// [Load K metadata]
+			// K is TurboQuant packed: per-token packed 4-bit indices + fp16 norm.
+			uint blk_indices = block_indices[start_block_idx + block_idx];
+			uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
+			const half* k_norm_base = reinterpret_cast<const half*>(key + k_base_offset + KV_BLOCK_SIZE * K_PACKED_BYTES);
 
-		if (leftover_size > 0) {
-			auto Svec = rS_slice.format<float>();
-			for (int i = leftover_size; i < KV_PARTITION_STEP_NUM * REG_N; i++) {
-				Svec[i] = -3e38f;
+			uint kv_pos_end = KV_BLOCK_SIZE;
+			if (block_idx == block_num - 1 && leftover_size > 0) {
+				kv_pos_end = leftover_size % KV_BLOCK_SIZE;
+				if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
+			}
+
+			for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
+				#pragma unroll
+				for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
+					// [Dequantize K tile]
+					// Rebuild fp16 Kt tile from packed indices via centroid lookup.
+					matrix<half, REG_K, REG_N> Kt = 0;
+					const int packed_base = ri * (REG_K / 2);
+
+					#pragma unroll
+					for (int n = 0; n < REG_N; n++) {
+						int token_in_block = kv_pos + n;
+						if (token_in_block >= kv_pos_end) {
+							continue;
+						}
+
+						const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES + packed_base;
+						vector<uchar, REG_K / 2> packed8 = 0;
+						cm_svm_block_read<uchar, REG_K / 2>((svmptr_t)(key + token_packed_off), packed8);
+						float knorm = (float)k_norm_base[token_in_block];
+
+						#pragma unroll
+						for (int p = 0; p < REG_K / 2; p++) {
+							uchar packed = packed8[p];
+							int idx0 = (int)(packed & 0x0f);
+							int idx1 = (int)(packed >> 4);
+							float k0 = centroid_tbl[idx0] * knorm;
+							float k1 = centroid_tbl[idx1] * knorm;
+							// [QJL correction]
+							// Apply per-token norm (scale) after centroid lookup.
+							Kt[p * 2][n] = (half)k0;
+							Kt[p * 2 + 1][n] = (half)k1;
+						}
+					}
+
+					// [Q * K^T]
+					// Use DPAS (XMX) on host pre-rotated Q and dequantized K tile.
+					matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
+					matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
+					rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+								rS_data.format<float>(),
+								Kt.format<int32_t>(),
+								Qmat_data.format<int32_t>());
+					rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki * REG_N) += rS_data;
+				}
 			}
 		}
 
-		constexpr float log2e = 1.4426950408889634f;
-		constexpr float loge2 = 0.6931471805599453f;
-
-		auto rSv = rS_slice.format<float>();
-		float row_max = rSv[0];
+		// [Softmax]
+		// Convert logits rS -> probabilities Pmat; track partition-local lse/sum.
 		#pragma unroll
-		for (int r = 1; r < rSv.n_elems(); r++) {
-			row_max = cm_max<float>(row_max, rSv[r]);
+		for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+			auto rS_slice = rS[qi].format<float, KV_PARTITION_STEP_NUM, REG_N>();
+			rS_slice = cm_mul<float>(rS_slice, (float)SCALE_FACTOR);
+
+			if (leftover_size > 0) {
+				auto Svec = rS_slice.format<float>();
+				for (int i = leftover_size; i < KV_PARTITION_STEP_NUM * REG_N; i++) {
+					Svec[i] = -3e38f;
+				}
+			}
+
+			constexpr float log2e = 1.4426950408889634f;
+			constexpr float loge2 = 0.6931471805599453f;
+
+			auto rSv = rS_slice.format<float>();
+			float row_max = rSv[0];
+			#pragma unroll
+			for (int r = 1; r < rSv.n_elems(); r++) {
+				row_max = cm_max<float>(row_max, rSv[r]);
+			}
+
+			vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rSv - row_max) * log2e);
+			Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
+
+			cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
+			cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max;
+			cur_sum[qi] = cm_sum<float>(Pmat[qi]);
 		}
-
-		vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rSv - row_max) * log2e);
-		Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
-
-		cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
-		cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max;
-		cur_sum[qi] = cm_sum<float>(Pmat[qi]);
 	}
 
 	// [P * V accumulator]
