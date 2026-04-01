@@ -59,7 +59,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	int* subsequence_begins [[type("svmptr_t")]],
 	float* output [[type("svmptr_t")]],
 	float* lse [[type("svmptr_t")]],
-	const half* tq_q_t [[type("svmptr_t")]],
 	const half* tq_centroids [[type("svmptr_t")]],
 	int q_len// 1
 	) {
@@ -95,22 +94,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	const uint qo_offset = (seq_idx * HEADS_NUM * q_len + head_num_idx) * HEAD_SIZE;
 	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
 	cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
-
-	// [Compute rotated Q]
-	// Apply TurboQuant rotation in-kernel: Qrot = Q * Q_T.
-	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qrot = 0;
-	#pragma unroll
-	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-		#pragma unroll
-		for (int d = 0; d < HEAD_SIZE; d++) {
-			float acc = 0.0f;
-			#pragma unroll
-			for (int j = 0; j < HEAD_SIZE; j++) {
-				acc += (float)Qmat[qi][j] * (float)tq_q_t[j * HEAD_SIZE + d];
-			}
-			Qrot[qi][d] = (half)acc;
-		}
-	}
 
 	constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE);
 	constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * K_TOKEN_BYTES;
@@ -176,8 +159,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 				}
 
 				// [Q * K^T]
-				// Use DPAS (XMX) on rotated Q and dequantized K tile.
-				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qrot.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
+				// Use DPAS (XMX) on host pre-rotated Q and dequantized K tile.
+				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
 				matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
 				rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
 							rS_data.format<float>(),

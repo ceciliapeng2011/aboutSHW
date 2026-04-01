@@ -155,6 +155,8 @@ class PaSingleTokenRunner:
         kv_cache_quant_mode: str,
         turboquant_enabled: bool,
         turboquant_bits: int,
+        k_partition_block_num: int | None = None,
+        reduce_split_step: int = 8,
     ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -186,9 +188,16 @@ class PaSingleTokenRunner:
         else:
             self.sdpa_2nd_kernel_name = "cm_sdpa_2nd"
 
-        self.k_partition_block_num = 2 if self.use_turboquant_kernel else 1
+        default_k_partition_block_num = 2 if self.use_turboquant_kernel else 1
+        self.k_partition_block_num = int(default_k_partition_block_num if k_partition_block_num is None else k_partition_block_num)
+        if self.k_partition_block_num <= 0:
+            raise ValueError("k_partition_block_num must be > 0")
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
-        self.reduce_split_step = 8
+        self.reduce_split_step = int(reduce_split_step)
+        if self.reduce_split_step <= 0:
+            raise ValueError("reduce_split_step must be > 0")
+        if self.head_size % self.reduce_split_step != 0:
+            raise ValueError("reduce_split_step must divide head_size")
 
         max_repeat_count = 8
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads
@@ -198,11 +207,19 @@ class PaSingleTokenRunner:
 
         if self.use_turboquant_kernel:
             tq = TurboQuantMSE_CM.create_instance(head_size=self.head_size, num_kv_heads=1, bits=self.turboquant_bits)
-            self._t_tq_q_t = cl.tensor(tq.q_t.numpy())
+            self._t_tq_q_t_host = torch.from_numpy(tq.q_t.numpy())
             self._t_tq_centroids = cl.tensor(tq.centroids.numpy())
         else:
-            self._t_tq_q_t = None
+            self._t_tq_q_t_host = None
             self._t_tq_centroids = None
+
+    def _prepare_query_for_kernel(self, query: torch.Tensor) -> torch.Tensor:
+        if not self.use_turboquant_kernel:
+            return query
+        if self._t_tq_q_t_host is None:
+            raise RuntimeError("TurboQuant Q rotation matrix is not initialized")
+        q_t = self._t_tq_q_t_host.to(dtype=torch.float32)
+        return torch.matmul(query.float(), q_t).to(dtype=query.dtype)
 
     @staticmethod
     @functools.cache
@@ -215,6 +232,8 @@ class PaSingleTokenRunner:
         kv_cache_quant_mode: str,
         turboquant_enabled: bool,
         turboquant_bits: int,
+        k_partition_block_num: int | None = None,
+        reduce_split_step: int = 8,
     ):
         return PaSingleTokenRunner(
             num_heads,
@@ -225,6 +244,8 @@ class PaSingleTokenRunner:
             kv_cache_quant_mode,
             turboquant_enabled,
             turboquant_bits,
+            k_partition_block_num,
+            reduce_split_step,
         )
 
     @staticmethod
@@ -331,6 +352,7 @@ class PaSingleTokenRunner:
             raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
 
         kernels = self._create_kernels()
+        query_kernel = self._prepare_query_for_kernel(query)
 
         batch_size = int(query.shape[0])
         max_context_len = int(past_lens.max().item()) + 1
@@ -342,7 +364,7 @@ class PaSingleTokenRunner:
         lws_2 = [1, 1, 1]
 
         for _ in range(n_repeats):
-            t_q = cl.tensor(query.detach().numpy())
+            t_q = cl.tensor(query_kernel.detach().numpy())
             t_k = cl.tensor(key_cache.contiguous().detach().numpy())
             t_v = cl.tensor(value_cache.contiguous().detach().numpy())
             t_past_lens = cl.tensor(past_lens.detach().numpy())
@@ -367,7 +389,6 @@ class PaSingleTokenRunner:
                     t_subsequence_begins,
                     t_out,
                     t_lse,
-                    self._t_tq_q_t,
                     self._t_tq_centroids,
                     1,
                 )
@@ -719,7 +740,13 @@ def test_pa_turboquant_xe1_raises(monkeypatch: pytest.MonkeyPatch):
     PaSingleTokenRunner.create_instance.cache_clear()
 
 
-def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: int = 5) -> dict[str, float]:
+def _run_bandwidth_measurement(
+    case: DecodingCase,
+    loop_cnt: int = 100,
+    warmup: int = 5,
+    k_partition_block_num: int | None = None,
+    reduce_split_step: int = 8,
+) -> dict[str, float]:
     data = _build_single_subsequence_inputs(case)
     runner = PaSingleTokenRunner.create_instance(
         case.num_heads,
@@ -730,10 +757,12 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
         case.kv_cache_quant_mode,
         case.turboquant_enabled,
         case.turboquant_bits,
+        k_partition_block_num,
+        reduce_split_step,
     )
     kernels = runner._create_kernels()
 
-    query = data["query"]
+    query = runner._prepare_query_for_kernel(data["query"])
     key_cache = data["key_cache"]
     value_cache = data["value_cache"]
     past_lens = data["past_lens"]
@@ -792,7 +821,6 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
                 t_subsequence_begins,
                 t_out,
                 t_lse,
-                runner._t_tq_q_t,
                 runner._t_tq_centroids,
                 1,
             )
@@ -967,7 +995,66 @@ def _benchmark_decoding_standard_vs_turboquant(
     return rows
 
 
-@pytest.mark.parametrize("bench_kv_len", [2048, 4096, 8192, 16384, 24576, 32768])
+def _benchmark_turboquant_knob_sweep(
+    kv_len: int = 24576,
+    loop_cnt: int = 10,
+    warmup: int = 1,
+    turboquant_bits: int = 4,
+    k_partition_block_nums: tuple[int, ...] = (1, 2, 4),
+) -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    reduce_split_step = 8
+
+    case = DecodingCase(
+        num_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=256,
+        kv_len=kv_len,
+        kv_cache_compression=True,
+        kv_cache_quant_mode="by_token",
+        turboquant_enabled=True,
+        turboquant_bits=turboquant_bits,
+    )
+
+    if case.head_size % reduce_split_step != 0:
+        raise ValueError("reduce_split_step must divide head_size")
+
+    # Keep reduce_split_step constant and tune only first-kernel knob(s).
+    for k_partition_block_num in k_partition_block_nums:
+        try:
+            perf = _run_bandwidth_measurement(
+                case,
+                loop_cnt=loop_cnt,
+                warmup=warmup,
+                k_partition_block_num=k_partition_block_num,
+                reduce_split_step=reduce_split_step,
+            )
+        except Exception as e:
+            print(
+                f"[sweep] skip k_partition_block_num={k_partition_block_num}, "
+                f"fixed_reduce_split_step={reduce_split_step}: {str(e).splitlines()[0]}"
+            )
+            continue
+
+        total_ms = perf["cm_sdpa_2nd_ms"] + perf["cm_sdpa_2nd_reduce_ms"]
+        rows.append(
+            {
+                "kv_len": float(kv_len),
+                "k_partition_block_num": float(k_partition_block_num),
+                "total_ms": float(total_ms),
+                "cm_sdpa_2nd_ms": float(perf["cm_sdpa_2nd_ms"]),
+                "cm_sdpa_2nd_reduce_ms": float(perf["cm_sdpa_2nd_reduce_ms"]),
+                "cm_sdpa_2nd_bw_gbs": float(perf["cm_sdpa_2nd_bw_gbs"]),
+                "cm_sdpa_2nd_reduce_bw_gbs": float(perf["cm_sdpa_2nd_reduce_bw_gbs"]),
+            }
+        )
+
+    rows.sort(key=lambda x: x["total_ms"])
+    return rows
+
+
+@pytest.mark.parametrize("bench_kv_len", [24576])
 def test_pa_benchmark_turboquant_vs_standard_decoding(bench_kv_len: int):
     """Benchmark-style pytest similar to triton_attention.benchmark_fused_vs_standard."""
     if os.environ.get("RUN_PA_BENCH", "0") != "1":
@@ -999,8 +1086,37 @@ def test_pa_benchmark_turboquant_vs_standard_decoding(bench_kv_len: int):
     # assert rows[0]["speedup"] > 1.0
 
 
+@pytest.mark.parametrize("bench_kv_len", [24576])
+def test_pa_sweep_turboquant_knobs(bench_kv_len: int):
+    if os.environ.get("RUN_PA_SWEEP", "0") != "1":
+        pytest.skip("Set RUN_PA_SWEEP=1 to enable TurboQuant knob sweep")
+
+    rows = _benchmark_turboquant_knob_sweep(
+        kv_len=bench_kv_len,
+        loop_cnt=10,
+        warmup=1,
+        turboquant_bits=4,
+    )
+
+    print("[benchmark] TurboQuant knob sweep")
+    for row in rows:
+        print(
+            f"  kv_len={int(row['kv_len']):5d}  "
+            f"k_partition_block_num={int(row['k_partition_block_num'])}  "
+            f"total={row['total_ms']:.3f}ms  "
+            f"k/reduce={row['cm_sdpa_2nd_ms']:.3f}/{row['cm_sdpa_2nd_reduce_ms']:.3f}ms  "
+            f"bw={row['cm_sdpa_2nd_bw_gbs']:.3f}/{row['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s"
+        )
+
+    assert len(rows) > 0
+    for row in rows:
+        assert row["total_ms"] > 0.0
+        assert np.isfinite(row["total_ms"])
+
+
 # Usages:
 # - python -m pytest test_pa_decoding.py --collect-only -q
 # - python -m pytest test_pa_decoding.py -vv
 # - RUN_PA_PERF=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_perf_bandwidth_generate_single_subsequence_default_params' -vv
 # - RUN_PA_BENCH=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_benchmark_turboquant_vs_standard_decoding' -vv
+# - RUN_PA_SWEEP=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_sweep_turboquant_knobs' -vv
