@@ -137,30 +137,27 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 					// Rebuild fp16 Kt tile from packed indices via centroid lookup.
 					matrix<half, REG_K, REG_N> Kt = 0;
 					const int packed_base = ri * (REG_K / 2);
+					int valid_n = kv_pos_end - kv_pos;
+					if (valid_n > REG_N) {
+						valid_n = REG_N;
+					}
 
-					#pragma unroll
-					for (int n = 0; n < REG_N; n++) {
+					for (int n = 0; n < valid_n; n++) {
 						int token_in_block = kv_pos + n;
-						if (token_in_block >= kv_pos_end) {
-							continue;
-						}
 
 						const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES + packed_base;
 						vector<uchar, REG_K / 2> packed8 = 0;
 						cm_svm_block_read<uchar, REG_K / 2>((svmptr_t)(key + token_packed_off), packed8);
 						float knorm = (float)k_norm_base[token_in_block];
 
-						#pragma unroll
 						for (int p = 0; p < REG_K / 2; p++) {
 							uchar packed = packed8[p];
 							int idx0 = (int)(packed & 0x0f);
 							int idx1 = (int)(packed >> 4);
-							float k0 = centroid_tbl[idx0] * knorm;
-							float k1 = centroid_tbl[idx1] * knorm;
 							// [QJL correction]
 							// Apply per-token norm (scale) after centroid lookup.
-							Kt[p * 2][n] = (half)k0;
-							Kt[p * 2 + 1][n] = (half)k1;
+							Kt[p * 2][n] = (half)(centroid_tbl[idx0] * knorm);
+							Kt[p * 2 + 1][n] = (half)(centroid_tbl[idx1] * knorm);
 						}
 					}
 
