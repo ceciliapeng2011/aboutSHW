@@ -188,7 +188,7 @@ class PaSingleTokenRunner:
         else:
             self.sdpa_2nd_kernel_name = "cm_sdpa_2nd"
 
-        default_k_partition_block_num = 2 if self.use_turboquant_kernel else 1
+        default_k_partition_block_num = 1
         self.k_partition_block_num = int(default_k_partition_block_num if k_partition_block_num is None else k_partition_block_num)
         if self.k_partition_block_num <= 0:
             raise ValueError("k_partition_block_num must be > 0")
