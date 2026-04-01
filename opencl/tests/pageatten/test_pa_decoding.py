@@ -175,7 +175,18 @@ class PaSingleTokenRunner:
         if self.turboquant_enabled and self.kv_cache_compression:
             raise ValueError("TurboQuant decoding branch requires kv_cache_compression=False")
 
-        self.sdpa_2nd_kernel_name = "cm_sdpa_2nd_turboquant" if self.use_turboquant_kernel else "cm_sdpa_2nd"
+        self.use_quant_bytoken_kernel = bool(
+            (not self.use_turboquant_kernel)
+            and self.kv_cache_compression
+            and (self.kv_cache_quant_mode == "by_token")
+        )
+
+        if self.use_turboquant_kernel:
+            self.sdpa_2nd_kernel_name = "cm_sdpa_2nd_turboquant"
+        elif self.use_quant_bytoken_kernel:
+            self.sdpa_2nd_kernel_name = "cm_sdpa_2nd_quant_bytoken"
+        else:
+            self.sdpa_2nd_kernel_name = "cm_sdpa_2nd"
 
         self.k_partition_block_num = 2 if self.use_turboquant_kernel else 1
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
@@ -233,14 +244,23 @@ class PaSingleTokenRunner:
         kv_cache_compression_by_token: int,
         kv_cache_turboquant: int,
         use_turboquant_kernel: int,
+        use_quant_bytoken_kernel: int,
         tq_bits: int,
         xe_arch: int,
         q_head_chunks_per_kv_head: int,
         q_head_chunk_size: int,
         scale_factor: float,
     ):
-        cm_src_file = "pa_single_token_turboquant.cm" if use_turboquant_kernel else "pa_single_token.cm"
-        src = f'#include "{cm_src_file}"'
+        if use_turboquant_kernel:
+            cm_src_file = "pa_single_token_turboquant.cm"
+        elif use_quant_bytoken_kernel:
+            cm_src_file = "pa_generate_quant_bytoken.cm"
+        else:
+            cm_src_file = "pa_single_token.cm"
+        src = f'''
+                #include "{cm_src_file}"
+                #include "pa_single_token_finalization.cm"
+                '''
         cwd = os.path.dirname(os.path.realpath(__file__))
         return cl.kernels(
             src,
@@ -279,6 +299,7 @@ class PaSingleTokenRunner:
             kv_cache_by_token_jit,
             int(self.turboquant_enabled),
             int(self.use_turboquant_kernel),
+            int(self.use_quant_bytoken_kernel),
             int(self.turboquant_bits),
             self.xe_arch,
             int(self.q_head_chunks_per_kv_head),
