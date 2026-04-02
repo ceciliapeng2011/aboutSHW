@@ -1000,13 +1000,15 @@ def _benchmark_decoding_standard_vs_turboquant(
     turboquant_bits: int = 4,
 ) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
+    
+    block_size = 16
 
     for kv_len in kv_lens:
         std_case = DecodingCase(
             num_heads=32,
             num_kv_heads=8,
             head_size=128,
-            block_size=16,
+            block_size=block_size,
             kv_len=kv_len,
             kv_cache_compression=True,
             kv_cache_quant_mode="by_token",
@@ -1017,7 +1019,7 @@ def _benchmark_decoding_standard_vs_turboquant(
             num_heads=32,
             num_kv_heads=8,
             head_size=128,
-            block_size=256,
+            block_size=block_size,
             kv_len=kv_len,
             kv_cache_compression=True,
             kv_cache_quant_mode="by_token",
