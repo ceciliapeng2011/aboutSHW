@@ -140,6 +140,14 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 				valid_n = REG_N;
 			}
 
+			// [Load K norm]
+			// One fp16 norm per token scales dequantized centroid values.
+			vector<half, REG_N> knorm_vec = 0;
+			cm_svm_block_read<half, REG_N>((svmptr_t)(k_norm_base + kv_pos), knorm_vec);
+			for (int n = valid_n; n < REG_N; n++) {
+				knorm_vec[n] = 0.0f;
+			}
+
 			#pragma unroll
 			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
 				matrix<half, REG_K, REG_N> Kt = 0;
@@ -148,14 +156,6 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 				matrix<uint8_t, REG_N, REG_K / 2> Kpack = 0;
 				b2dK.set_block_x(packed_base);
 				cm_load<lsc::Normal>(Kpack.format<uint8_t>(), b2dK.set_block_y(kv_pos));
-
-				// [Load K norm]
-				// One fp16 norm per token scales dequantized centroid values.
-				vector<half, REG_N> knorm_vec = 0;
-				cm_svm_block_read<half, REG_N>((svmptr_t)(k_norm_base + kv_pos), knorm_vec);
-				for (int n = valid_n; n < REG_N; n++) {
-					knorm_vec[n] = 0.0f;
-				}
 
 				// [Dequantize K tile]
 				// Unpack 4-bit indices, lookup centroid LUT, then apply token norm.
