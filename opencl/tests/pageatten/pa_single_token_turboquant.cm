@@ -96,10 +96,13 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
 	cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
 
+	// [Block geometry]
+	// TurboQuant K uses packed 4-bit payload + fp16 token norm.
+	// V keeps by-token uint8 payload + fp16 scale/zp metadata.
 	constexpr uint per_v_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * (HEAD_SIZE + KV_SCALE_ZP_SIZE);
 	constexpr uint per_k_block_element_num = KV_BLOCK_SIZE * KV_HEADS_NUM * K_TOKEN_BYTES;
-	uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
 
+	uint block_num = KV_PARTITION_SIZE / KV_BLOCK_SIZE;
 	uint leftover_size = 0;
 	if (kv_partition_idx == kv_partition_num - 1) {
 		leftover_size = (kv_len - KV_PARTITION_SIZE * kv_partition_idx) % KV_PARTITION_SIZE;
@@ -108,24 +111,120 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		block_num = total_blocks_num - start_block_idx;
 	}
 
-	// [Online Softmax + P * V accumulation]
-	// Avoid full partition-level Pmat materialization by updating running
-	// (max, sum, weighted-output) state per KV chunk.
-	constexpr float log2e = 1.4426950408889634f;
-	constexpr float loge2 = 0.6931471805599453f;
-	// cur_max / cur_sum are online-softmax states for each query row.
-	// cur_lse is finalized after all chunks are processed.
-	vector<float, Q_head_chunk_size> cur_sum = 0.0f;
-	vector<float, Q_head_chunk_size> cur_max = -3e38f;
-	vector<float, Q_head_chunk_size> cur_lse = 0.0f;
-	// Omat stores the running numerator of softmax-weighted V accumulation.
-	matrix<float, Q_head_chunk_size, HEAD_SIZE/REG_N * REG_M * REG_N> Omat = 0;
+	// [Q * K^T accumulator]
+	// rS stores attention logits for current KV partition.
+	matrix<float, Q_head_chunk_size, REG_M * KV_PARTITION_STEP_NUM * REG_N> rS = 0;
 
-	for (uint block_idx = 0; block_idx < block_num; block_idx++) {
+	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
 		uint blk_indices = block_indices[start_block_idx + block_idx];
 		uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
 		const half* k_norm_base = reinterpret_cast<const half*>(key + k_base_offset + KV_BLOCK_SIZE * K_PACKED_BYTES);
 
+		lsc::block_2d_desc<uint8_t, 1, REG_N, REG_K/2> b2dK(
+			key + k_base_offset,
+			KV_BLOCK_SIZE - 1,
+			K_PACKED_BYTES * sizeof(uint8_t) - 1,
+			K_PACKED_BYTES * sizeof(uint8_t) - 1,
+			0,
+			0);
+
+		uint kv_pos_end = KV_BLOCK_SIZE;
+		if (block_idx == block_num - 1 && leftover_size > 0) {
+			kv_pos_end = leftover_size % KV_BLOCK_SIZE;
+			if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
+		}
+
+		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
+			int valid_n = kv_pos_end - kv_pos;
+			if (valid_n > REG_N) {
+				valid_n = REG_N;
+			}
+
+			#pragma unroll
+			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
+				matrix<half, REG_K, REG_N> Kt = 0;
+				const int packed_base = ri * (REG_K / 2);
+
+				matrix<uint8_t, REG_N, REG_K / 2> Kpack = 0;
+				b2dK.set_block_x(packed_base);
+				cm_load<lsc::Normal>(Kpack.format<uint8_t>(), b2dK.set_block_y(kv_pos));
+
+				// [Load K norm]
+				// One fp16 norm per token scales dequantized centroid values.
+				vector<half, REG_N> knorm_vec = 0;
+				cm_svm_block_read<half, REG_N>((svmptr_t)(k_norm_base + kv_pos), knorm_vec);
+				for (int n = valid_n; n < REG_N; n++) {
+					knorm_vec[n] = 0.0f;
+				}
+
+				// [Dequantize K tile]
+				// Unpack 4-bit indices, lookup centroid LUT, then apply token norm.
+				for (int n = 0; n < REG_N; n++) {
+					float knorm = (float)knorm_vec[n];
+					for (int p = 0; p < REG_K / 2; p++) {
+						uchar packed = Kpack[n][p];
+						int idx0 = (int)(packed & 0x0f);
+						int idx1 = (int)(packed >> 4);
+						Kt[p * 2][n] = (half)(centroid_tbl[idx0] * knorm);
+						Kt[p * 2 + 1][n] = (half)(centroid_tbl[idx1] * knorm);
+					}
+				}
+
+				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
+				matrix<float, Q_head_chunk_size, REG_N> rS_data = 0;
+				// [Q * K^T]
+				// DPAS accumulation over reconstructed K tiles.
+				rS_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
+							rS_data.format<float>(),
+							Kt.format<int32_t>(),
+							Qmat_data.format<int32_t>());
+				rS.select<Q_head_chunk_size, 1, REG_N, 1>(0, ki * REG_N) += rS_data;
+			}
+		}
+	}
+
+	// [Softmax]
+	// Convert logits rS -> probabilities Pmat; track partition-local lse/sum.
+	vector<float, Q_head_chunk_size> cur_sum = 0.0f;
+	vector<float, Q_head_chunk_size> cur_lse = 0.0f;
+	matrix<half, Q_head_chunk_size, KV_PARTITION_STEP_NUM * REG_M * REG_N> Pmat = 0;
+
+	#pragma unroll
+	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+		auto rS_slice = rS[qi].format<float, KV_PARTITION_STEP_NUM, REG_N>();
+		rS_slice = cm_mul<float>(rS_slice, (float)SCALE_FACTOR);
+
+		if (leftover_size > 0) {
+			auto Svec = rS_slice.format<float>();
+			for (int i = leftover_size; i < KV_PARTITION_STEP_NUM * REG_N; i++) {
+				Svec[i] = -3e38f;
+			}
+		}
+
+		constexpr float log2e = 1.4426950408889634f;
+		constexpr float loge2 = 0.6931471805599453f;
+
+		auto rSv = rS_slice.format<float>();
+		float row_max = rSv[0];
+		#pragma unroll
+		for (int r = 1; r < rSv.n_elems(); r++) {
+			row_max = cm_max<float>(row_max, rSv[r]);
+		}
+
+		vector<float, KV_PARTITION_STEP_NUM * REG_N> rS_exp_temp = cm_exp((rSv - row_max) * log2e);
+		Pmat[qi].format<half, KV_PARTITION_STEP_NUM * REG_M, REG_N>() = rS_exp_temp;
+
+		cur_lse[qi] = cm_sum<float>(rS_exp_temp.format<float>());
+		cur_lse[qi] = cm_log<float>(cur_lse[qi]) * loge2 + row_max;
+		cur_sum[qi] = cm_sum<float>(Pmat[qi]);
+	}
+
+	// [P * V accumulator]
+	// Omat accumulates weighted value vectors for this partition.
+	matrix<float, Q_head_chunk_size, HEAD_SIZE/REG_N * REG_M * REG_N> Omat = 0;
+
+	for (uint block_idx = 0, ki = 0; block_idx < block_num; block_idx++) {
+		uint blk_indices = block_indices[start_block_idx + block_idx];
 		uint v_base_offset = blk_indices * per_v_block_element_num + kv_head_num_idx * (per_v_block_element_num / KV_HEADS_NUM);
 		uint v_scale_zp_offset = v_base_offset + KV_BLOCK_SIZE * HEAD_SIZE;
 
@@ -138,6 +237,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		}
 
 		// [Load V scale/zp]
+		// Per-token dequant params for this V block.
 		vector<half, KV_BLOCK_SIZE> scale_vec;
 		vector<half, KV_BLOCK_SIZE> zp_vec;
 		cm_svm_block_read(reinterpret_cast<svmptr_t>(value + v_scale_zp_offset), scale_vec);
@@ -149,83 +249,16 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 			}
 		}
 
-		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K) {
-			int valid_n = kv_pos_end - kv_pos;
-			if (valid_n > REG_N) {
-				valid_n = REG_N;
-			}
-
-			// [Q * K^T for this KV chunk]
-			// Compute logits only for current KV_STEP chunk.
-			matrix<float, Q_head_chunk_size, REG_N> S_chunk = 0;
-			#pragma unroll
-			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
-				matrix<half, REG_K, REG_N> Kt = 0;
-				const int packed_base = ri * (REG_K / 2);
-
-				for (int n = 0; n < valid_n; n++) {
-					int token_in_block = kv_pos + n;
-					const uint token_packed_off = k_base_offset + token_in_block * K_PACKED_BYTES + packed_base;
-					vector<uchar, REG_K / 2> packed8 = 0;
-					cm_svm_block_read<uchar, REG_K / 2>((svmptr_t)(key + token_packed_off), packed8);
-					float knorm = (float)k_norm_base[token_in_block];
-
-					for (int p = 0; p < REG_K / 2; p++) {
-						uchar packed = packed8[p];
-						int idx0 = (int)(packed & 0x0f);
-						int idx1 = (int)(packed >> 4);
-						Kt[p * 2][n] = (half)(centroid_tbl[idx0] * knorm);
-						Kt[p * 2 + 1][n] = (half)(centroid_tbl[idx1] * knorm);
-					}
-				}
-
-				matrix<half, Q_head_chunk_size, REG_K> Qmat_data = Qmat.select<Q_head_chunk_size,1,REG_K,1>(0, ri * REG_K);
-				matrix<float, Q_head_chunk_size, REG_N> S_data = 0;
-				S_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
-							S_data.format<float>(),
-							Kt.format<int32_t>(),
-							Qmat_data.format<int32_t>());
-				S_chunk += S_data;
-			}
-
-			// [Online softmax state update for this KV chunk]
-			// P_chunk holds exp(logits - new_max) for this chunk only.
-			// REG_K == REG_N on this kernel config, so use REG_K width for DPAS input.
-			matrix<half, Q_head_chunk_size, REG_K> P_chunk = 0;
-			#pragma unroll
-			for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-				vector<float, REG_N> svec = S_chunk[qi];
-				svec = cm_mul<float>(svec, (float)SCALE_FACTOR);
-				for (int i = valid_n; i < REG_N; i++) {
-					svec[i] = -3e38f;
-				}
-
-				float row_max = svec[0];
-				#pragma unroll
-				for (int i = 1; i < REG_N; i++) {
-					row_max = cm_max<float>(row_max, svec[i]);
-				}
-
-				float new_max = cm_max<float>(cur_max[qi], row_max);
-				float old_scale = cm_exp((cur_max[qi] - new_max) * log2e);
-				vector<float, REG_N> pvec = cm_exp((svec - new_max) * log2e);
-
-				auto Orow = Omat[qi];
-				Orow = cm_mul<float>(Orow, old_scale);
-
-				cur_sum[qi] = cm_mul<float>(cur_sum[qi], old_scale) + cm_sum<float>(pvec);
-				cur_max[qi] = new_max;
-				P_chunk[qi] = pvec;
-			}
-
-			// [P * V for this KV chunk]
-			// Accumulate chunk contribution directly into running Omat.
+		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += REG_K, ki++) {
 			vector<half, REG_K> temp_scale = scale_vec.select<REG_K, 1>(kv_pos);
 			vector<half, REG_K> temp_zp = zp_vec.select<REG_K, 1>(kv_pos);
 			matrix<uint8_t, REG_K, REG_N> Vt_quant;
 
 			#pragma unroll
 			for (int k = 0, ri = 0; k < HEAD_SIZE; k += REG_N, ri++) {
+				// [Dequantize V tile]
+				// Load quantized V tile, apply per-token dequantization,
+				// and pack to VNNI layout for DPAS.
 				matrix<half, REG_K, REG_N> VmatNormal;
 				matrix<half, REG_K, REG_N> Vmat;
 
@@ -263,19 +296,16 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 				}
 				#endif
 
+				matrix<half, Q_head_chunk_size, REG_K> Pmat_data = Pmat.select<Q_head_chunk_size,1,REG_K,1>(0, ki * REG_K);
 				auto Omat_data = Omat.select<Q_head_chunk_size,1,REG_N,1>(0, ri * REG_N);
+				// [P * V]
+				// DPAS accumulation of weighted values.
 				Omat_data = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, Q_head_chunk_size>(
 						Omat_data.format<float>(),
 						Vmat.format<half, REG_K/2, REG_N * 2>().format<int32_t>(),
-						P_chunk.format<int32_t>());
+						Pmat_data.format<int32_t>());
 			}
 		}
-	}
-
-	#pragma unroll
-	for (int qi = 0; qi < Q_head_chunk_size; qi++) {
-		// Finalize lse from online softmax states.
-		cur_lse[qi] = cm_log<float>(cur_sum[qi]) * loge2 + cur_max[qi];
 	}
 
 	#pragma unroll
