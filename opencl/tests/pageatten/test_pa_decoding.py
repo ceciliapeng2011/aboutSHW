@@ -991,7 +991,8 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params(
     assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
     assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
 
-
+# Compare decoding performance of standard compressed KV cache vs TurboQuant compressed KV cache with same bitwidth, 
+# to understand TurboQuant decode overhead and potential speedup over standard quantization.
 def _benchmark_decoding_standard_vs_turboquant(
     kv_lens: tuple[int, ...] = (2048,),
     loop_cnt: int = 20,
@@ -1005,7 +1006,7 @@ def _benchmark_decoding_standard_vs_turboquant(
             num_heads=32,
             num_kv_heads=8,
             head_size=128,
-            block_size=256,
+            block_size=16,
             kv_len=kv_len,
             kv_cache_compression=True,
             kv_cache_quant_mode="by_token",
@@ -1046,18 +1047,50 @@ def _benchmark_decoding_standard_vs_turboquant(
 
     return rows
 
+@pytest.mark.parametrize("bench_kv_len", [24576])
+def test_pa_benchmark_turboquant_vs_standard_decoding(bench_kv_len: int):
+    """Benchmark-style pytest similar to triton_attention.benchmark_fused_vs_standard."""
+    if os.environ.get("RUN_PA_BENCH", "0") != "1":
+        pytest.skip("Set RUN_PA_BENCH=1 to enable standard-vs-turboquant benchmark")
 
-def _benchmark_non_turboquant_knob_sweep(
+    rows = _benchmark_decoding_standard_vs_turboquant(
+        kv_lens=(bench_kv_len,),
+        loop_cnt=10,
+        warmup=1,
+        turboquant_bits=4,
+    )
+
+    print("[benchmark] decoding standard vs turboquant")
+    for row in rows:
+        print(
+            f"  kv_len={int(row['kv_len']):5d}  "
+            f"standard={row['standard_ms']:.3f}ms  "
+            f"turboquant={row['turboquant_ms']:.3f}ms  "
+            f"speedup={row['speedup']:.3f}x\n"
+            f"    std_bw(k/reduce)={row['standard_k_bw_gbs']:.3f}/{row['standard_reduce_bw_gbs']:.3f} GB/s  "
+            f"tq_bw(k/reduce)={row['turboquant_k_bw_gbs']:.3f}/{row['turboquant_reduce_bw_gbs']:.3f} GB/s"
+        )
+
+    assert len(rows) > 0
+    for row in rows:
+        assert row["standard_ms"] > 0.0
+        assert row["turboquant_ms"] > 0.0
+        assert np.isfinite(row["speedup"])
+    # assert rows[0]["speedup"] > 1.0
+
+# Sweep different kv_partition_size with fixed reduce_split_step to find good default config.
+def _benchmark_partition_size_sweep(
     kv_len: int = 24576,
     loop_cnt: int = 10,
     warmup: int = 1,
+    turboquant_enabled: bool = False,
     block_sizes: tuple[int, ...] = (16, 256),
     kv_partition_sizes: tuple[int, ...] = (16, 32, 64, 128, 256),
 ) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     reduce_split_step = 8
 
-    # Keep reduce_split_step constant and tune only first-kernel knob(s).
+    # Keep reduce_split_step constant and sweep kv_partition_size.
     for block_size in block_sizes:
         case = DecodingCase(
             num_heads=32,
@@ -1067,7 +1100,7 @@ def _benchmark_non_turboquant_knob_sweep(
             kv_len=kv_len,
             kv_cache_compression=True,
             kv_cache_quant_mode="by_token",
-            turboquant_enabled=False,
+            turboquant_enabled=turboquant_enabled,
             turboquant_bits=4,
         )
 
@@ -1107,51 +1140,41 @@ def _benchmark_non_turboquant_knob_sweep(
     rows.sort(key=lambda x: x["total_ms"])
     return rows
 
-
 @pytest.mark.parametrize("bench_kv_len", [24576])
-def test_pa_benchmark_turboquant_vs_standard_decoding(bench_kv_len: int):
-    """Benchmark-style pytest similar to triton_attention.benchmark_fused_vs_standard."""
-    if os.environ.get("RUN_PA_BENCH", "0") != "1":
-        pytest.skip("Set RUN_PA_BENCH=1 to enable standard-vs-turboquant benchmark")
-
-    rows = _benchmark_decoding_standard_vs_turboquant(
-        kv_lens=(bench_kv_len,),
-        loop_cnt=10,
-        warmup=1,
-        turboquant_bits=4,
-    )
-
-    print("[benchmark] decoding standard vs turboquant")
-    for row in rows:
-        print(
-            f"  kv_len={int(row['kv_len']):5d}  "
-            f"standard={row['standard_ms']:.3f}ms  "
-            f"turboquant={row['turboquant_ms']:.3f}ms  "
-            f"speedup={row['speedup']:.3f}x\n"
-            f"    std_bw(k/reduce)={row['standard_k_bw_gbs']:.3f}/{row['standard_reduce_bw_gbs']:.3f} GB/s  "
-            f"tq_bw(k/reduce)={row['turboquant_k_bw_gbs']:.3f}/{row['turboquant_reduce_bw_gbs']:.3f} GB/s"
-        )
-
-    assert len(rows) > 0
-    for row in rows:
-        assert row["standard_ms"] > 0.0
-        assert row["turboquant_ms"] > 0.0
-        assert np.isfinite(row["speedup"])
-    # assert rows[0]["speedup"] > 1.0
-
-
-@pytest.mark.parametrize("bench_kv_len", [24576])
-def test_pa_sweep_non_turboquant_knobs(bench_kv_len: int):
+@pytest.mark.parametrize(
+    ("turboquant_enabled", "sweep_name"),
+    [
+        (False, "non-TurboQuant partition-size sweep"),
+        (True, "TurboQuant partition-size sweep"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("block_sizes", "block_sizes_name"),
+    [
+        ((16,), "block_size=16"),
+        ((256,), "block_size=256"),
+        ((16, 256), "block_size=16,256"),
+    ],
+)
+def test_pa_sweep_partition_size(
+    bench_kv_len: int,
+    turboquant_enabled: bool,
+    sweep_name: str,
+    block_sizes: tuple[int, ...],
+    block_sizes_name: str,
+):
     if os.environ.get("RUN_PA_SWEEP", "0") != "1":
-        pytest.skip("Set RUN_PA_SWEEP=1 to enable non-TurboQuant knob sweep")
+        pytest.skip("Set RUN_PA_SWEEP=1 to enable partition-size sweep")
 
-    rows = _benchmark_non_turboquant_knob_sweep(
+    rows = _benchmark_partition_size_sweep(
         kv_len=bench_kv_len,
         loop_cnt=10,
         warmup=1,
+        turboquant_enabled=turboquant_enabled,
+        block_sizes=block_sizes,
     )
 
-    print("[benchmark] non-TurboQuant knob sweep")
+    print(f"[benchmark] {sweep_name} ({block_sizes_name})")
     for row in rows:
         print(
             f"  kv_len={int(row['kv_len']):5d}  "
@@ -1173,4 +1196,19 @@ def test_pa_sweep_non_turboquant_knobs(bench_kv_len: int):
 # - python -m pytest test_pa_decoding.py -vv
 # - RUN_PA_PERF=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_perf_bandwidth_generate_single_subsequence_default_params' -vv
 # - RUN_PA_BENCH=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_benchmark_turboquant_vs_standard_decoding' -vv
-# - RUN_PA_SWEEP=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_sweep_non_turboquant_knobs' -vv
+#
+# - RUN_PA_SWEEP=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_sweep_partition_size' -vv
+# [benchmark] non-TurboQuant partition-size sweep (block_size=16,256)
+#   kv_len=24576  block_size=16  kv_partition_size=256  total=0.576ms  k/reduce=0.525/0.051ms  bw=95.866/31.035 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=128  total=0.626ms  k/reduce=0.536/0.090ms  bw=93.917/35.045 GB/s
+#   kv_len=24576  block_size=256  kv_partition_size=256  total=0.659ms  k/reduce=0.583/0.076ms  bw=86.333/20.900 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=64  total=0.740ms  k/reduce=0.566/0.175ms  bw=89.001/36.314 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=32  total=0.953ms  k/reduce=0.611/0.342ms  bw=82.370/37.064 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=16  total=1.381ms  k/reduce=0.718/0.663ms  bw=70.054/38.265 GB/s
+# [benchmark] TurboQuant partition-size sweep (block_size=16,256)
+#   kv_len=24576  block_size=16  kv_partition_size=64  total=2.478ms  k/reduce=2.326/0.152ms  bw=16.737/41.635 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=256  total=2.533ms  k/reduce=2.489/0.044ms  bw=15.638/36.146 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=128  total=2.536ms  k/reduce=2.457/0.079ms  bw=15.845/39.929 GB/s
+#   kv_len=24576  block_size=256  kv_partition_size=256  total=2.575ms  k/reduce=2.530/0.045ms  bw=15.386/35.100 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=32  total=2.862ms  k/reduce=2.534/0.328ms  bw=15.364/38.675 GB/s
+#   kv_len=24576  block_size=16  kv_partition_size=16  total=3.208ms  k/reduce=2.542/0.666ms  bw=15.313/38.063 GB/s
