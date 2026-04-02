@@ -17,6 +17,11 @@ torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
 
 
+# Keep this aligned with -Qxcm_register_file_size in kernel build options.
+# It is also used by OpenVINO-style q_chunking budget estimation.
+PA_CM_REGISTER_FILE_SIZE = 256
+
+
 def get_cm_grf_width() -> int:
     cm_kernels = cl.kernels(
         r'''
@@ -28,6 +33,47 @@ def get_cm_grf_width() -> int:
     t_info = cl.tensor([2], np.dtype(np.int32))
     cm_kernels.enqueue("cm_get_grf_width", [1], [1], t_info)
     return int(t_info.numpy()[0])
+
+
+def get_single_token_q_chunking_openvino_style(
+    num_heads: int,
+    num_kv_heads: int,
+    kv_partition_size: int,
+    xe_arch: int,
+    kv_step: int,
+) -> tuple[int, int]:
+    # Match OpenVINO get_single_token_q_chunking() logic.
+    max_repeat_count = 8
+    reg_m = 1  # RepeatCount
+    bytes_per_float = 4
+    reg_n = 8 if xe_arch == 1 else 16
+
+    q_heads_per_kv_head = num_heads // num_kv_heads
+    kv_partition_step_num = kv_partition_size // kv_step
+    rs_cols = reg_m * kv_partition_step_num * reg_n
+
+    grf_bytes = 32 if xe_arch == 1 else 64
+    budget_bytes = PA_CM_REGISTER_FILE_SIZE * grf_bytes - 1
+    max_q_by_matrix = budget_bytes // (bytes_per_float * rs_cols)
+    if max_q_by_matrix < 1:
+        max_q_by_matrix = 1
+
+    target_chunk = min(max_repeat_count, max_q_by_matrix)
+    q_head_chunk_size = min(q_heads_per_kv_head, target_chunk)
+    while q_head_chunk_size > 1 and (q_heads_per_kv_head % q_head_chunk_size) != 0:
+        q_head_chunk_size -= 1
+    q_head_chunks_per_kv_head = q_heads_per_kv_head // q_head_chunk_size
+    return int(q_head_chunks_per_kv_head), int(q_head_chunk_size)
+
+
+def get_default_kv_partition_size(block_size: int) -> int:
+    # Match OpenVINO get_partition_size behavior used by single-token path:
+    # if block size is legacy (<256), use 128; otherwise use 256.
+
+    # It is an intriguing heuristic that seems to balance register usage and parallelism for typical block sizes, 
+    # but the optimal choice may vary based on the specific workload and hardware characteristics.
+    # Sweeping this parameter could be an interesting avenue for performance tuning.
+    return 256 if block_size >= 256 else 128
 
 
 def _check_close(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-2, rtol: float = 1e-3) -> None:
@@ -155,7 +201,7 @@ class PaSingleTokenRunner:
         kv_cache_quant_mode: str,
         turboquant_enabled: bool,
         turboquant_bits: int,
-        k_partition_block_num: int | None = None,
+        kv_partition_size: int | None = None,
         reduce_split_step: int = 8,
     ):
         self.num_heads = num_heads
@@ -188,21 +234,27 @@ class PaSingleTokenRunner:
         else:
             self.sdpa_2nd_kernel_name = "cm_sdpa_2nd"
 
-        default_k_partition_block_num = 1
-        self.k_partition_block_num = int(default_k_partition_block_num if k_partition_block_num is None else k_partition_block_num)
-        if self.k_partition_block_num <= 0:
-            raise ValueError("k_partition_block_num must be > 0")
-        self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
+        self.kv_partition_size = int(
+            get_default_kv_partition_size(self.block_size) if kv_partition_size is None else kv_partition_size
+        )
+        if self.kv_partition_size <= 0:
+            raise ValueError("kv_partition_size must be > 0")
+        if self.kv_partition_size % self.block_size != 0:
+            raise ValueError("kv_partition_size must be divisible by block_size")
+
         self.reduce_split_step = int(reduce_split_step)
         if self.reduce_split_step <= 0:
             raise ValueError("reduce_split_step must be > 0")
         if self.head_size % self.reduce_split_step != 0:
             raise ValueError("reduce_split_step must divide head_size")
 
-        max_repeat_count = 8
-        q_heads_per_kv_head = self.num_heads // self.num_kv_heads
-        self.q_head_chunks_per_kv_head = (q_heads_per_kv_head + (max_repeat_count - 1)) // max_repeat_count
-        self.q_head_chunk_size = self.num_heads // (self.num_kv_heads * self.q_head_chunks_per_kv_head)
+        self.q_head_chunks_per_kv_head, self.q_head_chunk_size = get_single_token_q_chunking_openvino_style(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            kv_partition_size=self.kv_partition_size,
+            xe_arch=self.xe_arch,
+            kv_step=self.kv_step,
+        )
         self.scale_factor = 1.0 / (self.head_size**0.5)
 
         if self.use_turboquant_kernel:
@@ -232,7 +284,7 @@ class PaSingleTokenRunner:
         kv_cache_quant_mode: str,
         turboquant_enabled: bool,
         turboquant_bits: int,
-        k_partition_block_num: int | None = None,
+        kv_partition_size: int | None = None,
         reduce_split_step: int = 8,
     ):
         return PaSingleTokenRunner(
@@ -244,7 +296,7 @@ class PaSingleTokenRunner:
             kv_cache_quant_mode,
             turboquant_enabled,
             turboquant_bits,
-            k_partition_block_num,
+            kv_partition_size,
             reduce_split_step,
         )
 
@@ -285,7 +337,7 @@ class PaSingleTokenRunner:
             src,
             f'''-cmc -Qxcm_jit_option=""
                         -mCM_printregusage -mdump_asm -g2
-                        -Qxcm_register_file_size=256 -I{cwd}
+                        -Qxcm_register_file_size={PA_CM_REGISTER_FILE_SIZE} -I{cwd}
                         -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
                         -DQ_STEP=32 -DKV_STEP={kv_step}
                         -DWG_SIZE=1 -DKV_BLOCK_SIZE={block_size}
@@ -744,7 +796,7 @@ def _run_bandwidth_measurement(
     case: DecodingCase,
     loop_cnt: int = 100,
     warmup: int = 5,
-    k_partition_block_num: int | None = None,
+    kv_partition_size: int | None = None,
     reduce_split_step: int = 8,
 ) -> dict[str, float]:
     data = _build_single_subsequence_inputs(case)
@@ -757,7 +809,7 @@ def _run_bandwidth_measurement(
         case.kv_cache_quant_mode,
         case.turboquant_enabled,
         case.turboquant_bits,
-        k_partition_block_num,
+        kv_partition_size,
         reduce_split_step,
     )
     kernels = runner._create_kernels()
@@ -995,60 +1047,62 @@ def _benchmark_decoding_standard_vs_turboquant(
     return rows
 
 
-def _benchmark_turboquant_knob_sweep(
+def _benchmark_non_turboquant_knob_sweep(
     kv_len: int = 24576,
     loop_cnt: int = 10,
     warmup: int = 1,
-    turboquant_bits: int = 4,
-    k_partition_block_nums: tuple[int, ...] = (1, 2, 4),
+    block_sizes: tuple[int, ...] = (16, 256),
+    kv_partition_sizes: tuple[int, ...] = (16, 32, 64, 128, 256),
 ) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     reduce_split_step = 8
 
-    case = DecodingCase(
-        num_heads=32,
-        num_kv_heads=8,
-        head_size=128,
-        block_size=256,
-        kv_len=kv_len,
-        kv_cache_compression=True,
-        kv_cache_quant_mode="by_token",
-        turboquant_enabled=True,
-        turboquant_bits=turboquant_bits,
-    )
-
-    if case.head_size % reduce_split_step != 0:
-        raise ValueError("reduce_split_step must divide head_size")
-
     # Keep reduce_split_step constant and tune only first-kernel knob(s).
-    for k_partition_block_num in k_partition_block_nums:
-        try:
-            perf = _run_bandwidth_measurement(
-                case,
-                loop_cnt=loop_cnt,
-                warmup=warmup,
-                k_partition_block_num=k_partition_block_num,
-                reduce_split_step=reduce_split_step,
-            )
-        except Exception as e:
-            print(
-                f"[sweep] skip k_partition_block_num={k_partition_block_num}, "
-                f"fixed_reduce_split_step={reduce_split_step}: {str(e).splitlines()[0]}"
-            )
-            continue
-
-        total_ms = perf["cm_sdpa_2nd_ms"] + perf["cm_sdpa_2nd_reduce_ms"]
-        rows.append(
-            {
-                "kv_len": float(kv_len),
-                "k_partition_block_num": float(k_partition_block_num),
-                "total_ms": float(total_ms),
-                "cm_sdpa_2nd_ms": float(perf["cm_sdpa_2nd_ms"]),
-                "cm_sdpa_2nd_reduce_ms": float(perf["cm_sdpa_2nd_reduce_ms"]),
-                "cm_sdpa_2nd_bw_gbs": float(perf["cm_sdpa_2nd_bw_gbs"]),
-                "cm_sdpa_2nd_reduce_bw_gbs": float(perf["cm_sdpa_2nd_reduce_bw_gbs"]),
-            }
+    for block_size in block_sizes:
+        case = DecodingCase(
+            num_heads=32,
+            num_kv_heads=8,
+            head_size=128,
+            block_size=block_size,
+            kv_len=kv_len,
+            kv_cache_compression=True,
+            kv_cache_quant_mode="by_token",
+            turboquant_enabled=False,
+            turboquant_bits=4,
         )
+
+        if case.head_size % reduce_split_step != 0:
+            raise ValueError("reduce_split_step must divide head_size")
+
+        for kv_partition_size in kv_partition_sizes:
+            try:
+                perf = _run_bandwidth_measurement(
+                    case,
+                    loop_cnt=loop_cnt,
+                    warmup=warmup,
+                    kv_partition_size=kv_partition_size,
+                    reduce_split_step=reduce_split_step,
+                )
+            except Exception as e:
+                print(
+                    f"[sweep] skip block_size={block_size}, kv_partition_size={kv_partition_size}, "
+                    f"fixed_reduce_split_step={reduce_split_step}: {str(e).splitlines()[0]}"
+                )
+                continue
+
+            total_ms = perf["cm_sdpa_2nd_ms"] + perf["cm_sdpa_2nd_reduce_ms"]
+            rows.append(
+                {
+                    "kv_len": float(kv_len),
+                    "block_size": float(block_size),
+                    "kv_partition_size": float(kv_partition_size),
+                    "total_ms": float(total_ms),
+                    "cm_sdpa_2nd_ms": float(perf["cm_sdpa_2nd_ms"]),
+                    "cm_sdpa_2nd_reduce_ms": float(perf["cm_sdpa_2nd_reduce_ms"]),
+                    "cm_sdpa_2nd_bw_gbs": float(perf["cm_sdpa_2nd_bw_gbs"]),
+                    "cm_sdpa_2nd_reduce_bw_gbs": float(perf["cm_sdpa_2nd_reduce_bw_gbs"]),
+                }
+            )
 
     rows.sort(key=lambda x: x["total_ms"])
     return rows
@@ -1087,22 +1141,22 @@ def test_pa_benchmark_turboquant_vs_standard_decoding(bench_kv_len: int):
 
 
 @pytest.mark.parametrize("bench_kv_len", [24576])
-def test_pa_sweep_turboquant_knobs(bench_kv_len: int):
+def test_pa_sweep_non_turboquant_knobs(bench_kv_len: int):
     if os.environ.get("RUN_PA_SWEEP", "0") != "1":
-        pytest.skip("Set RUN_PA_SWEEP=1 to enable TurboQuant knob sweep")
+        pytest.skip("Set RUN_PA_SWEEP=1 to enable non-TurboQuant knob sweep")
 
-    rows = _benchmark_turboquant_knob_sweep(
+    rows = _benchmark_non_turboquant_knob_sweep(
         kv_len=bench_kv_len,
         loop_cnt=10,
         warmup=1,
-        turboquant_bits=4,
     )
 
-    print("[benchmark] TurboQuant knob sweep")
+    print("[benchmark] non-TurboQuant knob sweep")
     for row in rows:
         print(
             f"  kv_len={int(row['kv_len']):5d}  "
-            f"k_partition_block_num={int(row['k_partition_block_num'])}  "
+            f"block_size={int(row['block_size'])}  "
+            f"kv_partition_size={int(row['kv_partition_size'])}  "
             f"total={row['total_ms']:.3f}ms  "
             f"k/reduce={row['cm_sdpa_2nd_ms']:.3f}/{row['cm_sdpa_2nd_reduce_ms']:.3f}ms  "
             f"bw={row['cm_sdpa_2nd_bw_gbs']:.3f}/{row['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s"
@@ -1119,4 +1173,4 @@ def test_pa_sweep_turboquant_knobs(bench_kv_len: int):
 # - python -m pytest test_pa_decoding.py -vv
 # - RUN_PA_PERF=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_perf_bandwidth_generate_single_subsequence_default_params' -vv
 # - RUN_PA_BENCH=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_benchmark_turboquant_vs_standard_decoding' -vv
-# - RUN_PA_SWEEP=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_sweep_turboquant_knobs' -vv
+# - RUN_PA_SWEEP=1 python -m pytest -s test_pa_decoding.py -k 'test_pa_sweep_non_turboquant_knobs' -vv
