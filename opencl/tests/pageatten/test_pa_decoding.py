@@ -510,8 +510,6 @@ def _build_single_subsequence_inputs(case: DecodingCase):
             case.block_size * (k_packed_bytes + 2),
             dtype=torch.uint8,
         )
-        # updater also needs value cache argument; it is ignored for decode path here.
-        value_cache_dummy = torch.zeros_like(key_cache_logical)
 
         updater = CompressedKVCache_Update_CM(
             num_kv_heads=case.num_kv_heads,
@@ -519,6 +517,16 @@ def _build_single_subsequence_inputs(case: DecodingCase):
             v_head_size=case.head_size,
             block_size=case.block_size,
             bits=case.turboquant_bits,
+            value_cache_mode="by_token",
+        )
+
+        # updater also needs value cache argument; decode path ignores returned value cache,
+        # but the buffer shape still must match selected value-cache mode.
+        value_cache_dummy = torch.zeros(
+            total_blk_num,
+            case.num_kv_heads,
+            updater.value_cache_block_bytes_per_head,
+            dtype=torch.uint8,
         )
 
         key_tokens = k_bhls[0].transpose(0, 1).reshape(new_kv_len, case.num_kv_heads * case.head_size).contiguous()

@@ -248,7 +248,16 @@ class TurboQuantMSE_CM:
 # ----------------------------------------------------------------------------
 
 class CompressedKVCache_Update_CM:
-    def __init__(self, num_kv_heads: int, k_head_size: int, v_head_size: int, block_size: int, bits: int = 4, rotation_seed: int = 0):
+    def __init__(
+        self,
+        num_kv_heads: int,
+        k_head_size: int,
+        v_head_size: int,
+        block_size: int,
+        bits: int = 4,
+        rotation_seed: int = 0,
+        value_cache_mode=False,
+    ):
         assert k_head_size % 16 == 0 and v_head_size % 16 == 0
 
         self.num_kv_heads = num_kv_heads
@@ -261,6 +270,25 @@ class CompressedKVCache_Update_CM:
         self.v_packed_bytes = (v_head_size * bits + 7) // 8
         self.k_token_bytes = self.k_packed_bytes + 2
         self.v_token_bytes = self.v_packed_bytes + 2
+        if isinstance(value_cache_mode, str):
+            mode_l = value_cache_mode.lower()
+            if mode_l == "turboquant":
+                self.value_cache_mode = True
+            elif mode_l == "by_token":
+                self.value_cache_mode = False
+            else:
+                raise ValueError("value_cache_mode must be bool, or one of: 'turboquant', 'by_token'")
+        else:
+            self.value_cache_mode = bool(value_cache_mode)
+        self.value_cache_mode_flag = 1 if self.value_cache_mode else 0
+
+        self.key_cache_block_bytes_per_head = self.block_size * self.k_token_bytes
+        if self.value_cache_mode:
+            self.value_cache_block_bytes_per_head = self.block_size * self.v_token_bytes
+        else:
+            # per-token uint8 quantization layout (same as pa_kv_cache_update_ref.hpp):
+            #   [block_size * v_head_size] u8 payload + [block_size] fp16 scales + [block_size] fp16 zps
+            self.value_cache_block_bytes_per_head = self.block_size * (self.v_head_size + 4)
 
         # Reuse TurboQuantMSE_CM as helper providers for table construction.
         self.tq_k = TurboQuantMSE_CM.create_instance(k_head_size, 1, bits, rotation_seed)
@@ -291,6 +319,7 @@ class CompressedKVCache_Update_CM:
                 f" -DK_HEAD_SIZE={k_head_size}"
                 f" -DV_HEAD_SIZE={v_head_size}"
                 f" -DPAGED_ATTENTION_BLOCK_SIZE={block_size}"
+                f" -DVALUE_CACHE_MODE={self.value_cache_mode_flag}"
                 f" -mdump_asm -g2"
             ),
         )
@@ -394,14 +423,16 @@ class CompressedKVCache_Update_CM:
             for k, time_opt in enumerate(ns):
                 total_bytes = (
                     n_tokens * self.num_kv_heads *
-                    (2 * (self.k_head_size + self.v_head_size) + self.k_token_bytes + self.v_token_bytes)
+                    (2 * self.k_head_size + self.k_token_bytes + 2 * self.v_head_size + self.value_cache_block_bytes_per_head / self.block_size)
                 )
                 tput = total_bytes / time_opt
                 print(f'(compressed_kv_cache_update_tq)TPUT_{k}:[{total_bytes*1e-6:.3f} MB] {time_opt*1e-3:.0f} us, {tput:,.2f} GB/s')
         else:
             cl.finish()
 
-        return torch.tensor(t_key_cache.numpy(), dtype=torch.uint8), torch.tensor(t_value_cache.numpy(), dtype=torch.uint8)
+        out_k = torch.tensor(t_key_cache.numpy(), dtype=torch.uint8)
+        out_v = torch.tensor(t_value_cache.numpy(), dtype=torch.uint8)
+        return out_k, out_v
 
 
 @functools.lru_cache(maxsize=None)

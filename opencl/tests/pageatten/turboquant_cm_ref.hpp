@@ -312,7 +312,11 @@ extern "C" _GENX_MAIN_ void turboquant_dequantize(
 //
 // Packed cache storage (uint8 byte-addressed):
 //   key_cache   : [num_blocks, KV_HEADS_NUM, PAGED_ATTENTION_BLOCK_SIZE * (((K_HEAD_SIZE * TQ_BITS + 7)/8) + 2)] (u8)
-//   value_cache : [num_blocks, KV_HEADS_NUM, PAGED_ATTENTION_BLOCK_SIZE * (((V_HEAD_SIZE * TQ_BITS + 7)/8) + 2)] (u8)
+//   value_cache :
+//     - if VALUE_CACHE_MODE==1 (TurboQuant):
+//         [num_blocks, KV_HEADS_NUM, PAGED_ATTENTION_BLOCK_SIZE * (((V_HEAD_SIZE * TQ_BITS + 7)/8) + 2)] (u8)
+//     - if VALUE_CACHE_MODE==0 (per-token u8 + fp16 scale/zp):
+//         [num_blocks, KV_HEADS_NUM, PAGED_ATTENTION_BLOCK_SIZE * (V_HEAD_SIZE + 4)] (u8)
 //
 // Per (block, head) byte layout for key_cache (same pattern for value_cache):
 //   let K_PACKED_BYTES = (K_HEAD_SIZE * TQ_BITS + 7) / 8
@@ -324,6 +328,34 @@ extern "C" _GENX_MAIN_ void turboquant_dequantize(
 //
 // This matches TurboQuantMSE compressed-size accounting:
 //   bits-per-index storage + 2-byte norm per vector.
+#ifndef VALUE_CACHE_MODE
+#define VALUE_CACHE_MODE 0
+#endif
+
+template <int HS>
+CM_INLINE void quantize_and_store_value_per_token(vector_ref<half, HS> data,
+                                                  uint8_t* out [[type("svmptr_t")]],
+                                                  uint out_offset,
+                                                  uint token_pos) {
+    uint scale_offset = out_offset + HS * PAGED_ATTENTION_BLOCK_SIZE + token_pos * sizeof(half);
+
+    half max_val = cm_reduced_max<half>(data);
+    half min_val = cm_reduced_min<half>(data);
+    half qrange = max_val - min_val;
+
+    float scale_val = qrange == (half)0.0 ? 1.0f : 255.0f / (float)qrange;
+    half zp_val = (half)((0.0f - (float)min_val) * scale_val);
+
+    vector<half, HS> quant_data_h = cm_mul<half>(data, (half)scale_val) + zp_val;
+    vector<uchar, HS> data_u8 = cm_rnde<uchar, HS>(quant_data_h);
+
+    store_vec<uchar, HS>(reinterpret_cast<svmptr_t>(out + out_offset + token_pos * HS), 0, data_u8);
+
+    half* out_scale_zp = reinterpret_cast<half*>(out + scale_offset);
+    out_scale_zp[0] = (half)(1.0f / scale_val);
+    out_scale_zp[PAGED_ATTENTION_BLOCK_SIZE] = zp_val;
+}
+
 extern "C" _GENX_MAIN_ void compressed_kv_cache_update_tq(
     const half* key [[type("svmptr_t")]],                    // [batch_size_in_tokens, KV_HEADS_NUM * K_HEAD_SIZE]
     const half* value [[type("svmptr_t")]],                  // [batch_size_in_tokens, KV_HEADS_NUM * V_HEAD_SIZE]
@@ -388,7 +420,7 @@ extern "C" _GENX_MAIN_ void compressed_kv_cache_update_tq(
             1);
     }
 
-    {
+    #if VALUE_CACHE_MODE
         uint block_v_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * V_TOKEN_BYTES * PAGED_ATTENTION_BLOCK_SIZE;
         half* value_norm_base = reinterpret_cast<half*>(value_cache + block_v_base_offset + V_PACKED_BYTES * PAGED_ATTENTION_BLOCK_SIZE);
 
@@ -406,5 +438,13 @@ extern "C" _GENX_MAIN_ void compressed_kv_cache_update_tq(
             block_v_base_offset + token_start_pos * V_PACKED_BYTES,
             token_start_pos,
             1);
-    }
+    #else
+        constexpr uint V_TOKEN_BYTES_PER_TOKEN_Q = V_HEAD_SIZE + 4;
+        uint block_v_base_offset = (block_indices[block_offset] * KV_HEADS_NUM + head_idx) * V_TOKEN_BYTES_PER_TOKEN_Q * PAGED_ATTENTION_BLOCK_SIZE;
+        uint value_in_offset = token_idx * value_pitch + head_idx * V_HEAD_SIZE + value_offset;
+
+        vector<half, V_HEAD_SIZE> value_data;
+        load_vec_half<V_HEAD_SIZE>(value_data, value, value_in_offset * sizeof(half));
+        quantize_and_store_value_per_token<V_HEAD_SIZE>(value_data, value_cache, block_v_base_offset, token_start_pos);
+    #endif
 }

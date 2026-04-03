@@ -61,6 +61,21 @@ def _unpack_idx_bits(packed: torch.Tensor, n_idx: int, bits: int) -> torch.Tenso
     return out
 
 
+def _quant_token_u8_with_scale_zp(vec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = vec.float()
+    x_max = x.max()
+    x_min = x.min()
+    qrange = x_max - x_min
+
+    scale = 1.0 if float(qrange.item()) == 0.0 else 255.0 / float(qrange.item())
+    zp = (0.0 - float(x_min.item())) * scale
+
+    q_u8 = torch.round(x * scale + zp).clamp(0.0, 255.0).to(torch.uint8)
+    dq_scale = torch.tensor([1.0 / scale], dtype=torch.float16)
+    zp_h = torch.tensor([zp], dtype=torch.float16)
+    return q_u8, dq_scale, zp_h
+
+
 def _reference_update_tq(
     key_cache,
     value_cache,
@@ -77,6 +92,7 @@ def _reference_update_tq(
     v_head_size,
     block_size,
     bits,
+    value_cache_mode,
 ):
     out_k = key_cache.clone()
     out_v = value_cache.clone()
@@ -87,18 +103,21 @@ def _reference_update_tq(
     # Use CM quantization outputs directly for exact parity with kernel path.
     # tq_key/tq_val are single-head helpers (num_kv_heads=1), so flatten heads.
     k_flat = key.view(key.shape[0], num_kv_heads, k_head_size).reshape(-1, k_head_size).float()
-    v_flat = value.view(value.shape[0], num_kv_heads, v_head_size).reshape(-1, v_head_size).float()
     k_q_flat = tq_key.quantize(k_flat)
-    v_q_flat = tq_val.quantize(v_flat)
 
     k_q_all = {
         "idx": k_q_flat["idx"].view(key.shape[0], num_kv_heads, k_head_size),
         "norms": k_q_flat["norms"].view(key.shape[0], num_kv_heads),
     }
-    v_q_all = {
-        "idx": v_q_flat["idx"].view(value.shape[0], num_kv_heads, v_head_size),
-        "norms": v_q_flat["norms"].view(value.shape[0], num_kv_heads),
-    }
+    if value_cache_mode:
+        v_flat = value.view(value.shape[0], num_kv_heads, v_head_size).reshape(-1, v_head_size).float()
+        v_q_flat = tq_val.quantize(v_flat)
+        v_q_all = {
+            "idx": v_q_flat["idx"].view(value.shape[0], num_kv_heads, v_head_size),
+            "norms": v_q_flat["norms"].view(value.shape[0], num_kv_heads),
+        }
+    else:
+        v_q_all = None
 
     batch = len(past_lens)
     for seq in range(batch):
@@ -121,15 +140,62 @@ def _reference_update_tq(
                 k_norm_base = block_size * k_packed_bytes + token_pos * 2
                 out_k_flat[block_pos, h, k_norm_base:k_norm_base + 2] = k_norm_u8.reshape(-1)
 
-                # value
-                v_idx = _pack_idx_bits(v_q_all["idx"][token_idx, h], bits)
-                out_v_flat[block_pos, h, token_pos * v_packed_bytes:(token_pos + 1) * v_packed_bytes] = v_idx
+                if value_cache_mode:
+                    v_idx = _pack_idx_bits(v_q_all["idx"][token_idx, h], bits)
+                    out_v_flat[block_pos, h, token_pos * v_packed_bytes:(token_pos + 1) * v_packed_bytes] = v_idx
 
-                v_norm_u8 = _pack_norm_to_u8(v_q_all["norms"][token_idx, h:h + 1].half())
-                v_norm_base = block_size * v_packed_bytes + token_pos * 2
-                out_v_flat[block_pos, h, v_norm_base:v_norm_base + 2] = v_norm_u8.reshape(-1)
+                    v_norm_u8 = _pack_norm_to_u8(v_q_all["norms"][token_idx, h:h + 1].half())
+                    v_norm_base = block_size * v_packed_bytes + token_pos * 2
+                    out_v_flat[block_pos, h, v_norm_base:v_norm_base + 2] = v_norm_u8.reshape(-1)
+                else:
+                    v_vec = value.view(value.shape[0], num_kv_heads, v_head_size)[token_idx, h]
+                    q_u8, dq_scale_h, zp_h = _quant_token_u8_with_scale_zp(v_vec)
+
+                    payload_base = token_pos * v_head_size
+                    out_v_flat[block_pos, h, payload_base:payload_base + v_head_size] = q_u8.reshape(-1)
+
+                    scale_base = block_size * v_head_size + token_pos * 2
+                    zp_base = block_size * v_head_size + block_size * 2 + token_pos * 2
+                    out_v_flat[block_pos, h, scale_base:scale_base + 2] = dq_scale_h.view(torch.uint8).reshape(-1)
+                    out_v_flat[block_pos, h, zp_base:zp_base + 2] = zp_h.view(torch.uint8).reshape(-1)
 
     return out_k, out_v
+
+
+def _reconstruct_updated_tokens_from_cache_per_token(
+    cache,
+    past_lens,
+    subsequence_begins,
+    block_indices,
+    block_indices_begins,
+    num_kv_heads,
+    head_size,
+    block_size,
+):
+    flat = cache.reshape(cache.shape[0], cache.shape[1], -1)
+    payload_end = block_size * head_size
+
+    rows = []
+    batch = len(past_lens)
+    for seq in range(batch):
+        seq_tokens = subsequence_begins[seq + 1] - subsequence_begins[seq]
+        for t in range(seq_tokens):
+            cur_block_idx = (past_lens[seq] + t) // block_size
+            token_pos = (past_lens[seq] + t) % block_size
+            block_pos = block_indices[block_indices_begins[seq] + cur_block_idx]
+
+            row_heads = []
+            for h in range(num_kv_heads):
+                token_start = token_pos * head_size
+                token_end = token_start + head_size
+                q_u8 = flat[block_pos, h, token_start:token_end].to(torch.float32)
+
+                dq_scale = flat[block_pos, h, payload_end + token_pos * 2: payload_end + token_pos * 2 + 2].view(torch.float16).float()
+                zp = flat[block_pos, h, payload_end + block_size * 2 + token_pos * 2: payload_end + block_size * 2 + token_pos * 2 + 2].view(torch.float16).float()
+                row_heads.append((q_u8 - zp) * dq_scale)
+            rows.append(torch.stack(row_heads, dim=0))
+
+    return torch.stack(rows, dim=0).to(torch.float16)
 
 
 def _reconstruct_updated_tokens_from_cache(
@@ -212,7 +278,8 @@ def test_turboquant_mse_cm_quant_dequant():
     compare(x_ref.numpy(), x_cm.numpy(), 3e-2)
 
 
-def test_compressed_kv_cache_update_cm():
+@pytest.mark.parametrize("value_cache_mode", [True, False], ids=["turboquant", "per_token_u8"])
+def test_compressed_kv_cache_update_cm(value_cache_mode: bool):
     torch.manual_seed(11)
 
     num_tokens = [7, 4, 3]
@@ -229,19 +296,18 @@ def test_compressed_kv_cache_update_cm():
     key = torch.randn(batch_tokens, num_kv_heads * k_head_size, dtype=torch.float16)
     value = torch.randn(batch_tokens, num_kv_heads * v_head_size, dtype=torch.float16)
 
-    num_blocks = len(block_indices)
-    k_packed_bytes = (k_head_size * bits + 7) // 8
-    v_packed_bytes = (v_head_size * bits + 7) // 8
-    key_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (k_packed_bytes + 2), dtype=torch.uint8)
-    value_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (v_packed_bytes + 2), dtype=torch.uint8)
-
     updater = CompressedKVCache_Update_CM(
         num_kv_heads=num_kv_heads,
         k_head_size=k_head_size,
         v_head_size=v_head_size,
         block_size=block_size,
         bits=bits,
+        value_cache_mode=value_cache_mode,
     )
+
+    num_blocks = len(block_indices)
+    key_cache = torch.zeros(num_blocks, num_kv_heads, updater.key_cache_block_bytes_per_head, dtype=torch.uint8)
+    value_cache = torch.zeros(num_blocks, num_kv_heads, updater.value_cache_block_bytes_per_head, dtype=torch.uint8)
 
     out_k, out_v = updater(
         key,
@@ -270,6 +336,7 @@ def test_compressed_kv_cache_update_cm():
         v_head_size,
         block_size,
         bits,
+        value_cache_mode,
     )
 
     out_k_rec = _reconstruct_updated_tokens_from_cache(
@@ -278,12 +345,20 @@ def test_compressed_kv_cache_update_cm():
     ref_k_rec = _reconstruct_updated_tokens_from_cache(
         ref_k, past_lens, subsequence_begins, block_indices, block_indices_begins,
         num_kv_heads, k_head_size, block_size, bits, updater.tq_k.ref)
-    out_v_rec = _reconstruct_updated_tokens_from_cache(
-        out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
-        num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
-    ref_v_rec = _reconstruct_updated_tokens_from_cache(
-        ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
-        num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+    if value_cache_mode:
+        out_v_rec = _reconstruct_updated_tokens_from_cache(
+            out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+            num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+        ref_v_rec = _reconstruct_updated_tokens_from_cache(
+            ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+            num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+    else:
+        out_v_rec = _reconstruct_updated_tokens_from_cache_per_token(
+            out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+            num_kv_heads, v_head_size, block_size)
+        ref_v_rec = _reconstruct_updated_tokens_from_cache_per_token(
+            ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+            num_kv_heads, v_head_size, block_size)
 
     _assert_algorithm_level_match(ref_k_rec, out_k_rec, bits, "k")
     _assert_algorithm_level_match(ref_v_rec, out_v_rec, bits, "v")
@@ -296,18 +371,13 @@ def _run_compressed_kv_case(num_tokens,
                             v_head_size,
                             block_size,
                             bits=4,
-                            check_perf=False):
+                            check_perf=False,
+                            value_cache_mode: bool = False):
     subsequence_begins, block_indices, block_indices_begins = _build_pa_metadata(num_tokens, past_lens, block_size)
 
     batch_tokens = sum(num_tokens)
     key = torch.randn(batch_tokens, num_kv_heads * k_head_size, dtype=torch.float16)
     value = torch.randn(batch_tokens, num_kv_heads * v_head_size, dtype=torch.float16)
-
-    num_blocks = len(block_indices)
-    k_packed_bytes = (k_head_size * bits + 7) // 8
-    v_packed_bytes = (v_head_size * bits + 7) // 8
-    key_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (k_packed_bytes + 2), dtype=torch.uint8)
-    value_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (v_packed_bytes + 2), dtype=torch.uint8)
 
     updater = CompressedKVCache_Update_CM(
         num_kv_heads=num_kv_heads,
@@ -315,7 +385,12 @@ def _run_compressed_kv_case(num_tokens,
         v_head_size=v_head_size,
         block_size=block_size,
         bits=bits,
+        value_cache_mode=value_cache_mode,
     )
+
+    num_blocks = len(block_indices)
+    key_cache = torch.zeros(num_blocks, num_kv_heads, updater.key_cache_block_bytes_per_head, dtype=torch.uint8)
+    value_cache = torch.zeros(num_blocks, num_kv_heads, updater.value_cache_block_bytes_per_head, dtype=torch.uint8)
 
     n_repeats = 20 if check_perf else 1
     out_k, out_v = updater(
@@ -348,6 +423,7 @@ def _run_compressed_kv_case(num_tokens,
             v_head_size,
             block_size,
             bits,
+            value_cache_mode,
         )
 
         out_k_rec = _reconstruct_updated_tokens_from_cache(
@@ -356,18 +432,27 @@ def _run_compressed_kv_case(num_tokens,
         ref_k_rec = _reconstruct_updated_tokens_from_cache(
             ref_k, past_lens, subsequence_begins, block_indices, block_indices_begins,
             num_kv_heads, k_head_size, block_size, bits, updater.tq_k.ref)
-        out_v_rec = _reconstruct_updated_tokens_from_cache(
-            out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
-            num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
-        ref_v_rec = _reconstruct_updated_tokens_from_cache(
-            ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
-            num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+        if value_cache_mode:
+            out_v_rec = _reconstruct_updated_tokens_from_cache(
+                out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+            ref_v_rec = _reconstruct_updated_tokens_from_cache(
+                ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+        else:
+            out_v_rec = _reconstruct_updated_tokens_from_cache_per_token(
+                out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                num_kv_heads, v_head_size, block_size)
+            ref_v_rec = _reconstruct_updated_tokens_from_cache_per_token(
+                ref_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                num_kv_heads, v_head_size, block_size)
 
         _assert_algorithm_level_match(ref_k_rec, out_k_rec, bits, "k")
         _assert_algorithm_level_match(ref_v_rec, out_v_rec, bits, "v")
 
 
 @pytest.mark.parametrize("n_bits", [2, 3, 4])
+@pytest.mark.parametrize("value_cache_mode", [True, False], ids=["turboquant", "per_token_u8"])
 @pytest.mark.parametrize(
     "num_tokens,past_lens,num_kv_heads,k_head_size,v_head_size,block_size",
     [
@@ -381,6 +466,7 @@ def _run_compressed_kv_case(num_tokens,
 )
 def test_compressed_kv_cache_update_cm_parameterized(
     n_bits,
+    value_cache_mode,
     num_tokens,
     past_lens,
     num_kv_heads,
@@ -399,11 +485,13 @@ def test_compressed_kv_cache_update_cm_parameterized(
         block_size=block_size,
         bits=n_bits,
         check_perf=False,
+        value_cache_mode=value_cache_mode,
     )
 
 
 @pytest.mark.skipif(os.getenv("RUN_PERF_TESTS") != "1", reason="Set RUN_PERF_TESTS=1 to enable perf tests")
 @pytest.mark.parametrize("n_bits", [2, 3, 4])
+@pytest.mark.parametrize("value_cache_mode", [True, False], ids=["turboquant", "per_token_u8"])
 @pytest.mark.parametrize(
     "num_tokens,past_lens,num_kv_heads,k_head_size,v_head_size,block_size",
     [
@@ -417,6 +505,7 @@ def test_compressed_kv_cache_update_cm_parameterized(
 )
 def test_compressed_kv_cache_update_cm_perf(
     n_bits,
+    value_cache_mode,
     num_tokens,
     past_lens,
     num_kv_heads,
@@ -435,6 +524,7 @@ def test_compressed_kv_cache_update_cm_perf(
         block_size=block_size,
         bits=n_bits,
         check_perf=True,
+        value_cache_mode=value_cache_mode,
     )
 
 
@@ -506,72 +596,79 @@ def test_compressed_kv_cache_update_cm_self_test_like():
     key_ref = key.view(batch_tokens, num_kv_heads, k_head_size).float()
     value_ref = value.view(batch_tokens, num_kv_heads, v_head_size).float()
 
-    prev_k_mse = None
-    prev_v_mse = None
-    prev_k_cos = None
-    prev_v_cos = None
+    for value_cache_mode in [False, True]:
+        prev_k_mse = None
+        prev_v_mse = None
+        prev_k_cos = None
+        prev_v_cos = None
+        for bits in [2, 3, 4]:
+            k_packed_bytes = (k_head_size * bits + 7) // 8
+            num_blocks = len(block_indices)
 
-    for bits in [2, 3, 4]:
-        k_packed_bytes = (k_head_size * bits + 7) // 8
-        v_packed_bytes = (v_head_size * bits + 7) // 8
-        num_blocks = len(block_indices)
-        key_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (k_packed_bytes + 2), dtype=torch.uint8)
-        value_cache = torch.zeros(num_blocks, num_kv_heads, block_size * (v_packed_bytes + 2), dtype=torch.uint8)
+            updater = CompressedKVCache_Update_CM(
+                num_kv_heads=num_kv_heads,
+                k_head_size=k_head_size,
+                v_head_size=v_head_size,
+                block_size=block_size,
+                bits=bits,
+                value_cache_mode=value_cache_mode,
+            )
 
-        updater = CompressedKVCache_Update_CM(
-            num_kv_heads=num_kv_heads,
-            k_head_size=k_head_size,
-            v_head_size=v_head_size,
-            block_size=block_size,
-            bits=bits,
-        )
+            key_cache = torch.zeros(num_blocks, num_kv_heads, updater.key_cache_block_bytes_per_head, dtype=torch.uint8)
+            value_cache = torch.zeros(num_blocks, num_kv_heads, updater.value_cache_block_bytes_per_head, dtype=torch.uint8)
 
-        out_k, out_v = updater(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            past_lens,
-            subsequence_begins,
-            block_indices,
-            block_indices_begins,
-        )
+            out_k, out_v = updater(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                past_lens,
+                subsequence_begins,
+                block_indices,
+                block_indices_begins,
+            )
 
-        k_rec = _reconstruct_updated_tokens_from_cache(
-            out_k, past_lens, subsequence_begins, block_indices, block_indices_begins,
-            num_kv_heads, k_head_size, block_size, bits, updater.tq_k.ref)
-        v_rec = _reconstruct_updated_tokens_from_cache(
-            out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
-            num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+            k_rec = _reconstruct_updated_tokens_from_cache(
+                out_k, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                num_kv_heads, k_head_size, block_size, bits, updater.tq_k.ref)
+            if value_cache_mode:
+                v_rec = _reconstruct_updated_tokens_from_cache(
+                    out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                    num_kv_heads, v_head_size, block_size, bits, updater.tq_v.ref)
+            else:
+                v_rec = _reconstruct_updated_tokens_from_cache_per_token(
+                    out_v, past_lens, subsequence_begins, block_indices, block_indices_begins,
+                    num_kv_heads, v_head_size, block_size)
 
-        k_mse = ((key_ref - k_rec) ** 2).mean().item()
-        v_mse = ((value_ref - v_rec) ** 2).mean().item()
-        k_cos = torch.nn.functional.cosine_similarity(
-            key_ref.reshape(-1, k_head_size), k_rec.reshape(-1, k_head_size), dim=-1).mean().item()
-        v_cos = torch.nn.functional.cosine_similarity(
-            value_ref.reshape(-1, v_head_size), v_rec.reshape(-1, v_head_size), dim=-1).mean().item()
+            k_mse = ((key_ref - k_rec) ** 2).mean().item()
+            v_mse = ((value_ref - v_rec) ** 2).mean().item()
+            k_cos = torch.nn.functional.cosine_similarity(
+                key_ref.reshape(-1, k_head_size), k_rec.reshape(-1, k_head_size), dim=-1).mean().item()
+            v_cos = torch.nn.functional.cosine_similarity(
+                value_ref.reshape(-1, v_head_size), v_rec.reshape(-1, v_head_size), dim=-1).mean().item()
 
-        key_orig_bytes = key.numel() * key.element_size()
-        value_orig_bytes = value.numel() * value.element_size()
-        key_comp_bytes = batch_tokens * num_kv_heads * (k_packed_bytes + 2)
-        value_comp_bytes = batch_tokens * num_kv_heads * (v_packed_bytes + 2)
+            key_orig_bytes = key.numel() * key.element_size()
+            value_orig_bytes = value.numel() * value.element_size()
+            key_comp_bytes = batch_tokens * num_kv_heads * (k_packed_bytes + 2)
+            value_comp_bytes = batch_tokens * num_kv_heads * (updater.value_cache_block_bytes_per_head // block_size)
 
-        print(f"CompressedKVCache_Update_CM  bits={bits}  tokens={batch_tokens}  heads={num_kv_heads}")
-        print(f"  key   MSE={k_mse:.6f}  cos={k_cos:.4f}  size: {key_orig_bytes:,} -> {key_comp_bytes:,} ({key_orig_bytes / key_comp_bytes:.1f}x)")
-        print(f"  value MSE={v_mse:.6f}  cos={v_cos:.4f}  size: {value_orig_bytes:,} -> {value_comp_bytes:,} ({value_orig_bytes / value_comp_bytes:.1f}x)")
-        print()
+            mode_name = "turboquant" if value_cache_mode else "per_token_u8"
+            print(f"CompressedKVCache_Update_CM  value_mode={mode_name}  bits={bits}  tokens={batch_tokens}  heads={num_kv_heads}")
+            print(f"  key   MSE={k_mse:.6f}  cos={k_cos:.4f}  size: {key_orig_bytes:,} -> {int(key_comp_bytes):,} ({key_orig_bytes / key_comp_bytes:.1f}x)")
+            print(f"  value MSE={v_mse:.6f}  cos={v_cos:.4f}  size: {value_orig_bytes:,} -> {int(value_comp_bytes):,} ({value_orig_bytes / value_comp_bytes:.1f}x)")
+            print()
 
-        assert k_mse == k_mse and v_mse == v_mse and k_cos == k_cos and v_cos == v_cos
-        assert key_comp_bytes < key_orig_bytes
-        assert value_comp_bytes < value_orig_bytes
+            assert k_mse == k_mse and v_mse == v_mse and k_cos == k_cos and v_cos == v_cos
+            assert key_comp_bytes < key_orig_bytes
+            assert value_comp_bytes < value_orig_bytes
 
-        if prev_k_mse is not None:
-            assert k_mse < prev_k_mse + 1e-6
-            assert v_mse < prev_v_mse + 1e-6
-            assert k_cos > prev_k_cos - 1e-6
-            assert v_cos > prev_v_cos - 1e-6
+            if prev_k_mse is not None:
+                assert k_mse < prev_k_mse + 1e-6
+                assert v_mse < prev_v_mse + 1e-6
+                assert k_cos > prev_k_cos - 1e-6
+                assert v_cos > prev_v_cos - 1e-6
 
-        prev_k_mse = k_mse
-        prev_v_mse = v_mse
-        prev_k_cos = k_cos
-        prev_v_cos = v_cos
+            prev_k_mse = k_mse
+            prev_v_mse = v_mse
+            prev_k_cos = k_cos
+            prev_v_cos = v_cos
