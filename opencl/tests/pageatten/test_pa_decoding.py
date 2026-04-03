@@ -259,19 +259,14 @@ class PaSingleTokenRunner:
 
         if self.use_turboquant_kernel:
             tq = TurboQuantMSE_CM.create_instance(head_size=self.head_size, num_kv_heads=1, bits=self.turboquant_bits)
-            self._t_tq_q_t_host = torch.from_numpy(tq.q_t.numpy())
+            self._t_tq_q_t = cl.tensor(tq.q_t.numpy())
             self._t_tq_centroids = cl.tensor(tq.centroids.numpy())
         else:
-            self._t_tq_q_t_host = None
+            self._t_tq_q_t = None
             self._t_tq_centroids = None
 
     def _prepare_query_for_kernel(self, query: torch.Tensor) -> torch.Tensor:
-        if not self.use_turboquant_kernel:
-            return query
-        if self._t_tq_q_t_host is None:
-            raise RuntimeError("TurboQuant Q rotation matrix is not initialized")
-        q_t = self._t_tq_q_t_host.to(dtype=torch.float32)
-        return torch.matmul(query.float(), q_t).to(dtype=query.dtype)
+        return query
 
     @staticmethod
     @functools.cache
@@ -441,6 +436,7 @@ class PaSingleTokenRunner:
                     t_subsequence_begins,
                     t_out,
                     t_lse,
+                    self._t_tq_q_t,
                     self._t_tq_centroids,
                     1,
                 )
@@ -873,6 +869,7 @@ def _run_bandwidth_measurement(
                 t_subsequence_begins,
                 t_out,
                 t_lse,
+                runner._t_tq_q_t,
                 runner._t_tq_centroids,
                 1,
             )

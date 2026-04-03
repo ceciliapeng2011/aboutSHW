@@ -189,9 +189,6 @@ class page_atten_cm:
         seq_len, _, head_size = q.shape
         assert head_size == self.head_size
 
-        if self.turboquant_enabled:
-            q = turboquant_rotate_query(q, self.tq)
-
         aligned_seq_len = seq_len
         if seq_len % self.block_sz != 0:
             pad = self.block_sz - seq_len % self.block_sz
@@ -250,6 +247,7 @@ class page_atten_cm:
         lws = [1, 1, wg_size]
 
         if self.turboquant_enabled:
+            t_q_t = cl.tensor(self.tq.q_t.numpy())
             t_centroids = cl.tensor(self.tq.centroids.numpy())
             self.kernels.enqueue(
                 self.kernel_name,
@@ -263,6 +261,7 @@ class page_atten_cm:
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_out,
+                t_q_t,
                 t_centroids,
                 seq_len,
             )

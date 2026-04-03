@@ -59,6 +59,7 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	int* subsequence_begins [[type("svmptr_t")]],
 	float* output [[type("svmptr_t")]],
 	float* lse [[type("svmptr_t")]],
+	const half* tq_q_t [[type("svmptr_t")]],
 	const half* tq_centroids [[type("svmptr_t")]],
 	int q_len// 1
 	) {
@@ -92,12 +93,28 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		affine_scale_h = (half)((centroid_h[(1 << TQ_BITS) - 1] - centroid_h[0]) / (float)((1 << TQ_BITS) - 1));
 	}
 
-	// [Load Q]
+	// [Load and rotate Q]
 	// Q layout: [seq, head, dim] chunk for current (kv_head, q_head_chunk).
-	// Q is already rotated on host side; kernel consumes pre-rotated Q directly.
+	// Apply TurboQuant query rotation in-kernel: Q_rot = Q * Q_T.
 	const uint qo_offset = (seq_idx * HEADS_NUM * q_len + head_num_idx) * HEAD_SIZE;
 	matrix<half, Q_head_chunk_size, HEAD_SIZE> Qmat = 0;
 	cm_svm_block_read<half, Q_head_chunk_size * HEAD_SIZE>((svmptr_t)(query + qo_offset), Qmat.format<half>());
+	{
+		matrix<half, Q_head_chunk_size, HEAD_SIZE> Qrot = 0;
+		#pragma unroll
+		for (int qi = 0; qi < Q_head_chunk_size; qi++) {
+			#pragma unroll
+			for (int j = 0; j < HEAD_SIZE; j++) {
+				float acc = 0.0f;
+				#pragma unroll
+				for (int i = 0; i < HEAD_SIZE; i++) {
+					acc += (float)Qmat[qi][i] * (float)tq_q_t[i * HEAD_SIZE + j];
+				}
+				Qrot[qi][j] = (half)acc;
+			}
+		}
+		Qmat = Qrot;
+	}
 
 	// [Block geometry]
 	// TurboQuant K uses packed 4-bit payload + fp16 token norm.

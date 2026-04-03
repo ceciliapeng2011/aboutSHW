@@ -45,6 +45,7 @@ void pa_lsc_u8_tq(
 	int q_len,
 	int kv_len,
 	svmptr_t q_base [[type("svmptr_t")]],
+	const half* tq_q_t [[type("svmptr_t")]],
 	const half* tq_centroids [[type("svmptr_t")]],
 	svmptr_t k_cache_base [[type("svmptr_t")]],
 	svmptr_t v_cache_base [[type("svmptr_t")]],
@@ -90,7 +91,46 @@ void pa_lsc_u8_tq(
 		#pragma unroll
 		for (int k = 0, ri = 0; k < head_size / 2; k += REG_K / 2, ri++) {
 			cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-			rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+		}
+
+		vector<half, q_step * head_size> q_src = 0;
+		vector<half, q_step * head_size> q_rot = 0;
+
+		#pragma unroll
+		for (int ri = 0; ri < head_size / REG_K; ri++) {
+			auto q_chunk = rQ[ri].format<half, REG_K, REG_N>();
+			#pragma unroll
+			for (int rk = 0; rk < REG_K; rk++) {
+				int gk = ri * REG_K + rk;
+				for (int qt = 0; qt < q_tokens_left; qt++) {
+					q_src[qt * head_size + gk] = q_chunk.format<half>()[rk * REG_N + qt];
+				}
+			}
+		}
+
+		for (int qt = 0; qt < q_tokens_left; qt++) {
+			#pragma unroll
+			for (int j = 0; j < head_size; j++) {
+				float acc = 0.0f;
+				#pragma unroll
+				for (int i = 0; i < head_size; i++) {
+					acc += (float)q_src[qt * head_size + i] * (float)tq_q_t[i * head_size + j];
+				}
+				q_rot[qt * head_size + j] = (half)acc;
+			}
+		}
+
+		#pragma unroll
+		for (int ri = 0; ri < head_size / REG_K; ri++) {
+			auto q_chunk = rQ[ri].format<half, REG_K, REG_N>();
+			#pragma unroll
+			for (int rk = 0; rk < REG_K; rk++) {
+				int gk = ri * REG_K + rk;
+				for (int qt = 0; qt < q_step; qt++) {
+					half v = (qt < q_tokens_left) ? q_rot[qt * head_size + gk] : (half)0.0f;
+					q_chunk.format<half>()[rk * REG_N + qt] = cm_mul<half>(v, (half)scale_factor);
+				}
+			}
 		}
 	}
 
@@ -280,6 +320,7 @@ extern "C" _GENX_MAIN_ void cm_pa_multi_token_turboquant(
 	int32_t* block_indices_begins [[type("svmptr_t")]],
 	int32_t* subsequence_begins [[type("svmptr_t")]],
 	half* output [[type("svmptr_t")]],
+	const half* tq_q_t [[type("svmptr_t")]],
 	const half* tq_centroids [[type("svmptr_t")]],
 	int q_len
 	) {
@@ -346,6 +387,7 @@ extern "C" _GENX_MAIN_ void cm_pa_multi_token_turboquant(
 							q_len_sg, //q_step,
 							kv_seq_len, //kv_len,
 							reinterpret_cast<svmptr_t>(query + q_offset),
+							tq_q_t,
 							tq_centroids,
 							reinterpret_cast<svmptr_t>(k_cache + kv_offset),
 							reinterpret_cast<svmptr_t>(v_cache + kv_offset),
