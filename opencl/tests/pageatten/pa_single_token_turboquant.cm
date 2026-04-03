@@ -80,13 +80,16 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 	}
 	const uint total_blocks_num = (kv_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	constexpr uint kv_pitch = HEAD_SIZE * sizeof(KV_ELEMENT_TYPE);
-	// [TurboQuant LUT preload]
-	// Load centroid table once per thread: used by packed-index dequantization.
-	vector<float, (1 << TQ_BITS)> centroid_tbl;
+	// [TurboQuant affine decode params]
+	// Approximate centroid LUT by affine mapping: value = scale * idx + bias.
+	// We derive (scale, bias) from centroid endpoints.
+	half affine_scale_h = 0.0f;
+	half affine_bias_h = 0.0f;
 	{
 		vector<half, (1 << TQ_BITS)> centroid_h;
 		cm_svm_block_read<half, (1 << TQ_BITS)>((svmptr_t)tq_centroids, centroid_h);
-		centroid_tbl = centroid_h;
+		affine_bias_h = centroid_h[0];
+		affine_scale_h = (half)((centroid_h[(1 << TQ_BITS) - 1] - centroid_h[0]) / (float)((1 << TQ_BITS) - 1));
 	}
 
 	// [Load Q]
@@ -120,8 +123,8 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 		uint k_base_offset = blk_indices * per_k_block_element_num + kv_head_num_idx * (per_k_block_element_num / KV_HEADS_NUM);
 		const half* k_norm_base = reinterpret_cast<const half*>(key + k_base_offset + KV_BLOCK_SIZE * K_PACKED_BYTES);
 
-		lsc::block_2d_desc<uint8_t, 1, REG_N, REG_K/2> b2dK(
-			key + k_base_offset,
+		lsc::block_2d_desc<uint, 1, REG_N, REG_K/8> b2dK(
+			reinterpret_cast<uint*>(key + k_base_offset),
 			KV_BLOCK_SIZE - 1,
 			K_PACKED_BYTES * sizeof(uint8_t) - 1,
 			K_PACKED_BYTES * sizeof(uint8_t) - 1,
@@ -134,39 +137,45 @@ extern "C" _GENX_MAIN_ void cm_sdpa_2nd_turboquant(
 			if (kv_pos_end == 0) kv_pos_end = KV_BLOCK_SIZE;
 		}
 
-		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
-			int valid_n = kv_pos_end - kv_pos;
-			if (valid_n > REG_N) {
-				valid_n = REG_N;
+		// [Load K norm]
+		// Per-token fp16 norm for this whole K block.
+		vector<half, KV_BLOCK_SIZE> knorm_vec_blk;
+		cm_svm_block_read<half, KV_BLOCK_SIZE>((svmptr_t)k_norm_base, knorm_vec_blk);
+		if (kv_pos_end < KV_BLOCK_SIZE) {
+			for (int i = kv_pos_end; i < KV_BLOCK_SIZE; i++) {
+				knorm_vec_blk[i] = 0.0f;
 			}
+		}
 
-			// [Load K norm]
-			// One fp16 norm per token scales dequantized centroid values.
-			vector<half, REG_N> knorm_vec = 0;
-			cm_svm_block_read<half, REG_N>((svmptr_t)(k_norm_base + kv_pos), knorm_vec);
-			for (int n = valid_n; n < REG_N; n++) {
-				knorm_vec[n] = 0.0f;
-			}
+		for (int kv_pos = 0; kv_pos < kv_pos_end; kv_pos += KV_STEP, ki++) {
+			vector<half, REG_N> knorm_vec = knorm_vec_blk.select<REG_N, 1>(kv_pos);
 
 			#pragma unroll
 			for (int ri = 0; ri < HEAD_SIZE / REG_K; ri++) {
 				matrix<half, REG_K, REG_N> Kt = 0;
-				const int packed_base = ri * (REG_K / 2);
+				const int packed_base = ri * (REG_K / 8);
 
-				matrix<uint8_t, REG_N, REG_K / 2> Kpack = 0;
+				matrix<uint8_t, REG_K / 2, REG_N> Kpack_raw = 0;
 				b2dK.set_block_x(packed_base);
-				cm_load<lsc::Normal>(Kpack.format<uint8_t>(), b2dK.set_block_y(kv_pos));
+				cm_load<lsc::Transpose>(Kpack_raw.format<uint>(), b2dK.set_block_y(kv_pos));
 
-				// [Dequantize K tile]
-				// Unpack 4-bit indices, lookup centroid LUT, then apply token norm.
-				for (int n = 0; n < REG_N; n++) {
-					float knorm = (float)knorm_vec[n];
-					for (int p = 0; p < REG_K / 2; p++) {
-						uchar packed = Kpack[n][p];
-						int idx0 = (int)(packed & 0x0f);
-						int idx1 = (int)(packed >> 4);
-						Kt[p * 2][n] = (half)(centroid_tbl[idx0] * knorm);
-						Kt[p * 2 + 1][n] = (half)(centroid_tbl[idx1] * knorm);
+				auto pack_src = Kpack_raw.format<ushort, REG_K / 4, REG_N>();
+
+				#pragma unroll
+				for (int p = 0; p < REG_K / 2; p += 2) {
+					vector<ushort, REG_N> packed_row0 = pack_src.select<2,1,8,2>(p, 0);
+					vector<ushort, REG_N> packed_row1 = pack_src.select<2,1,8,2>(p, 1);
+					for (int n = 0; n < REG_N; n++) {
+						uint8_t packed_idx0 = (uint8_t)packed_row0[n];
+						uint8_t packed_idx1 = (uint8_t)packed_row1[n];
+						half deq0_lo = (half)((half)(packed_idx0 & 0x0f) * affine_scale_h + affine_bias_h);
+						half deq0_hi = (half)((half)(packed_idx0 >> 4) * affine_scale_h + affine_bias_h);
+						half deq1_lo = (half)((half)(packed_idx1 & 0x0f) * affine_scale_h + affine_bias_h);
+						half deq1_hi = (half)((half)(packed_idx1 >> 4) * affine_scale_h + affine_bias_h);
+						Kt[2 * p][n] = (half)(deq0_lo * knorm_vec[n]);
+						Kt[2 * p + 1][n] = (half)(deq0_hi * knorm_vec[n]);
+						Kt[2 * (p + 1)][n] = (half)(deq1_lo * knorm_vec[n]);
+						Kt[2 * (p + 1) + 1][n] = (half)(deq1_hi * knorm_vec[n]);
 					}
 				}
 
