@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from clops import cl
-from turboquant_cm import TurboQuantMSE_CM, CompressedKVCache_Update_CM
+from turboquant_cm import TurboQuantMSE_CM
 
 
 cl.profiling(True)
@@ -499,78 +499,55 @@ def _build_single_subsequence_inputs(case: DecodingCase):
     v_blocks = v_bhls[0].transpose(0, 1).reshape(total_blk_num, case.block_size, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
 
     if case.turboquant_enabled:
-        tq = TurboQuantMSE_CM.create_instance(head_size=case.head_size, num_kv_heads=1, bits=case.turboquant_bits)
-        tq_ref = tq.ref
-
-        # Build compressed key cache with the CM updater implementation.
-        k_packed_bytes = (case.head_size * case.turboquant_bits + 7) // 8
-        key_cache_logical = torch.zeros(
-            total_blk_num,
-            case.num_kv_heads,
-            case.block_size * (k_packed_bytes + 2),
-            dtype=torch.uint8,
-        )
-
-        updater = CompressedKVCache_Update_CM(
+        tq = TurboQuantMSE_CM.create_instance(
+            head_size=case.head_size,
             num_kv_heads=case.num_kv_heads,
-            k_head_size=case.head_size,
-            v_head_size=case.head_size,
-            block_size=case.block_size,
             bits=case.turboquant_bits,
-            value_cache_mode="by_token",
         )
 
-        # updater also needs value cache argument; decode path ignores returned value cache,
-        # but the buffer shape still must match selected value-cache mode.
-        value_cache_dummy = torch.zeros(
-            total_blk_num,
-            case.num_kv_heads,
-            updater.value_cache_block_bytes_per_head,
-            dtype=torch.uint8,
-        )
+        # Build compressed key cache directly from TurboQuant indices/norms.
+        if case.turboquant_bits != 4:
+            raise ValueError("TurboQuant decode test currently supports bits==4")
 
+        k_packed_bytes = (case.head_size * case.turboquant_bits + 7) // 8
         key_tokens = k_bhls[0].transpose(0, 1).reshape(new_kv_len, case.num_kv_heads * case.head_size).contiguous()
-        value_tokens = v_bhls[0].transpose(0, 1).reshape(new_kv_len, case.num_kv_heads * case.head_size).contiguous()
-        _k_cache_updated, _ = updater(
-            key_tokens,
-            value_tokens,
-            key_cache_logical,
-            value_cache_dummy,
-            [0],
-            [0, new_kv_len],
-            list(range(total_blk_num)),
-            [0, total_blk_num],
-            n_repeats=1,
-        )
-        k_cache = _k_cache_updated
+        k_quant = tq.quantize(key_tokens)
 
-        # Build rotated-domain key reference directly from packed cache bytes.
-        k_packed_region = k_cache[:, :, : case.block_size * k_packed_bytes].reshape(
+        k_idx = k_quant["idx"].reshape(new_kv_len, case.num_kv_heads, case.head_size)
+        k_norms = k_quant["norms"].reshape(new_kv_len, case.num_kv_heads)
+
+        k_idx_blocks = k_idx.reshape(total_blk_num, case.block_size, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
+        k_norms_blocks = k_norms.reshape(total_blk_num, case.block_size, case.num_kv_heads).transpose(1, 2).contiguous()
+
+        k_packed_region = torch.zeros(
             total_blk_num,
             case.num_kv_heads,
             case.block_size,
             k_packed_bytes,
+            dtype=torch.uint8,
         )
-        idx = torch.empty(
+        k_packed_region[..., : case.head_size // 2] = (
+            (k_idx_blocks[..., 0::2] & 0x0F) | ((k_idx_blocks[..., 1::2] & 0x0F) << 4)
+        )
+
+        k_cache = torch.concat(
+            (
+                k_packed_region.reshape(total_blk_num, case.num_kv_heads, case.block_size * k_packed_bytes),
+                k_norms_blocks.unsqueeze(-1).to(torch.float16).view(torch.uint8).reshape(
+                    total_blk_num,
+                    case.num_kv_heads,
+                    case.block_size * 2,
+                ),
+            ),
+            dim=-1,
+        )
+
+        k_ref_blocks = tq.dequantize(k_quant).reshape(
             total_blk_num,
-            case.num_kv_heads,
             case.block_size,
+            case.num_kv_heads,
             case.head_size,
-            dtype=torch.long,
-        )
-        idx[:, :, :, 0::2] = (k_packed_region & 0x0F).reshape(total_blk_num, case.num_kv_heads, case.block_size, case.head_size // 2).long()
-        idx[:, :, :, 1::2] = (k_packed_region >> 4).reshape(total_blk_num, case.num_kv_heads, case.block_size, case.head_size // 2).long()
-
-        k_norms = (
-            k_cache[:, :, case.block_size * k_packed_bytes : case.block_size * (k_packed_bytes + 2)]
-            .view(torch.float16)
-            .reshape(total_blk_num, case.num_kv_heads, case.block_size, 1)
-            .float()
-        )
-        k_ref_blocks = (tq_ref.centroids[idx] * k_norms).to(torch.float16)
-
-        # Reference attention is computed in rotated query/key domain.
-        q_rot_blhs = torch.matmul(q_blhs.float(), tq_ref.Q_T.float()).to(torch.float16)
+        ).transpose(1, 2).contiguous()
 
         # Value path follows by-token uint8 cache (+ fp16 scale/zp metadata).
         v_cache = _quant_per_token(v_blocks)
@@ -594,23 +571,8 @@ def _build_single_subsequence_inputs(case: DecodingCase):
         k_ref_blocks = k_blocks
         v_ref_blocks = v_blocks
 
-    block_indices = torch.randperm(total_blk_num, dtype=torch.int32)
-    if case.turboquant_enabled:
-        key_cache = torch.empty_like(k_cache)
-        value_cache = torch.empty_like(v_cache)
-        key_cache[block_indices.to(dtype=torch.long)] = k_cache
-        value_cache[block_indices.to(dtype=torch.long)] = v_cache
-    else:
-        key_cache = torch.empty_like(k_cache)
-        value_cache = torch.empty_like(v_cache)
-        key_cache[block_indices.to(dtype=torch.long)] = k_cache
-        value_cache[block_indices.to(dtype=torch.long)] = v_cache
-
     # Reference in logical order.
     q_ref_bhls = q_bhls
-    if case.turboquant_enabled:
-        q_ref_bhls = q_rot_blhs.transpose(1, 2).contiguous()
-
     k_ref_bhls = k_ref_blocks.transpose(1, 2).reshape(batch, new_kv_len, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
     v_ref_bhls = v_ref_blocks.transpose(1, 2).reshape(batch, new_kv_len, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
 
@@ -623,6 +585,14 @@ def _build_single_subsequence_inputs(case: DecodingCase):
         dropout_p=0.0,
         enable_gqa=(case.num_heads > case.num_kv_heads),
     ).transpose(1, 2).contiguous()
+
+
+    # shuffle k/v cache to test block index remapping logic.
+    block_indices = torch.randperm(total_blk_num, dtype=torch.int32)
+    key_cache = torch.empty_like(k_cache)
+    value_cache = torch.empty_like(v_cache)
+    key_cache[block_indices.to(dtype=torch.long)] = k_cache
+    value_cache[block_indices.to(dtype=torch.long)] = v_cache
 
     past_lens = torch.tensor([case.kv_len - 1], dtype=torch.int32)
     block_indices_begins = torch.tensor([0, total_blk_num], dtype=torch.int32)
