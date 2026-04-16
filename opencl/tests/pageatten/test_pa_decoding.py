@@ -163,7 +163,7 @@ class PaSingleTokenRunner:
 
         self.k_partition_block_num = 1
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
-        self.reduce_split_step = 8
+        self.reduce_split_step = 16 if head_size >= 256 else 8
 
         max_repeat_count = 8
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads

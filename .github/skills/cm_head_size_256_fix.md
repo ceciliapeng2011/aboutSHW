@@ -32,34 +32,58 @@ Near-perfect scaling: 2x data with roughly the same bandwidth. No regression.
 
 ## test_pa_decoding.py (pa_single_token.cm: cm_sdpa_2nd + cm_sdpa_2nd_reduce)
 
-**Problem:** None for compilation. The single-token decoding kernel uses RepeatCount=1 and Q_head_chunk_size (derived from num_heads/num_kv_heads, max 8). With Q_head_chunk_size=4, HEAD_SIZE=256: Omat = 4 * (256/16*2) * (8*16) * 4 = 4*32*128*4 bytes per row-group, but each row of `Omat` is only `REG_M*REG_N*4 = 512 bytes`, and row count is `Q_head_chunk_size * head_size/REG_N * num_P_tiles = 4*16*2 = 128`. Total = 128 * 512 = 65536. Actually this kernel uses a different layout with smaller per-element matrices that stay under 16384 bytes.
+**Problem:** No compilation error, but severe u8 performance regression. The `#pragma unroll` on the V inner loop (`for k=0; k<HEAD_SIZE; k+=REG_N`) fully unrolls 16 iterations for hs256 (vs 8 for hs128), keeping all iterations' VmatNormal/Vmat/Vt_quant registers live simultaneously. This causes 2368-byte spill in the u8 path (256 registers saturated). Additionally, `reduce_split_step=8` causes `REDUCE_SPLIT_SIZE=32` for hs256, dispatching 2x more reduce workitems than hs128.
 
-**Fix:** Added accuracy test cases only (no kernel changes):
-```python
-DecodingCase(head_size=256, kv_len=513, kv_cache_compression=False),
-DecodingCase(head_size=256, kv_len=513, kv_cache_compression=True, kv_cache_quant_mode="by_token"),
-DecodingCase(head_size=256, kv_len=513, kv_cache_compression=True, kv_cache_quant_mode="by_channel"),
-```
-All 7 functional tests pass. Added perf benchmark extension in the `test_pa_perf_bandwidth_generate_single_subsequence_default_params` test (gated by `RUN_PA_PERF=1`).
+**Fix (two changes):**
+1. **pa_single_token.cm line 469:** Conditionally remove `#pragma unroll` from V inner loop for `HEAD_SIZE > 128`:
+   ```cpp
+   #if HEAD_SIZE <= 128
+   #pragma unroll
+   #endif
+   ```
+   This lets the compiler use a runtime loop for hs256, reducing register live ranges from 16 iterations to 1. Eliminates the 2368-byte spill entirely. u8/by_token registers drop from 256 to 175.
+
+2. **test_pa_decoding.py line 166:** Increase `reduce_split_step` to 16 for hs256:
+   ```python
+   self.reduce_split_step = 16 if head_size >= 256 else 8
+   ```
+   This keeps `REDUCE_SPLIT_SIZE=16` (same as hs128), halving GWS_2 dispatch from 32 to 16 workitems.
+
+All 7 functional tests pass (4 hs128 + 3 hs256). Added perf benchmark extension in the `test_pa_perf_bandwidth_generate_single_subsequence_default_params` test (gated by `RUN_PA_PERF=1`).
 
 **Performance (memory-bound, kv_len=32769, 32 heads, 8 kv_heads):**
 
-| Config | sdpa_2nd BW (GB/s) | reduce BW (GB/s) | sdpa_2nd (ms) | reduce (ms) |
-|--------|--------------------|------------------|---------------|-------------|
-| hs128, fp16 | 47.47 | 29.16 | 2.850 | 0.073 |
-| hs128, u8/by_token | 94.01 | 40.06 | 0.719 | 0.053 |
-| hs128, u8/by_channel | 91.38 | 36.57 | 0.740 | 0.058 |
-| hs256, fp16 | 91.42 | 34.60 | 2.959 | 0.123 |
-| hs256, u8/by_token | 38.84 | 30.81 | 3.483 | 0.138 |
-| hs256, u8/by_channel | 52.21 | 34.38 | 2.591 | 0.123 |
+*Before optimization:*
 
-- **hs256 fp16** scales excellently: 91 GB/s (nearly 2x of hs128's 47 GB/s), only +4% latency for 2x data. Wider reads amortize per-dispatch overhead.
-- **hs256 u8/by_token** regresses badly: 38.84 GB/s (vs 94 for hs128). Per-token dequant (scale/zp applied across 256 elements) creates register pressure; the 2368-byte spill confirms this.
-- **hs256 u8/by_channel** is middling: 52 GB/s. Per-channel quant distributes scale/zp across tokens, less sensitive to wider head_size.
+| Config | sdpa_2nd BW (GB/s) | reduce BW (GB/s) | sdpa_2nd (ms) | reduce (ms) | Spill |
+|--------|--------------------|------------------|---------------|-------------|-------|
+| hs128, fp16 | 105 | 40 | 1.28 | 0.054 | 0 |
+| hs128, u8/by_token | 97 | 39 | 0.70 | 0.055 | 0 |
+| hs128, u8/by_channel | 97 | 39 | 0.70 | 0.055 | 0 |
+| hs256, fp16 | 105 | 39 | 2.58 | 0.108 | 0 |
+| hs256, u8/by_token | 58 | 41 | 2.32 | 0.103 | **2368 B** |
+| hs256, u8/by_channel | 54 | 41 | 2.51 | 0.104 | **2368 B** |
+
+*After optimization:*
+
+| Config | sdpa_2nd BW (GB/s) | reduce BW (GB/s) | sdpa_2nd (ms) | reduce (ms) | Spill |
+|--------|--------------------|------------------|---------------|-------------|-------|
+| hs128, fp16 | 105 | 40 | 1.28 | 0.054 | 0 |
+| hs128, u8/by_token | 97 | 39 | 0.70 | 0.055 | 0 |
+| hs128, u8/by_channel | 97 | 39 | 0.70 | 0.055 | 0 |
+| hs256, fp16 | 105 | **62** | 2.59 | **0.069** | 0 |
+| hs256, u8/by_token | **101** | **63** | **1.34** | **0.068** | **0** |
+| hs256, u8/by_channel | **101** | **64** | **1.34** | **0.067** | **0** |
+
+**End-to-end improvement (sdpa_2nd + reduce total):**
+- **hs256 fp16:** 2.689 -> 2.655 ms (-1.3%, reduce-only gain)
+- **hs256 u8/by_token:** 2.424 -> 1.410 ms (**-42%**)
+- **hs256 u8/by_channel:** 2.614 -> 1.408 ms (**-46%**)
+- **hs128:** zero regression across all configs
 
 **Suggestion:**
-- Investigate u8/by_token dequantization loop for hs256: the inner loop processes 256 elements per token with a single scale/zp pair, likely causing register spills in the dequant-transpose pipeline. Consider tiling the dequant in head_size/2 chunks.
-- The reduce kernel at hs256 dispatches `head_size // reduce_split_step = 32` workitems (vs 16 for hs128). This is fine functionally but contributes +70% to reduce latency (0.123 vs 0.073 ms). Could increase `reduce_split_step` to 16 for hs256 to keep GWS_2 the same.
+- The fp16 path (no dequant) is already optimal — 105 GB/s matches hs128's bandwidth ceiling on LNL.
+- For further u8 gains, consider applying the same no-unroll technique to the K dequant loop (lines 231-236 in pa_single_token.cm) which also iterates HEAD_SIZE/REG_K times with `#pragma unroll`.
 
 ---
 
