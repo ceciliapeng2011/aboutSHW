@@ -10,3 +10,8 @@ a.out
 *.asm
 *.visaasm
 *.dat
+
+.github
+.vscode
+ocl.venv
+.venv
