@@ -11,7 +11,6 @@ a.out
 *.visaasm
 *.dat
 
-.github
 .vscode
 ocl.venv
 .venv

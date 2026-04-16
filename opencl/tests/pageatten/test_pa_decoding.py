@@ -422,6 +422,9 @@ GENERATE_ONLY_SINGLE_SUBSEQ_CASES = (
     DecodingCase(kv_len=1025, kv_cache_compression=True, kv_cache_quant_mode="by_token"),
     DecodingCase(kv_len=1025, kv_cache_compression=True, kv_cache_quant_mode="by_channel"),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=False),
+    DecodingCase(head_size=256, kv_len=513, kv_cache_compression=False),
+    DecodingCase(head_size=256, kv_len=513, kv_cache_compression=True, kv_cache_quant_mode="by_token"),
+    DecodingCase(head_size=256, kv_len=513, kv_cache_compression=True, kv_cache_quant_mode="by_channel"),
 )
 
 
@@ -607,4 +610,27 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
 
     assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
     assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
+
+    # HEAD_SIZE=256 bandwidth benchmark — compare against head_size=128
+    for hs, compress, qm in [(128, True, "by_token"), (128, True, "by_channel"),
+                              (256, False, "by_token"), (256, True, "by_token"), (256, True, "by_channel")]:
+        case_cmp = DecodingCase(
+            num_heads=32,
+            num_kv_heads=8,
+            head_size=hs,
+            block_size=256,
+            kv_len=32769,
+            kv_cache_compression=compress,
+            kv_cache_quant_mode=qm,
+        )
+        perf_cmp = _run_bandwidth_measurement(case_cmp, loop_cnt=50, warmup=5)
+        tag = f"hs{hs}_{'u8' if compress else 'f16'}_{qm}"
+        print(
+            f"[perf][{tag}] "
+            f"cm_sdpa_2nd_bw={perf_cmp['cm_sdpa_2nd_bw_gbs']:.3f} GB/s, "
+            f"cm_sdpa_2nd_reduce_bw={perf_cmp['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s, "
+            f"cm_sdpa_2nd_ms={perf_cmp['cm_sdpa_2nd_ms']:.3f}, "
+            f"cm_sdpa_2nd_reduce_ms={perf_cmp['cm_sdpa_2nd_reduce_ms']:.3f}"
+        )
+        assert perf_cmp["cm_sdpa_2nd_bw_gbs"] > 0.0
 
