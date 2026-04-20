@@ -1,18 +1,14 @@
-/*******************************************************************************
- * Copyright (c) 2018-2026 Intel Corporation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *******************************************************************************/
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#ifndef KV_CACHE_COMPRESSION
+#if defined(USE_INT8)
+#define KV_CACHE_COMPRESSION (USE_INT8 ? 1 : 0)
+#else
+#define KV_CACHE_COMPRESSION 0
+#endif
+#endif
 
 // namespace KERNEL_NAME {
 #include "estimate.hpp"
@@ -94,7 +90,7 @@ extern "C" _GENX_MAIN_ void gemm_qk(
 
     #ifdef CM_HAS_LSC_UNTYPED_2D
     // key cache: [block, HQ, KV_BLOCK_SIZE, HEAD_SIZE_KEY]
-#if USE_INT8
+#if KV_CACHE_COMPRESSION
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
 #else
     key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
