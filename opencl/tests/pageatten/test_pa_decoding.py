@@ -8,14 +8,18 @@ import torch
 import torch.nn.functional as F
 
 from clops import cl
+from kv_cache_quant_utils import (
+    DEFAULT_SUB_BLOCK_SIZE,
+    dequant_per_channel as _dequant_per_channel,
+    dequant_per_token as _dequant_per_token,
+    quant_per_channel as _quant_per_channel,
+    quant_per_token as _quant_per_token,
+)
 
 
 cl.profiling(True)
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
-
-DEFAULT_SUB_BLOCK_SIZE = 16
-
 
 def get_cm_grf_width() -> int:
     cm_kernels = cl.kernels(
@@ -41,116 +45,6 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-
         f"actual={actual[bad]}\n"
         f"expected={expected[bad]}"
     )
-
-
-def _quant_per_token(kv: torch.Tensor) -> torch.Tensor:
-    blk_num, kv_heads, blk_size, head_size = kv.shape
-    kv_max = kv.amax(dim=3, keepdim=True)
-    kv_min = kv.amin(dim=3, keepdim=True)
-    qrange = kv_max - kv_min
-
-    intmax = 255.0
-    intmin = 0.0
-    intrange = intmax - intmin
-
-    kv_scale = torch.zeros(blk_num, kv_heads, blk_size, 1, dtype=torch.float16)
-    kv_scale[qrange != 0] = (intrange / qrange[qrange != 0]).to(dtype=torch.float16)
-    kv_zp = ((0.0 - kv_min) * kv_scale + intmin).to(dtype=torch.float16)
-
-    kv_u8 = torch.round(kv * kv_scale + kv_zp).clamp(intmin, intmax).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-
-    dq_scale = torch.zeros(blk_num, kv_heads, blk_size, 1, dtype=torch.float16)
-    dq_scale[kv_scale != 0] = (1.0 / kv_scale[kv_scale != 0]).to(dtype=torch.float16)
-    dq_scale_u8 = dq_scale.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    kv_zp_u8 = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-
-    return torch.concat((kv_u8, dq_scale_u8, kv_zp_u8), dim=-1)
-
-
-def _dequant_per_token(kv: torch.Tensor, head_size: int, blk_size: int) -> torch.Tensor:
-    blk_num, kv_head_num, _ = kv.shape
-    kv_u8 = kv[:, :, : head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-    kv_scale = kv[:, :, head_size * blk_size : (head_size * blk_size + blk_size * 2)].view(dtype=torch.float16).reshape(
-        blk_num,
-        kv_head_num,
-        blk_size,
-        1,
-    )
-    kv_zp = kv[:, :, (head_size * blk_size + blk_size * 2) : (head_size * blk_size + blk_size * 4)].view(
-        dtype=torch.float16
-    ).reshape(
-        blk_num,
-        kv_head_num,
-        blk_size,
-        1,
-    )
-    return (kv_u8 - kv_zp) * kv_scale
-
-
-def _quant_per_channel(kv: torch.Tensor, sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE) -> torch.Tensor:
-    blk_num, kv_heads, blk_size, head_size = kv.shape
-    if blk_size % sub_block_size != 0:
-        raise ValueError(f"blk_size ({blk_size}) must be divisible by sub_block_size ({sub_block_size})")
-
-    num_sub_blocks = blk_size // sub_block_size
-    kv_sub = kv.reshape(blk_num, kv_heads, num_sub_blocks, sub_block_size, head_size)
-
-    kv_max = kv_sub.amax(dim=3, keepdim=True)
-    kv_min = kv_sub.amin(dim=3, keepdim=True)
-    qrange = kv_max - kv_min
-
-    intmax = 255.0
-    intmin = 0.0
-    intrange = intmax - intmin
-
-    kv_scale = torch.zeros(blk_num, kv_heads, num_sub_blocks, 1, head_size, dtype=torch.float16)
-    kv_scale[qrange != 0] = (intrange / qrange[qrange != 0]).to(dtype=torch.float16)
-    kv_zp = ((0.0 - kv_min) * kv_scale + intmin).to(dtype=torch.float16)
-
-    kv_u8 = torch.round(kv_sub * kv_scale + kv_zp).clamp(intmin, intmax).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-
-    dq_scale = torch.zeros(blk_num, kv_heads, num_sub_blocks, 1, head_size, dtype=torch.float16)
-    dq_scale[kv_scale != 0] = (1.0 / kv_scale[kv_scale != 0]).to(dtype=torch.float16)
-    dq_scale_u8 = dq_scale.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    kv_zp_u8 = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-
-    return torch.concat((kv_u8, dq_scale_u8, kv_zp_u8), dim=-1)
-
-
-def _dequant_per_channel(
-    kv: torch.Tensor,
-    head_size: int,
-    blk_size: int,
-    sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
-) -> torch.Tensor:
-    blk_num, kv_head_num, _ = kv.shape
-    if blk_size % sub_block_size != 0:
-        raise ValueError(f"blk_size ({blk_size}) must be divisible by sub_block_size ({sub_block_size})")
-
-    num_sub_blocks = blk_size // sub_block_size
-    quantized_bytes = head_size * blk_size
-    metadata_bytes = num_sub_blocks * head_size * 2
-
-    kv_u8 = kv[:, :, : head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-    kv_scale = kv[:, :, quantized_bytes : (quantized_bytes + metadata_bytes)].view(dtype=torch.float16).reshape(
-        blk_num,
-        kv_head_num,
-        num_sub_blocks,
-        1,
-        head_size,
-    )
-    kv_zp = kv[:, :, (quantized_bytes + metadata_bytes) : (quantized_bytes + metadata_bytes * 2)].view(
-        dtype=torch.float16
-    ).reshape(
-        blk_num,
-        kv_head_num,
-        num_sub_blocks,
-        1,
-        head_size,
-    )
-
-    kv_u8 = kv_u8.reshape(blk_num, kv_head_num, num_sub_blocks, sub_block_size, head_size)
-    return ((kv_u8 - kv_zp) * kv_scale).reshape(blk_num, kv_head_num, blk_size, head_size)
 
 
 @dataclass(frozen=True)

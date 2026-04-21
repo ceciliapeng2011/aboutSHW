@@ -14,6 +14,13 @@ import sys
 from flashattn import get_flash0
 from check_density import paired_adjacent_row_diff_pct, load_ov_model_block_mask, verify_block_mask_integrity
 from generate_block_mask import generate_block_mask_with_ratio, count_false_percentage
+from kv_cache_quant_utils import (
+    DEFAULT_SUB_BLOCK_SIZE,
+    dequant_per_channel,
+    dequant_per_token,
+    quant_per_channel as quan_per_channel,
+    quant_per_token as quan_per_token,
+)
 
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
@@ -34,9 +41,6 @@ else:
 KV_CACHE_COMPRESSION_NONE = 0
 KV_CACHE_COMPRESSION_BY_TOKEN = 1
 KV_CACHE_COMPRESSION_BY_CHANNEL = 2
-DEFAULT_SUB_BLOCK_SIZE = 16
-
-
 def normalize_kv_cache_compression(mode):
     if isinstance(mode, bool):
         return KV_CACHE_COMPRESSION_BY_TOKEN if mode else KV_CACHE_COMPRESSION_NONE
@@ -64,89 +68,6 @@ def get_v_cache_layout(head_size, block_sz, compression_mode):
         return block_sz, head_size + 4
     return block_sz, head_size
 
-
-def quan_per_channel(kv, sub_blk_size=DEFAULT_SUB_BLOCK_SIZE):
-    blk_num, kv_heads, blk_size, head_size = kv.shape
-    assert blk_size % sub_blk_size == 0, f"blk_size ({blk_size}) must be divisible by sub_blk_size ({sub_blk_size})"
-
-    num_sub_blks = blk_size // sub_blk_size
-    kv_sub = kv.reshape(blk_num, kv_heads, num_sub_blks, sub_blk_size, head_size)
-
-    kv_max = kv_sub.amax(dim=3, keepdim=True)
-    kv_min = kv_sub.amin(dim=3, keepdim=True)
-    qrange = kv_max - kv_min
-
-    intmax = 255.0
-    intmin = 0.0
-    intrange = intmax - intmin
-
-    kv_scale = (intrange / (qrange + 1e-6)).to(dtype=torch.half)
-    kv_zp = ((0.0 - kv_min) * kv_scale + intmin).to(dtype=torch.half)
-
-    kv_u8 = torch.round(kv_sub * kv_scale + kv_zp).to(dtype=torch.uint8)
-    kv_u8_flat = kv_u8.reshape(blk_num, kv_heads, -1)
-    dq_scale_bytes = (1.0 / kv_scale).view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    kv_zp_bytes = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-    return torch.concat((kv_u8_flat, dq_scale_bytes, kv_zp_bytes), dim=-1)
-
-
-def dequant_per_channel(kv, head_size, blk_size, sub_blk_size=DEFAULT_SUB_BLOCK_SIZE):
-    blk_num, kv_head_num, _ = kv.shape
-    assert blk_size % sub_blk_size == 0, f"blk_size ({blk_size}) must be divisible by sub_blk_size ({sub_blk_size})"
-
-    num_sub_blks = blk_size // sub_blk_size
-    quantized_bytes = blk_size * head_size
-    metadata_bytes = num_sub_blks * head_size * 2
-
-    kv_u8 = kv[:, :, :quantized_bytes].reshape(blk_num, kv_head_num, num_sub_blks, sub_blk_size, head_size).to(dtype=torch.float16)
-    kv_scale = kv[:, :, quantized_bytes:quantized_bytes + metadata_bytes].view(dtype=torch.float16).reshape(blk_num, kv_head_num, num_sub_blks, 1, head_size)
-    kv_zp = kv[:, :, quantized_bytes + metadata_bytes:quantized_bytes + 2 * metadata_bytes].view(dtype=torch.float16).reshape(blk_num, kv_head_num, num_sub_blks, 1, head_size)
-
-    kv_dequant = (kv_u8 - kv_zp) * kv_scale
-    return kv_dequant.reshape(blk_num, kv_head_num, blk_size, head_size)
-
-def quan_per_token(kv):
-    blk_num, kv_heads, blksz, *_ = kv.shape
-    kv_max = kv.amax(dim=-1, keepdim = True)
-    kv_min = kv.amin(dim=-1, keepdim = True)
-    qrange = kv_max - kv_min
-
-    INTMAX = 255.0
-    INTMIN = 0.0
-    INTRAGNE = INTMAX - INTMIN
-    kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
-    kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
-    #round half to even
-    kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    # print("################################################################################")
-    # print(f'KV\n:{kv.reshape(64, 16)}')
-    # print(f'kv_INT8\n:{kv_INT8.reshape(64, 16)}')
-    # print(f'kv_scale\n:{kv_scale.reshape( 1, 64)}')
-    # print(f'kv_zp\n:{kv_zp.reshape( 1, 64)}')
-    # print("################################################################################")
-
-    dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
-
-def dequant_per_token(kv, head_size, blk_size):
-    blk_num, kv_head_num, _ = kv.shape
-    kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-    kv_scale = kv[:,:,head_size * blk_size:head_size * blk_size + blk_size * 2].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-    kv_zp = kv[:,:,head_size * blk_size + blk_size * 2:head_size * blk_size + blk_size * 4].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-
-    # print("dequant_kv_u8 = ", kv_u8)
-    # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
-    # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
-
-    kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
-
-    for m in range(blk_num):
-        for n in range(kv_head_num):
-            for i in range(blk_size):
-                kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
-
-    return kv_dequant
 
 def ALIGN_UP(x, y):
     return (x + y -1) // y * y
