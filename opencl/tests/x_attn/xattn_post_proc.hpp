@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2022-2025 Intel Corporation
+ * Copyright (c) 2018-2026 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
+
+namespace KERNEL_NAME {
 #include <cm/cm.h>
 #include <cm/cmtl.h>
 
-#if defined(SHIM) || defined(CMRT_EMU)
-#define ATTR
-#define ATTR_BUF
-#define CM_LOCAL_BARRIER 0x20
-#include "emu/block2d.h"
-#else
+#ifndef ATTR
 #define ATTR [[type("svmptr_t")]]
 #define ATTR_BUF [[type("buffer_t")]]
 #endif
@@ -74,3 +71,4 @@ extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t me
     }
 }
 
+}  // NAMESPACE

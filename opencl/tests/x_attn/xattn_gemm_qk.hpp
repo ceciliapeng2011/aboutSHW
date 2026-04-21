@@ -1,16 +1,20 @@
-// Copyright (C) 2018-2026 Intel Corporation
-// SPDX-License-Identifier: Apache-2.0
-//
+/*******************************************************************************
+ * Copyright (c) 2018-2026 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
 
-#ifndef KV_CACHE_COMPRESSION
-#if defined(USE_INT8)
-#define KV_CACHE_COMPRESSION (USE_INT8 ? 1 : 0)
-#else
-#define KV_CACHE_COMPRESSION 0
-#endif
-#endif
-
-// namespace KERNEL_NAME {
+namespace KERNEL_NAME {
 #include "estimate.hpp"
 
 #define ABS(x) (x) < 0 ? -(x) : (x)
@@ -114,15 +118,10 @@ extern "C" _GENX_MAIN_ void gemm_qk(
     kq_exp_partial_sum += offset_partial_sum;
     #endif
 
-// #define CONCAT_IMPL(a, b) KERNEL_NAME::gemm_qk
-// #define CONCAT(x, y) CONCAT_IMPL(x, y)
-// #define FUNC CONCAT(BLOCK_SG_M, BLOCK_SG_N)
-//     FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
-
-#define CONCAT_IMPL(a, b) gemm_qk_ ##a ##x ##b ##_xe2
+#define CONCAT_IMPL(a, b) KERNEL_NAME::gemm_qk
 #define CONCAT(x, y) CONCAT_IMPL(x, y)
 #define FUNC CONCAT(BLOCK_SG_M, BLOCK_SG_N)
-    gemm_qk(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
+    FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_indices_begins, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
 }
 
-// }  // NAMESPACE
+}  // NAMESPACE
