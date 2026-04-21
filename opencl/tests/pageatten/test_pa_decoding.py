@@ -14,6 +14,8 @@ cl.profiling(True)
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=1024)
 
+DEFAULT_SUB_BLOCK_SIZE = 16
+
 
 def get_cm_grf_width() -> int:
     cm_kernels = cl.kernels(
@@ -85,23 +87,29 @@ def _dequant_per_token(kv: torch.Tensor, head_size: int, blk_size: int) -> torch
     return (kv_u8 - kv_zp) * kv_scale
 
 
-def _quant_per_channel(kv: torch.Tensor) -> torch.Tensor:
+def _quant_per_channel(kv: torch.Tensor, sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE) -> torch.Tensor:
     blk_num, kv_heads, blk_size, head_size = kv.shape
-    kv_max = kv.amax(dim=2, keepdim=True)
-    kv_min = kv.amin(dim=2, keepdim=True)
+    if blk_size % sub_block_size != 0:
+        raise ValueError(f"blk_size ({blk_size}) must be divisible by sub_block_size ({sub_block_size})")
+
+    num_sub_blocks = blk_size // sub_block_size
+    kv_sub = kv.reshape(blk_num, kv_heads, num_sub_blocks, sub_block_size, head_size)
+
+    kv_max = kv_sub.amax(dim=3, keepdim=True)
+    kv_min = kv_sub.amin(dim=3, keepdim=True)
     qrange = kv_max - kv_min
 
     intmax = 255.0
     intmin = 0.0
     intrange = intmax - intmin
 
-    kv_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
+    kv_scale = torch.zeros(blk_num, kv_heads, num_sub_blocks, 1, head_size, dtype=torch.float16)
     kv_scale[qrange != 0] = (intrange / qrange[qrange != 0]).to(dtype=torch.float16)
     kv_zp = ((0.0 - kv_min) * kv_scale + intmin).to(dtype=torch.float16)
 
-    kv_u8 = torch.round(kv * kv_scale + kv_zp).clamp(intmin, intmax).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
+    kv_u8 = torch.round(kv_sub * kv_scale + kv_zp).clamp(intmin, intmax).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
 
-    dq_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
+    dq_scale = torch.zeros(blk_num, kv_heads, num_sub_blocks, 1, head_size, dtype=torch.float16)
     dq_scale[kv_scale != 0] = (1.0 / kv_scale[kv_scale != 0]).to(dtype=torch.float16)
     dq_scale_u8 = dq_scale.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
     kv_zp_u8 = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
@@ -109,24 +117,40 @@ def _quant_per_channel(kv: torch.Tensor) -> torch.Tensor:
     return torch.concat((kv_u8, dq_scale_u8, kv_zp_u8), dim=-1)
 
 
-def _dequant_per_channel(kv: torch.Tensor, head_size: int, blk_size: int) -> torch.Tensor:
+def _dequant_per_channel(
+    kv: torch.Tensor,
+    head_size: int,
+    blk_size: int,
+    sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
+) -> torch.Tensor:
     blk_num, kv_head_num, _ = kv.shape
+    if blk_size % sub_block_size != 0:
+        raise ValueError(f"blk_size ({blk_size}) must be divisible by sub_block_size ({sub_block_size})")
+
+    num_sub_blocks = blk_size // sub_block_size
+    quantized_bytes = head_size * blk_size
+    metadata_bytes = num_sub_blocks * head_size * 2
+
     kv_u8 = kv[:, :, : head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-    kv_scale = kv[:, :, head_size * blk_size : (head_size * blk_size + head_size * 2)].view(dtype=torch.float16).reshape(
+    kv_scale = kv[:, :, quantized_bytes : (quantized_bytes + metadata_bytes)].view(dtype=torch.float16).reshape(
         blk_num,
         kv_head_num,
+        num_sub_blocks,
         1,
         head_size,
     )
-    kv_zp = kv[:, :, (head_size * blk_size + head_size * 2) : (head_size * blk_size + head_size * 4)].view(
+    kv_zp = kv[:, :, (quantized_bytes + metadata_bytes) : (quantized_bytes + metadata_bytes * 2)].view(
         dtype=torch.float16
     ).reshape(
         blk_num,
         kv_head_num,
+        num_sub_blocks,
         1,
         head_size,
     )
-    return (kv_u8 - kv_zp) * kv_scale
+
+    kv_u8 = kv_u8.reshape(blk_num, kv_head_num, num_sub_blocks, sub_block_size, head_size)
+    return ((kv_u8 - kv_zp) * kv_scale).reshape(blk_num, kv_head_num, blk_size, head_size)
 
 
 @dataclass(frozen=True)
@@ -135,9 +159,9 @@ class DecodingCase:
     num_kv_heads: int = 8
     head_size: int = 128
     block_size: int = 256
+    sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE
     kv_len: int = 4097
-    kv_cache_compression: bool = False
-    kv_cache_quant_mode: str = "by_token"
+    kv_cache_compression: int = 0
 
 
 class PaSingleTokenRunner:
@@ -147,15 +171,20 @@ class PaSingleTokenRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
-        kv_cache_quant_mode: str,
+        sub_block_size: int,
+        kv_cache_compression: int,
     ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.block_size = block_size
+        self.sub_block_size = sub_block_size
         self.kv_cache_compression = kv_cache_compression
-        self.kv_cache_quant_mode = kv_cache_quant_mode
+
+        if self.block_size % self.sub_block_size != 0:
+            raise ValueError(
+                f"block_size ({self.block_size}) must be divisible by sub_block_size ({self.sub_block_size})"
+            )
 
         self.cm_grf_width = get_cm_grf_width()
         self.xe_arch = 1 if self.cm_grf_width == 256 else 2
@@ -178,16 +207,16 @@ class PaSingleTokenRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
-        kv_cache_quant_mode: str,
+        sub_block_size: int,
+        kv_cache_compression: int,
     ):
         return PaSingleTokenRunner(
             num_heads,
             num_kv_heads,
             head_size,
             block_size,
+            sub_block_size,
             kv_cache_compression,
-            kv_cache_quant_mode,
         )
 
     @staticmethod
@@ -198,17 +227,22 @@ class PaSingleTokenRunner:
         head_size: int,
         kv_step: int,
         block_size: int,
+        sub_block_size: int,
         kv_partition_size: int,
         reduce_split_step: int,
         clean_unused_kvcache: int,
         kv_cache_compression: int,
-        kv_cache_compression_by_token: int,
         xe_arch: int,
         q_head_chunks_per_kv_head: int,
         q_head_chunk_size: int,
         scale_factor: float,
     ):
-        src = r'''#include "pa_single_token.cm"'''
+        src = "\n".join(
+            [
+                '#include "pa_single_token.cm"',
+                '#include "pa_single_token_finalization.cm"',
+            ]
+        )
         cwd = os.path.dirname(os.path.realpath(__file__))
         return cl.kernels(
             src,
@@ -221,7 +255,7 @@ class PaSingleTokenRunner:
                         -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
                         -DCLEAN_UNUSED_KVCACHE={clean_unused_kvcache}
                         -DKV_CACHE_COMPRESSION={kv_cache_compression}
-                        -DKV_CACHE_COMPRESSION_BY_TOKEN={kv_cache_compression_by_token}
+                        -DSUB_BLOCK_SIZE={sub_block_size}
                         -DXE_ARCH={xe_arch}
                         -DQ_head_chunks_per_kv_head={q_head_chunks_per_kv_head}
                         -DQ_head_chunk_size={q_head_chunk_size}
@@ -235,11 +269,11 @@ class PaSingleTokenRunner:
             self.head_size,
             self.kv_step,
             self.block_size,
+            self.sub_block_size,
             self.kv_partition_size,
             self.reduce_split_step,
             1,
-            int(self.kv_cache_compression),
-            int(self.kv_cache_quant_mode == "by_token"),
+            self.kv_cache_compression,
             self.xe_arch,
             int(self.q_head_chunks_per_kv_head),
             int(self.q_head_chunk_size),
@@ -350,17 +384,14 @@ def _build_single_subsequence_inputs(case: DecodingCase):
     k_blocks = k_bhls[0].transpose(0, 1).reshape(total_blk_num, case.block_size, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
     v_blocks = v_bhls[0].transpose(0, 1).reshape(total_blk_num, case.block_size, case.num_kv_heads, case.head_size).transpose(1, 2).contiguous()
 
-    if case.kv_cache_compression:
-        if case.kv_cache_quant_mode == "by_token":
-            k_cache = _quant_per_token(k_blocks)
-            k_ref_blocks = _dequant_per_token(k_cache, case.head_size, case.block_size)
-        elif case.kv_cache_quant_mode == "by_channel":
-            k_cache = _quant_per_channel(k_blocks)
-            k_ref_blocks = _dequant_per_channel(k_cache, case.head_size, case.block_size)
-        else:
-            raise ValueError(f"Unsupported kv_cache_quant_mode={case.kv_cache_quant_mode}")
-
-        # value path supports per-token quantization in pa_2nd_token flow
+    if case.kv_cache_compression == 1:
+        k_cache = _quant_per_token(k_blocks)
+        k_ref_blocks = _dequant_per_token(k_cache, case.head_size, case.block_size)
+        v_cache = _quant_per_token(v_blocks)
+        v_ref_blocks = _dequant_per_token(v_cache, case.head_size, case.block_size)
+    elif case.kv_cache_compression == 2:
+        k_cache = _quant_per_channel(k_blocks, case.sub_block_size)
+        k_ref_blocks = _dequant_per_channel(k_cache, case.head_size, case.block_size, case.sub_block_size)
         v_cache = _quant_per_token(v_blocks)
         v_ref_blocks = _dequant_per_token(v_cache, case.head_size, case.block_size)
     else:
@@ -405,6 +436,8 @@ def _build_single_subsequence_inputs(case: DecodingCase):
     }
 
 
+_COMPRESSION_NAMES = {0: "fp16", 1: "by_token", 2: "by_channel"}
+
 def _case_id(case: DecodingCase) -> str:
     return (
         f"1x{case.kv_len}"
@@ -412,16 +445,21 @@ def _case_id(case: DecodingCase) -> str:
         f"_kv{case.num_kv_heads}"
         f"_hs{case.head_size}"
         f"_bls{case.block_size}"
-        f"_cmpr{int(case.kv_cache_compression)}"
-        f"_qm{case.kv_cache_quant_mode}"
+        f"_sbls{case.sub_block_size}"
+        f"_cmpr{_COMPRESSION_NAMES.get(case.kv_cache_compression, case.kv_cache_compression)}"
     )
 
 
 GENERATE_ONLY_SINGLE_SUBSEQ_CASES = (
-    DecodingCase(kv_len=129, kv_cache_compression=False, kv_cache_quant_mode="by_token"),
-    DecodingCase(kv_len=1025, kv_cache_compression=True, kv_cache_quant_mode="by_token"),
-    DecodingCase(kv_len=1025, kv_cache_compression=True, kv_cache_quant_mode="by_channel"),
-    DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=False),
+    DecodingCase(kv_len=129, kv_cache_compression=0),
+    DecodingCase(kv_len=129, kv_cache_compression=1),
+    DecodingCase(kv_len=129, kv_cache_compression=2),
+    DecodingCase(kv_len=1025, kv_cache_compression=0),
+    DecodingCase(kv_len=1025, kv_cache_compression=1),
+    DecodingCase(kv_len=1025, kv_cache_compression=2),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=0),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=1),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=2),
 )
 
 
@@ -434,8 +472,8 @@ def test_pa_smoke_paged_attention_generate_only(case: DecodingCase):
         case.num_kv_heads,
         case.head_size,
         case.block_size,
+        case.sub_block_size,
         case.kv_cache_compression,
-        case.kv_cache_quant_mode,
     )
 
     output = torch.empty([1, 1, case.num_heads, case.head_size], dtype=torch.float16)
@@ -452,7 +490,7 @@ def test_pa_smoke_paged_attention_generate_only(case: DecodingCase):
     )
 
     assert torch.isfinite(output).all().item()
-    tol = (2e-2, 2e-2) if case.kv_cache_compression else (1e-2, 1e-3)
+    tol = (2e-2, 2e-2) if case.kv_cache_compression > 0 else (1e-2, 1e-3)
     _check_close(output, data["expected"], atol=tol[0], rtol=tol[1])
 
 
@@ -463,8 +501,8 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
         case.num_kv_heads,
         case.head_size,
         case.block_size,
+        case.sub_block_size,
         case.kv_cache_compression,
-        case.kv_cache_quant_mode,
     )
     kernels = runner._create_kernels()
 
@@ -542,7 +580,7 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
 
     # Keep bandwidth size computation identical to pa_2nd_token.py (uses padded KV length).
     new_kv_len = int(key_cache.shape[0] * case.block_size)
-    if case.kv_cache_compression:
+    if case.kv_cache_compression > 0:
         kvcache_size = new_kv_len * case.num_kv_heads * case.head_size * 1 * 2
     else:
         kvcache_size = new_kv_len * case.num_kv_heads * case.head_size * 2 * 2
@@ -592,8 +630,7 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
         head_size=128,
         block_size=256,
         kv_len=32769,
-        kv_cache_compression=False,
-        kv_cache_quant_mode="by_token",
+        kv_cache_compression=0,
     )
     perf = _run_bandwidth_measurement(case, loop_cnt=100, warmup=5)
 
@@ -608,3 +645,8 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
     assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
     assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
 
+# Usage:
+#   python -m py_compile test_pa_decoding.py
+#   python -m pytest --collect-only -q test_pa_decoding.py
+#   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv
+#   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv -k 'generate_only and (cmprby_token or cmprby_channel)'

@@ -60,7 +60,7 @@ class pa_kvcache_update_cm:
                       f" -DADJUSTED_BLOCK_SIZE={adjusted_block_size}"
                       f" -DSUB_BLOCK_SIZE={self.sub_block_size}"
                       f" -DWG_SIZE={self.wg_size}"
-                      f" -DKV_CACHE_COMPRESSION_PER_TOKEN={int(enable_kvcache_compress)}"
+                      f" -DKV_CACHE_COMPRESSION={int(enable_kvcache_compress)}"
                       f" -mdump_asm -g2")
                     )
 
@@ -593,7 +593,7 @@ if __name__ == "__main__":
     #     import sys
     #     sys.exit(0)
 
-    if 0:
+    if 1:
         for compress_kvcache in [0, 1]:
             # test_pa_kv_cache_update([1024, 16, 17], [16, 0, 1], sub_block_size=block_size)
             test_pa_kv_cache_update([32*1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=16, enable_kvcache_compress=compress_kvcache, check_perf=True)
@@ -625,17 +625,18 @@ if __name__ == "__main__":
         ]
         for num_tokens, past_lens in token_pairs_acc:
             for sub_block_size in [16, 32]:
-                for enalbe_kvcache_compress in [0, 1, 2]:
+                for enalbe_kvcache_compress in [0, 1]:
                     test_pa_kv_cache_update(num_tokens, past_lens, num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=False)
 
-    token_pairs_perf = [
-        ([32*1024], [0]),
-        ([1], [32*1024]),
-        ([1], [32*1024+1]),
-        ([1], [32*1024+8]),
-        ([1], [32*1024+15]),
-    ]
-    for num_tokens, past_lens in token_pairs_perf:
-        for sub_block_size in [16, 32]:
-            for enalbe_kvcache_compress in [2]:
-                test_pa_kv_cache_update(num_tokens, past_lens, num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=True)
+    if 0:
+        token_pairs_perf = [
+            ([32*1024], [0]),
+            ([1], [32*1024]),
+            ([1], [32*1024+1]),
+            ([1], [32*1024+8]),
+            ([1], [32*1024+15]),
+        ]
+        for num_tokens, past_lens in token_pairs_perf:
+            for sub_block_size in [16, 32]:
+                for enalbe_kvcache_compress in [0, 1]:
+                    test_pa_kv_cache_update(num_tokens, past_lens, num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=True)
