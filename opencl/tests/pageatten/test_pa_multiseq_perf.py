@@ -139,7 +139,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
             head_size,
             block_sz,
             kv_cache_compression,
-            is_causal,
+            is_causal=is_causal,
             sub_block_size=sub_block_size,
             sparse_block_size=sparse_block_size,
             enable_hybrid_dispatch=enable_hybrid_dispatch,

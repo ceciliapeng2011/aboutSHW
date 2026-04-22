@@ -80,10 +80,6 @@ class SessionDescriptor:
             raise ValueError(f"num_input_tokens must be >= 1, got {self.num_input_tokens}")
         if self.num_output_tokens < 1:
             raise ValueError(f"num_output_tokens must be >= 1, got {self.num_output_tokens}")
-        if self.num_output_tokens > 2:
-            # Current harness models at most one decode iteration after prefill.
-            raise ValueError("num_output_tokens must be <= 2 in this harness")
-
 
 @dataclass(frozen=True)
 class RoundPlan:

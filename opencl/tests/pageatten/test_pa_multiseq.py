@@ -190,6 +190,13 @@ class PaMultiTokenRunner:
         selected_sequence_ids: torch.Tensor,
         wg_seq_len: int,
     ) -> tuple[torch.Tensor, int]:
+        # Keep in sync with pa_multi_token.cm header notes.
+        # Host prepares a packed int32 pair list consumed by kernel as:
+        #   [block_start_pos_0, subsequence_id_0,
+        #    block_start_pos_1, subsequence_id_1, ...]
+        # For each selected subsequence, split its query range [q_start, q_end)
+        # into ceil_div(subsequence_q_len, wg_seq_len) chunks and emit one pair
+        # per chunk with block_start_pos = q_start + chunk_idx * wg_seq_len.
         blocked_q_starts_and_subseq_mapping: list[int] = []
 
         for sequence_id in selected_sequence_ids.tolist():
@@ -461,6 +468,11 @@ class PaSingleTokenRunner:
         if len(decode_seq_indices) == 0:
             raise ValueError("decode_seq_indices must be non-empty")
 
+        # Keep in sync with pa_single_token.cm notes.
+        # selected_sequence_ids is a compact decode-subset -> original-sequence map:
+        # kernel seq_idx indexes this array, then resolves orig_seq_idx to read
+        # per-sequence metadata (past_lens/subsequence_begins/block_indices_begins).
+        # selected_sequence_count equals len(selected_sequence_ids).
         selected_sequence_ids = torch.tensor(decode_seq_indices, dtype=torch.int32)
         decode_seq_count = int(selected_sequence_ids.numel())
 
@@ -1035,6 +1047,24 @@ _PREFILL_ONLY_SMOKE_BASE_CASES = (
         k_head_size=32,
         v_head_size=32,
         block_size=32,
+    ),
+    # Align with smoke_cm_xattention/basic long prefill shapes (indices 15/18/27).
+    # kv_cache_compression is expanded by _with_kv_cache_compression_modes(...).
+    PagedAttentionTestCase(
+        subsequences=(ss(2048),),
+        num_heads=2,
+        num_kv_heads=2,
+        k_head_size=64,
+        v_head_size=64,
+        block_size=256,
+    ),
+    PagedAttentionTestCase(
+        subsequences=(ss(2048),),
+        num_heads=4,
+        num_kv_heads=2,
+        k_head_size=64,
+        v_head_size=64,
+        block_size=256,
     ),
 )
 
