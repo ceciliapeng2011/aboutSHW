@@ -211,6 +211,40 @@ class PaMultiTokenRunner:
         wg_count = len(blocked_q_starts_and_subseq_mapping) // 2
         return torch.tensor(blocked_q_starts_and_subseq_mapping, dtype=torch.int32), wg_count
 
+    def _create_sparse_mask_tensors(
+        self,
+        kern_attn_inputs: KernelInputs,
+        selected_sequence_ids: torch.Tensor,
+        batch_size_in_tokens: int,
+        wg_count: int,
+    ) -> tuple[object | None, object | None, int, int]:
+        if self.sparse_block_size <= 1:
+            return None, None, 0, 0
+
+        past_lens = kern_attn_inputs["past_lens"]
+        assert isinstance(past_lens, torch.Tensor)
+
+        num_q_blocks = DIV_UP(batch_size_in_tokens, self.sparse_block_size)
+        max_context_len = 0
+        for sequence_id in selected_sequence_ids.tolist():
+            sequence_index = int(sequence_id)
+            q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
+            q_len = q_end - q_start
+            past_len = int(past_lens[sequence_index].item())
+            context_len = past_len + q_len
+            if context_len > max_context_len:
+                max_context_len = context_len
+        num_k_blocks = DIV_UP(max_context_len, self.sparse_block_size)
+
+        sparse_block_mask = torch.ones((self.num_heads, num_q_blocks, num_k_blocks), dtype=torch.bool)
+        sparse_block_mask_wg = torch.ones((self.num_heads, int(wg_count), num_k_blocks), dtype=torch.bool)
+        return (
+            cl.tensor(sparse_block_mask.detach().numpy()),
+            cl.tensor(sparse_block_mask_wg.detach().numpy()),
+            int(num_q_blocks),
+            int(num_k_blocks),
+        )
+
     def __call__(
         self,
         kern_attn_inputs: KernelInputs,
@@ -283,6 +317,13 @@ class PaMultiTokenRunner:
             gws = [1, self.num_heads, int(wg_count * wg_size)]
             lws = [1, 1, wg_size]
 
+            t_sparse_block_mask, t_sparse_block_mask_wg, num_q_blocks, num_k_blocks = self._create_sparse_mask_tensors(
+                kern_attn_inputs,
+                selected_sequence_ids,
+                batch_size_in_tokens,
+                wg_count,
+            )
+
             use_optimized_dispatch = (
                 self.enable_hybrid_dispatch
                 and self.kernels_optimized is not None
@@ -308,21 +349,43 @@ class PaMultiTokenRunner:
             print("[enqueue] prefill_seq_count=", prefill_seq_count)
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
 
-            selected_kernels.enqueue(
-                "cm_page_attention",
-                gws,
-                lws,
-                t_q,
-                t_key_cache,
-                t_value_cache,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_blocked_q_starts_and_subseq_mapping,
-                t_out,
-                batch_size_in_tokens,
-            )
+            if self.sparse_block_size > 1:
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                    t_sparse_block_mask,
+                    t_sparse_block_mask_wg,
+                    int(num_q_blocks),
+                    int(num_k_blocks),
+                )
+            else:
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                )
 
             output_from_kernel = torch.from_numpy(t_out.numpy().reshape(batch_size_in_tokens, -1))
             out.copy_(output_from_kernel)
@@ -566,6 +629,7 @@ class PagedAttentionRunner:
         block_size: int,
         kv_cache_compression: int,
         sub_block_size: int,
+        sparse_block_size: int,
         is_causal: bool,
     ) -> PaMultiTokenRunner:
         return PaMultiTokenRunner.create_instance(
@@ -576,6 +640,7 @@ class PagedAttentionRunner:
             kv_cache_compression,
             is_causal,
             sub_block_size=sub_block_size,
+            sparse_block_size=sparse_block_size,
         )
 
     @staticmethod
@@ -604,6 +669,7 @@ class PagedAttentionRunner:
         block_size: int,
         kv_cache_compression: int,
         sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
+        sparse_block_size: int = 1,
         is_causal: bool = True,
     ):
         self.kvcache_updater = KVCacheUpdater(
@@ -622,6 +688,7 @@ class PagedAttentionRunner:
             block_size,
             kv_cache_compression,
             sub_block_size,
+            sparse_block_size,
             is_causal,
         )
         self.single_token_runner = self._create_single_token_runner(
@@ -941,8 +1008,9 @@ def run_paged_attention_smoke_case(
         case.k_head_size,
         case.block_size,
         case.kv_cache_compression,
-        case.sub_block_size,
-        True,
+        sub_block_size=case.sub_block_size,
+        sparse_block_size=case.sparse_block_size,
+        is_causal=True,
     )
 
     kern_attn_inputs, attn_outputs = pa_runner.run(
@@ -1007,7 +1075,36 @@ def _with_kv_cache_compression_modes(
                     v_head_size=case.v_head_size,
                     block_size=case.block_size,
                     sub_block_size=case.sub_block_size,
+                    sparse_block_size=case.sparse_block_size,
                     kv_cache_compression=mode,
+                )
+            )
+    return tuple(expanded_cases)
+
+
+def _sparse_block_sizes_for_case(case: PagedAttentionTestCase) -> tuple[int, ...]:
+    if case.block_size == 256:
+        return (1, 128, 256)
+    return (1,)
+
+
+def _with_sparse_block_sizes(
+    cases: tuple[PagedAttentionTestCase, ...],
+) -> tuple[PagedAttentionTestCase, ...]:
+    expanded_cases: list[PagedAttentionTestCase] = []
+    for case in cases:
+        for sparse_block_size in _sparse_block_sizes_for_case(case):
+            expanded_cases.append(
+                PagedAttentionTestCase(
+                    subsequences=case.subsequences,
+                    num_heads=case.num_heads,
+                    num_kv_heads=case.num_kv_heads,
+                    k_head_size=case.k_head_size,
+                    v_head_size=case.v_head_size,
+                    block_size=case.block_size,
+                    sub_block_size=case.sub_block_size,
+                    sparse_block_size=sparse_block_size,
+                    kv_cache_compression=case.kv_cache_compression,
                 )
             )
     return tuple(expanded_cases)
@@ -1068,7 +1165,9 @@ _PREFILL_ONLY_SMOKE_BASE_CASES = (
     ),
 )
 
-PREFILL_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(_PREFILL_ONLY_SMOKE_BASE_CASES)
+PREFILL_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(
+    _with_sparse_block_sizes(_PREFILL_ONLY_SMOKE_BASE_CASES)
+)
 
 
 _GENERATE_ONLY_SMOKE_BASE_CASES = (
@@ -1142,7 +1241,9 @@ _MIXED_ONLY_SMOKE_BASE_CASES = (
     ),
 )
 
-MIXED_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(_MIXED_ONLY_SMOKE_BASE_CASES)
+MIXED_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(
+    _with_sparse_block_sizes(_MIXED_ONLY_SMOKE_BASE_CASES)
+)
 
 
 def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
@@ -1162,6 +1263,7 @@ def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
         f"_vhs{case.v_head_size}"
         f"_bls{case.block_size}"
         f"_sbls{case.sub_block_size}"
+        f"_spbs{case.sparse_block_size}"
         f"_cmpr{int(case.kv_cache_compression)}"
     )
 
@@ -1238,6 +1340,7 @@ def test_pa_smoke_paged_attention_mixed_only_route_matches_reference(
 #   python -m pytest -s -q test_pa_multiseq.py -k 'test_pa_smoke_paged_attention_mixed_only_route_matches_reference and route_multi'
 #   timeout 120s python -m pytest -q test_pa_multiseq.py -vv
 #   timeout 120s python -m pytest -q test_pa_multiseq.py -vv -k 'cmpr0 and (generate_only or mixed_only)'
+#   python -m pytest -q test_pa_multiseq.py -k '(prefill_only and spbs128) or (mixed_only and spbs256 and route_split)'
 #
 # Notes:
 #   - Mixed routing is selected explicitly by the parametrized `mixed_route_mode` test argument.

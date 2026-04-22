@@ -86,6 +86,7 @@ class PagedAttentionTestCase:
     v_head_size: int = 64
     block_size: int = 16
     sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE
+    sparse_block_size: int = 1
     kv_cache_compression: int = KV_CACHE_COMPRESSION_NONE
 
 

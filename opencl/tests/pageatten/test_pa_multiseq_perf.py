@@ -220,6 +220,12 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
         gws = [1, self.num_heads, int(wg_count * wg_size)]
         lws = [1, 1, wg_size]
+        t_sparse_block_mask, t_sparse_block_mask_wg, num_q_blocks, num_k_blocks = self._create_sparse_mask_tensors(
+            kern_attn_inputs,
+            selected_sequence_ids,
+            batch_size_in_tokens,
+            wg_count,
+        )
 
         use_optimized_dispatch = (
             self.enable_hybrid_dispatch
@@ -234,40 +240,84 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         cl.finish()
 
         for _ in range(n_warmup):
-            selected_kernels.enqueue(
-                "cm_page_attention",
-                gws,
-                lws,
-                t_q,
-                t_key_cache,
-                t_value_cache,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_blocked_q_starts_and_subseq_mapping,
-                t_out,
-                batch_size_in_tokens,
-            )
+            if self.sparse_block_size > 1:
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                    t_sparse_block_mask,
+                    t_sparse_block_mask_wg,
+                    int(num_q_blocks),
+                    int(num_k_blocks),
+                )
+            else:
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                )
         cl.finish()
 
         t0 = time.perf_counter()
         for _ in range(n_iters):
-            selected_kernels.enqueue(
-                "cm_page_attention",
-                gws,
-                lws,
-                t_q,
-                t_key_cache,
-                t_value_cache,
-                t_past_lens,
-                t_block_indices,
-                t_block_indices_begins,
-                t_subsequence_begins,
-                t_blocked_q_starts_and_subseq_mapping,
-                t_out,
-                batch_size_in_tokens,
-            )
+            if self.sparse_block_size > 1:
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                    t_sparse_block_mask,
+                    t_sparse_block_mask_wg,
+                    int(num_q_blocks),
+                    int(num_k_blocks),
+                )
+            else:
+                selected_kernels.enqueue(
+                    "cm_page_attention",
+                    gws,
+                    lws,
+                    t_q,
+                    t_key_cache,
+                    t_value_cache,
+                    t_past_lens,
+                    t_block_indices,
+                    t_block_indices_begins,
+                    t_subsequence_begins,
+                    t_blocked_q_starts_and_subseq_mapping,
+                    t_out,
+                    batch_size_in_tokens,
+                )
         gpu_latency_ns = cl.finish()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -458,6 +508,7 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
         block_size: int,
         kv_cache_compression: int,
         sub_block_size: int,
+        sparse_block_size: int,
         is_causal: bool,
     ) -> PaMultiTokenPerfRunner:
         return PaMultiTokenPerfRunner.create_instance(
@@ -468,6 +519,7 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
             kv_cache_compression,
             is_causal,
             sub_block_size=sub_block_size,
+            sparse_block_size=sparse_block_size,
         )
 
     @staticmethod
@@ -672,8 +724,9 @@ def _prepare_case(perf_case: PerfCase):
         case.k_head_size,
         case.block_size,
         case.kv_cache_compression,
-        case.sub_block_size,
-        True,
+        sub_block_size=case.sub_block_size,
+        sparse_block_size=case.sparse_block_size,
+        is_causal=True,
     )
 
     return runner, query, key, value, past_lens, subsequence_begins, kvcache_table

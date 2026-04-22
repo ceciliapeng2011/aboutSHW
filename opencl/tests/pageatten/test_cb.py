@@ -107,6 +107,7 @@ class RoundPlan:
             v_head_size=template.v_head_size,
             block_size=template.block_size,
             sub_block_size=template.sub_block_size,
+            sparse_block_size=template.sparse_block_size,
             kv_cache_compression=template.kv_cache_compression,
         )
 
@@ -284,6 +285,7 @@ class ContinuousBatchingScheduler:
 def _default_case_template(
     block_size: int = 16,
     kv_cache_compression: int = KV_CACHE_COMPRESSION_NONE,
+    sparse_block_size: int = 1,
 ) -> PagedAttentionTestCase:
     # Qwen3-8B-like metadata; subsequence content is replaced per-round.
     return PagedAttentionTestCase(
@@ -293,6 +295,7 @@ def _default_case_template(
         k_head_size=128,
         v_head_size=128,
         block_size=block_size,
+        sparse_block_size=sparse_block_size,
         kv_cache_compression=kv_cache_compression,
     )
 
@@ -304,7 +307,9 @@ def _create_accuracy_runner(template: PagedAttentionTestCase) -> PagedAttentionR
         template.k_head_size,
         template.block_size,
         template.kv_cache_compression,
-        True,
+        sub_block_size=template.sub_block_size,
+        sparse_block_size=template.sparse_block_size,
+        is_causal=True,
     )
 
 
@@ -315,7 +320,9 @@ def _create_perf_runner(template: PagedAttentionTestCase) -> PagedAttentionPerfR
         template.k_head_size,
         template.block_size,
         template.kv_cache_compression,
-        True,
+        sub_block_size=template.sub_block_size,
+        sparse_block_size=template.sparse_block_size,
+        is_causal=True,
     )
 
 
