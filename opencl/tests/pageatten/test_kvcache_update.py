@@ -35,7 +35,7 @@ class pa_kvcache_update_cm:
             adjusted_block_size = block_size
         elif enable_kvcache_compress == 2:
             adjusted_k_head_size = k_head_size
-            adjusted_v_head_size = v_head_size
+            adjusted_v_head_size = v_head_size + 4
             adjusted_block_size = block_size + (block_size // sub_block_size) * 4
         else:
             adjusted_k_head_size = k_head_size
@@ -226,7 +226,7 @@ class ContinuousBatchKVCacheGenerator:
             value_cache = self.__get_kv_cache_u8_per_token(self.v_head_size, self.value_data, skip_input)
         else:
             key_cache = self.__get_kv_cache_u8_per_channel(self.k_head_size, self.key_data, skip_input)
-            value_cache = self.__get_kv_cache_u8_per_channel(self.v_head_size, self.value_data, skip_input)
+            value_cache = self.__get_kv_cache_u8_per_token(self.v_head_size, self.value_data, skip_input)
         return key_cache, value_cache
             
     # private methods
@@ -384,7 +384,7 @@ def run_pa_kv_cache_update_case(num_tokens:list, past_lens:list, num_kv_heads=1,
         else:
             num_sub_blocks = block_size // sub_block_size
             key_extra_bytes = 4 * num_sub_blocks * k_head_size
-            val_extra_bytes = 4 * num_sub_blocks * v_head_size
+            val_extra_bytes = block_size * 4
         out_key_cache=torch.tensor(out_key_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, block_size * k_head_size + key_extra_bytes)
         out_value_cache=torch.tensor(out_value_cache).to(dtype=torch.uint8).reshape(-1, num_kv_heads, block_size * v_head_size + val_extra_bytes)
         key_cache_ref = key_cache_ref.reshape(-1, num_kv_heads, block_size * k_head_size + key_extra_bytes)
