@@ -1,3 +1,56 @@
+"""
+test_pa_multiseq.py
+
+Purpose
+-------
+This module is the functional integration test harness for CM paged-attention
+in multi-sequence scenarios. It validates that the OpenCL/CM kernel path and
+the Python reference path produce consistent outputs across realistic batching
+patterns.
+
+What this file verifies
+-----------------------
+1) Prefill-only rounds
+    - Multiple subsequences in one launch where all tokens are prompt tokens.
+
+2) Generate-only rounds
+    - Decode-like rounds with short token counts and non-zero past length.
+
+3) Mixed rounds
+    - Prompt and decode style subsequences scheduled together.
+
+4) Routing behavior
+    - Split-route and mixed-route execution produce numerically stable outputs
+      and match the same reference attention computation.
+
+5) Cache variants and kernel dispatch
+    - FP16 KV cache and compressed KV cache modes.
+        - Compression mode uses `KV_CACHE_COMPRESSION` with values: 0 (none),
+            1 (by-token), 2 (by-channel).
+    - Sparse/dense block configurations and dynamic vs optimized dispatch paths.
+
+Implementation notes
+--------------------
+- `PaMultiTokenRunner` executes the CM kernel(s) and prepares kernel inputs.
+- `PaSingleTokenRunner` executes the decode/single-token CM path used for
+    generate-stage subsequences and mixed-route split mode.
+- `PagedAttentionRunner` orchestrates cache updates, sequence mapping, and
+  end-to-end round execution.
+- `reference_attention()` computes a PyTorch reference for correctness checks.
+
+In short, this file protects multi-sequence paged-attention correctness and
+route consistency for the kernel implementation.
+
+How this differs from `test_cb.py`
+----------------------------------
+- This file validates attention kernel correctness for a single assembled
+    round (prefill/generate/mixed), including route selection and reference
+    parity.
+- `test_cb.py` validates continuous-batching scheduling policy and token
+    accounting across many rounds, and then invokes runners from this file as
+    execution backends.
+"""
+
 import functools
 import os
 
@@ -9,8 +62,11 @@ import torch.nn.functional as F
 from clops import cl
 from clops.utils import Colors
 from pa_test_common import (
-    CacheQuantMode,
+    DEFAULT_SUB_BLOCK_SIZE,
     DIV_UP,
+    KV_CACHE_COMPRESSION_NONE,
+    KV_CACHE_COMPRESSION_BY_CHANNEL,
+    KV_CACHE_COMPRESSION_BY_TOKEN,
     KVCacheTable,
     KVCacheUpdater,
     KernelInputs,
@@ -21,6 +77,7 @@ from pa_test_common import (
     get_attention_mask,
     get_cm_grf_width,
     get_sequence_ranges,
+    normalize_kv_cache_compression,
     ss,
 )
 
@@ -39,7 +96,8 @@ class PaMultiTokenRunner:
         num_kv_heads,
         head_size,
         block_sz,
-        compressed_kvcache,
+        kv_cache_compression,
+        sub_block_size=DEFAULT_SUB_BLOCK_SIZE,
         is_causal=True,
         sparse_block_size=1,
         enable_hybrid_dispatch=True,
@@ -48,7 +106,8 @@ class PaMultiTokenRunner:
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.block_sz = block_sz
-        self.compressed_kvcache = compressed_kvcache
+        self.kv_cache_compression = normalize_kv_cache_compression(kv_cache_compression)
+        self.sub_block_size = int(sub_block_size)
         self.is_causal = is_causal
         self.sparse_block_size = sparse_block_size
         self.enable_hybrid_dispatch = enable_hybrid_dispatch
@@ -62,7 +121,7 @@ class PaMultiTokenRunner:
         print(
             f"{Colors.GREEN} [compile] "
             f"{num_heads=} {num_kv_heads=} {head_size=} {block_sz=} "
-            f"{compressed_kvcache=} {is_causal=} {sparse_block_size=} {enable_hybrid_dispatch=} "
+            f"{self.kv_cache_compression=} {self.sub_block_size=} {is_causal=} {sparse_block_size=} {enable_hybrid_dispatch=} "
             f"{Colors.END}"
         )
 
@@ -80,7 +139,8 @@ class PaMultiTokenRunner:
             f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
             f" -DCMPA_BLOCK_SZ={int(self.block_sz)}"
             f" -DSPARSE_BLOCK_SIZE={int(self.sparse_block_size)}"
-            f" -DCMPA_KVCACHE_U8={int(self.compressed_kvcache)}"
+            f" -DKV_CACHE_COMPRESSION={int(self.kv_cache_compression)}"
+            f" -DSUB_BLOCK_SIZE={int(self.sub_block_size)}"
         )
 
         # Generic dynamic path (uses pa_runner local size to derive wg_seq_len in kernel).
@@ -100,8 +160,9 @@ class PaMultiTokenRunner:
         num_kv_heads,
         head_size,
         block_sz,
-        compressed_kvcache,
+        kv_cache_compression,
         is_causal,
+        sub_block_size=DEFAULT_SUB_BLOCK_SIZE,
         sparse_block_size=1,
         enable_hybrid_dispatch=True,
     ):
@@ -110,15 +171,16 @@ class PaMultiTokenRunner:
             num_kv_heads,
             head_size,
             block_sz,
-            compressed_kvcache,
-            is_causal,
+            kv_cache_compression,
+            is_causal=is_causal,
+            sub_block_size=sub_block_size,
             sparse_block_size=sparse_block_size,
             enable_hybrid_dispatch=enable_hybrid_dispatch,
         )
 
     def _format_cache_for_kernel(self, cache: torch.Tensor) -> torch.Tensor:
         # Never fallback to fp16 kernel path when compression is enabled.
-        if self.compressed_kvcache:
+        if self.kv_cache_compression != KV_CACHE_COMPRESSION_NONE:
             return cache.contiguous()
         return cache.reshape(cache.shape[0], self.num_kv_heads, -1).contiguous()
 
@@ -178,7 +240,7 @@ class PaMultiTokenRunner:
         if out.dtype != torch.float16:
             raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
         output = out
-        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
+        kv_dtype = torch.uint8 if self.kv_cache_compression != KV_CACHE_COMPRESSION_NONE else torch.float16
 
         cl.finish()
 
@@ -268,14 +330,19 @@ class PaSingleTokenRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
     ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.block_size = block_size
-        self.kv_cache_compression = kv_cache_compression
-        self.kvcache_quantization_by_token = 1
+        self.kv_cache_compression = normalize_kv_cache_compression(kv_cache_compression)
+        self.sub_block_size = int(sub_block_size)
+        if self.kv_cache_compression == KV_CACHE_COMPRESSION_BY_CHANNEL and self.block_size % self.sub_block_size != 0:
+            raise ValueError(
+                f"block_size ({self.block_size}) must be divisible by sub_block_size ({self.sub_block_size}) for mode-2"
+            )
 
         self.cm_grf_width = get_cm_grf_width()
         self.xe_arch = 1 if self.cm_grf_width == 256 else 2
@@ -298,7 +365,8 @@ class PaSingleTokenRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
     ):
         return PaSingleTokenRunner(
             num_heads,
@@ -306,6 +374,7 @@ class PaSingleTokenRunner:
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
         )
 
     @staticmethod
@@ -320,13 +389,18 @@ class PaSingleTokenRunner:
         reduce_split_step: int,
         clean_unused_kvcache: int,
         kv_cache_compression: int,
-        kv_cache_compression_by_token: int,
+        sub_block_size: int,
         xe_arch: int,
         q_head_chunks_per_kv_head: int,
         q_head_chunk_size: int,
         scale_factor: float,
     ):
-        src = r'''#include "pa_single_token.cm"'''
+        src = "\n".join(
+            [
+                '#include "pa_single_token.cm"',
+                '#include "pa_single_token_finalization.cm"',
+            ]
+        )
         cwd = os.path.dirname(os.path.realpath(__file__))
         return cl.kernels(src, f'''-cmc -Qxcm_jit_option=""
                             -mCM_printregusage -mdump_asm -g2
@@ -337,7 +411,7 @@ class PaSingleTokenRunner:
                             -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
                             -DCLEAN_UNUSED_KVCACHE={clean_unused_kvcache}
                             -DKV_CACHE_COMPRESSION={kv_cache_compression}
-                            -DKV_CACHE_COMPRESSION_BY_TOKEN={kv_cache_compression_by_token}
+                            -DSUB_BLOCK_SIZE={sub_block_size}
                             -DXE_ARCH={xe_arch}
                             -DQ_head_chunks_per_kv_head={q_head_chunks_per_kv_head}
                             -DQ_head_chunk_size={q_head_chunk_size}
@@ -354,7 +428,7 @@ class PaSingleTokenRunner:
             self.reduce_split_step,
             1,
             int(self.kv_cache_compression),
-            self.kvcache_quantization_by_token,
+            int(self.sub_block_size),
             self.xe_arch,
             int(self.q_head_chunks_per_kv_head),
             int(self.q_head_chunk_size),
@@ -403,6 +477,8 @@ class PaSingleTokenRunner:
         kv_partition_num = DIV_UP(max_context_len, self.kv_partition_size)
         q_tokens = query.reshape(int(query.shape[0]), self.num_heads, self.head_size).contiguous()
         output_tokens = int(query.shape[0])
+        use_subset_execution = output_tokens != batch_size
+        selected_token_indices = (subsequence_begins_t[selected_sequence_ids.to(dtype=torch.long) + 1] - 1).to(dtype=torch.long)
 
         expected_shape = (output_tokens, self.num_heads * self.head_size)
         if tuple(out.shape) != expected_shape:
@@ -427,8 +503,7 @@ class PaSingleTokenRunner:
             t_subsequence_begins = cl.tensor(subsequence_begins_t.detach().numpy())
             t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
             t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
-            output_4d = output.reshape(output_tokens, 1, self.num_heads, self.head_size).contiguous()
-            t_out_final = cl.tensor(output_4d.detach().numpy())
+            t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
             t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
 
             print(f"{Colors.GREEN}[enqueue single] gws={gws} lws={lws}{Colors.END}")
@@ -457,14 +532,14 @@ class PaSingleTokenRunner:
                 t_out,
                 t_out_final,
                 t_lse,
-                t_subsequence_begins,
-                t_selected_sequence_ids,
-                decode_seq_count,
                 kv_partition_num,
             )
             cl.finish()
-            output_from_kernel = torch.from_numpy(t_out_final.numpy().reshape(output_tokens, -1))
-            out.copy_(output_from_kernel)
+            output_compact = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
+            if use_subset_execution:
+                out[selected_token_indices] = output_compact
+            else:
+                out.copy_(output_compact)
             output = out
 
         assert torch.isfinite(output).all().item()
@@ -477,7 +552,8 @@ class PagedAttentionRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int,
         is_causal: bool,
     ) -> PaMultiTokenRunner:
         return PaMultiTokenRunner.create_instance(
@@ -487,6 +563,7 @@ class PagedAttentionRunner:
             block_size,
             kv_cache_compression,
             is_causal,
+            sub_block_size=sub_block_size,
         )
 
     @staticmethod
@@ -495,7 +572,8 @@ class PagedAttentionRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int,
     ) -> PaSingleTokenRunner:
         return PaSingleTokenRunner.create_instance(
             num_heads,
@@ -503,6 +581,7 @@ class PagedAttentionRunner:
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
         )
 
     def __init__(
@@ -511,7 +590,8 @@ class PagedAttentionRunner:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
         is_causal: bool = True,
     ):
         self.kvcache_updater = KVCacheUpdater(
@@ -520,6 +600,7 @@ class PagedAttentionRunner:
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
             is_causal,
         )
         self.multi_token_runner = self._create_multi_token_runner(
@@ -528,6 +609,7 @@ class PagedAttentionRunner:
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
             is_causal,
         )
         self.single_token_runner = self._create_single_token_runner(
@@ -536,6 +618,7 @@ class PagedAttentionRunner:
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
         )
 
     def _prepare_kern_attn_inputs(
@@ -775,7 +858,9 @@ class PagedAttentionRunner:
                 self.multi_token_runner.num_kv_heads,
                 self.multi_token_runner.head_size,
                 self.multi_token_runner.block_sz,
-                self.multi_token_runner.compressed_kvcache,
+                self.multi_token_runner.kv_cache_compression,
+                cache_kind="key",
+                sub_block_size=self.multi_token_runner.sub_block_size,
             )
             value_context = KVCacheUpdater.recover_context_from_cache(
                 value_cache_blocks,
@@ -783,7 +868,9 @@ class PagedAttentionRunner:
                 self.multi_token_runner.num_kv_heads,
                 self.multi_token_runner.head_size,
                 self.multi_token_runner.block_sz,
-                self.multi_token_runner.compressed_kvcache,
+                self.multi_token_runner.kv_cache_compression,
+                cache_kind="value",
+                sub_block_size=self.multi_token_runner.sub_block_size,
             )
 
             attention_mask = get_attention_mask(
@@ -814,8 +901,6 @@ def run_paged_attention_smoke_case(
     check_acc=True,
     mixed_route_mode: str | None = None,
 ) -> KernelInputs:
-    if case.key_cache_quant_mode != CacheQuantMode.BY_TOKEN:
-        raise ValueError("Only CacheQuantMode.BY_TOKEN is supported in this test harness")
     if case.k_head_size != case.v_head_size:
         raise ValueError("k_head_size must equal v_head_size in this CM paged-attention harness")
 
@@ -844,6 +929,7 @@ def run_paged_attention_smoke_case(
         case.k_head_size,
         case.block_size,
         case.kv_cache_compression,
+        case.sub_block_size,
         True,
     )
 
@@ -886,7 +972,36 @@ def assert_generate_stage_inputs(kern_attn_inputs: KernelInputs):
     assert torch.all(token_counts == 1)
 
 
-PREFILL_ONLY_SMOKE_CASES = (
+SMOKE_KV_CACHE_COMPRESSION_MODES = (
+    KV_CACHE_COMPRESSION_NONE,
+    KV_CACHE_COMPRESSION_BY_TOKEN,
+    KV_CACHE_COMPRESSION_BY_CHANNEL,
+)
+
+
+def _with_kv_cache_compression_modes(
+    cases: tuple[PagedAttentionTestCase, ...],
+    modes: tuple[int, ...] = SMOKE_KV_CACHE_COMPRESSION_MODES,
+) -> tuple[PagedAttentionTestCase, ...]:
+    expanded_cases: list[PagedAttentionTestCase] = []
+    for case in cases:
+        for mode in modes:
+            expanded_cases.append(
+                PagedAttentionTestCase(
+                    subsequences=case.subsequences,
+                    num_heads=case.num_heads,
+                    num_kv_heads=case.num_kv_heads,
+                    k_head_size=case.k_head_size,
+                    v_head_size=case.v_head_size,
+                    block_size=case.block_size,
+                    sub_block_size=case.sub_block_size,
+                    kv_cache_compression=mode,
+                )
+            )
+    return tuple(expanded_cases)
+
+
+_PREFILL_ONLY_SMOKE_BASE_CASES = (
     PagedAttentionTestCase(
         subsequences=(ss(10),),
     ),
@@ -923,8 +1038,10 @@ PREFILL_ONLY_SMOKE_CASES = (
     ),
 )
 
+PREFILL_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(_PREFILL_ONLY_SMOKE_BASE_CASES)
 
-GENERATE_ONLY_SMOKE_CASES = (
+
+_GENERATE_ONLY_SMOKE_BASE_CASES = (
     # Test cases with varying sequence lengths, all with past_len > 0 to ensure they are in the generate stage
     PagedAttentionTestCase(
         subsequences=(ss(1, 10),),
@@ -954,20 +1071,11 @@ GENERATE_ONLY_SMOKE_CASES = (
         subsequences=(ss(1, 34), ss(1, 515)),
         block_size=256,
     ),
-    
-    # Test cases with KV cache compression enabled
-    PagedAttentionTestCase(
-        subsequences=(ss(1, 10),),
-        kv_cache_compression=True,
-    ),
-    PagedAttentionTestCase(
-        subsequences=(ss(1, 34), ss(1, 515)),
-        kv_cache_compression=True,
-    ),
 )
 
+GENERATE_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(_GENERATE_ONLY_SMOKE_BASE_CASES)
 
-MIXED_ONLY_SMOKE_CASES = (
+_MIXED_ONLY_SMOKE_BASE_CASES = (
     PagedAttentionTestCase(
         subsequences=(
             ss(1, 34),
@@ -1000,17 +1108,11 @@ MIXED_ONLY_SMOKE_CASES = (
             ss(25),
             ss(10, 34),
         ),
-        kv_cache_compression=True,
-    ),
-    PagedAttentionTestCase(
-        subsequences=(
-            ss(1, 34),
-            ss(25),
-            ss(10, 34),
-        ),
         block_size=256,
     ),
 )
+
+MIXED_ONLY_SMOKE_CASES = _with_kv_cache_compression_modes(_MIXED_ONLY_SMOKE_BASE_CASES)
 
 
 def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
@@ -1029,8 +1131,8 @@ def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
         f"_khs{case.k_head_size}"
         f"_vhs{case.v_head_size}"
         f"_bls{case.block_size}"
+        f"_sbls{case.sub_block_size}"
         f"_cmpr{int(case.kv_cache_compression)}"
-        f"_qm{case.key_cache_quant_mode.value}"
     )
 
 

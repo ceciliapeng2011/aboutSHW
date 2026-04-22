@@ -12,14 +12,15 @@ import torch
 from clops import cl
 from clops.utils import Colors
 from pa_test_common import (
-    CacheQuantMode,
     DIV_UP,
+    DEFAULT_SUB_BLOCK_SIZE,
     KVCacheTable,
     KernelInputs,
     PagedAttentionTestCase,
     create_paged_attention_inputs,
     create_subsequence_tensors,
     get_sequence_ranges,
+    normalize_kv_cache_compression,
     ss,
 )
 from test_pa_multiseq import (
@@ -126,8 +127,9 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         num_kv_heads,
         head_size,
         block_sz,
-        compressed_kvcache,
+        kv_cache_compression,
         is_causal,
+        sub_block_size=DEFAULT_SUB_BLOCK_SIZE,
         sparse_block_size=1,
         enable_hybrid_dispatch=True,
     ):
@@ -136,8 +138,9 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
             num_kv_heads,
             head_size,
             block_sz,
-            compressed_kvcache,
+            kv_cache_compression,
             is_causal,
+            sub_block_size=sub_block_size,
             sparse_block_size=sparse_block_size,
             enable_hybrid_dispatch=enable_hybrid_dispatch,
         )
@@ -172,7 +175,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         prefill_seq_count = int(selected_sequence_ids.numel())
 
         batch_size_in_tokens = query.shape[0]
-        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.float16
+        kv_dtype = torch.uint8 if self.kv_cache_compression != 0 else torch.float16
         use_subset_execution = prefill_seq_count != int(past_lens.numel())
 
         q_tensor = query.reshape(batch_size_in_tokens, self.num_heads, self.head_size).contiguous()
@@ -284,7 +287,8 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
     ):
         return PaSingleTokenPerfRunner(
             num_heads,
@@ -292,6 +296,7 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
         )
 
     def run_perf(
@@ -337,6 +342,7 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
         q_tokens = query.reshape(int(query.shape[0]), self.num_heads, self.head_size).contiguous()
         output_tokens = int(query.shape[0])
         use_subset_execution = output_tokens != batch_size
+        selected_token_indices = (subsequence_begins_t[selected_sequence_ids.to(dtype=torch.long) + 1] - 1).to(dtype=torch.long)
 
         kernels = self._create_kernels()
         gws = [batch_size, self.num_kv_heads * self.q_head_chunks_per_kv_head, kv_partition_num]
@@ -359,13 +365,9 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
             if out.dtype != torch.float16:
                 raise ValueError(f"out dtype mismatch: got {out.dtype}, expected torch.float16")
-            out_4d = out.reshape(output_tokens, 1, self.num_heads, self.head_size).contiguous()
-            t_out_final = cl.tensor(out_4d.detach().numpy())
+            t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
         else:
-            if use_subset_execution:
-                t_out_final = cl.tensor(np.zeros((output_tokens, 1, self.num_heads, self.head_size), dtype=np.float16))
-            else:
-                t_out_final = cl.tensor([output_tokens, 1, self.num_heads, self.head_size], np.dtype(np.float16))
+            t_out_final = cl.tensor([batch_size, 1, self.num_heads, self.head_size], np.dtype(np.float16))
         t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
 
         cl.finish()
@@ -395,9 +397,6 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_out,
                 t_out_final,
                 t_lse,
-                t_subsequence_begins,
-                t_selected_sequence_ids,
-                decode_seq_count,
                 kv_partition_num,
             )
         cl.finish()
@@ -428,18 +427,24 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_out,
                 t_out_final,
                 t_lse,
-                t_subsequence_begins,
-                t_selected_sequence_ids,
-                decode_seq_count,
                 kv_partition_num,
             )
         gpu_latency_ns = cl.finish()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        output = torch.from_numpy(t_out_final.numpy().reshape(output_tokens, -1))
+        output_compact = torch.from_numpy(t_out_final.numpy().reshape(batch_size, -1))
         if out is not None:
-            out.copy_(output)
+            if use_subset_execution:
+                out[selected_token_indices] = output_compact
+            else:
+                out.copy_(output_compact)
             output = out
+        else:
+            if use_subset_execution:
+                output = torch.zeros(output_tokens, self.num_heads * self.head_size, dtype=torch.float16)
+                output[selected_token_indices] = output_compact
+            else:
+                output = output_compact
         assert torch.isfinite(output).all().item()
         return output, gpu_latency_ns, elapsed_ms
 
@@ -451,7 +456,8 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int,
         is_causal: bool,
     ) -> PaMultiTokenPerfRunner:
         return PaMultiTokenPerfRunner.create_instance(
@@ -461,6 +467,7 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
             block_size,
             kv_cache_compression,
             is_causal,
+            sub_block_size=sub_block_size,
         )
 
     @staticmethod
@@ -469,7 +476,8 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        kv_cache_compression: bool,
+        kv_cache_compression: int,
+        sub_block_size: int,
     ) -> PaSingleTokenPerfRunner:
         return PaSingleTokenPerfRunner.create_instance(
             num_heads,
@@ -477,6 +485,7 @@ class PagedAttentionPerfRunner(PagedAttentionRunner):
             head_size,
             block_size,
             kv_cache_compression,
+            sub_block_size,
         )
 
     @staticmethod
@@ -626,12 +635,12 @@ class PerfCase:
 
 
 def _validate_perf_case(case: PagedAttentionTestCase):
-    assert case.key_cache_quant_mode == CacheQuantMode.BY_TOKEN
+    assert int(case.kv_cache_compression) in (0, 1, 2)
     assert case.k_head_size == case.v_head_size
 
 
 def _validate_qwen3_8b_perf_case(case: PagedAttentionTestCase):
-    assert case.key_cache_quant_mode == CacheQuantMode.BY_TOKEN
+    assert int(case.kv_cache_compression) in (0, 1, 2)
     assert case.k_head_size == 128 and case.v_head_size == 128
     assert case.num_heads == 32 and case.num_kv_heads == 8
     assert all(s.num_tokens <= TRUNK_SIZE for s in case.subsequences)
@@ -663,6 +672,7 @@ def _prepare_case(perf_case: PerfCase):
         case.k_head_size,
         case.block_size,
         case.kv_cache_compression,
+        case.sub_block_size,
         True,
     )
 
@@ -725,10 +735,9 @@ def _make_perf_case(
     case_tag: str,
     subsequences: tuple,
     block_size: int,
-    kv_cache_compression: bool,
+    kv_cache_compression: int,
 ) -> PerfCase:
-
-    cmpr = 1 if kv_cache_compression else 0
+    cmpr = int(normalize_kv_cache_compression(kv_cache_compression))
     return PerfCase(
         name=f"{perf_type}_{case_tag}_bs{block_size}_cmpr{cmpr}",
         perf_type=perf_type,
@@ -780,7 +789,7 @@ QWEN3_8B_PERF_CASES = tuple(
     for perf_type in ("prefill_only", "generate_only", "mixed_only")
     for case_tag, subsequences in PERF_SUBSEQUENCES[perf_type]
     for block_size in (16, 256)
-    for kv_cache_compression in (False, True)
+    for kv_cache_compression in (0, 1, 2)
 )
 
 

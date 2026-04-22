@@ -1,14 +1,38 @@
 import functools
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from clops import cl
+from kv_cache_quant_utils import (
+    DEFAULT_SUB_BLOCK_SIZE,
+    dequant_per_channel as dequant_per_channel_ref,
+    dequant_per_token as dequant_per_token_ref,
+    quant_per_channel as quant_per_channel_ref,
+    quant_per_token as quant_per_token_ref,
+)
 
 
 KernelInputs = dict[str, object]
+
+
+KV_CACHE_COMPRESSION_NONE = 0
+KV_CACHE_COMPRESSION_BY_TOKEN = 1
+KV_CACHE_COMPRESSION_BY_CHANNEL = 2
+
+
+def normalize_kv_cache_compression(mode: int) -> int:
+    if isinstance(mode, bool):
+        raise TypeError("kv_cache_compression must be int in {0, 1, 2}, got bool")
+    mode = int(mode)
+    if mode not in {
+        KV_CACHE_COMPRESSION_NONE,
+        KV_CACHE_COMPRESSION_BY_TOKEN,
+        KV_CACHE_COMPRESSION_BY_CHANNEL,
+    }:
+        raise ValueError(f"unsupported kv_cache_compression mode: {mode}")
+    return mode
 
 
 @functools.cache
@@ -53,10 +77,6 @@ class SubsequenceDescriptor:
         return self.past_len + self.num_tokens
 
 
-class CacheQuantMode(str, Enum):
-    BY_TOKEN = "BY_TOKEN"
-
-
 @dataclass(frozen=True)
 class PagedAttentionTestCase:
     subsequences: tuple[SubsequenceDescriptor, ...]
@@ -65,8 +85,8 @@ class PagedAttentionTestCase:
     k_head_size: int = 64
     v_head_size: int = 64
     block_size: int = 16
-    kv_cache_compression: bool = False
-    key_cache_quant_mode: CacheQuantMode = CacheQuantMode.BY_TOKEN
+    sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE
+    kv_cache_compression: int = KV_CACHE_COMPRESSION_NONE
 
 
 @dataclass(frozen=True)
@@ -89,59 +109,23 @@ class KVCacheTable:
 class KVCacheQuantizer:
     @staticmethod
     def quant_per_token(kv: torch.Tensor) -> torch.Tensor:
-        blk_num, kv_heads, _, _ = kv.shape
-        kv_max = kv.amax(dim=-1, keepdim=True)
-        kv_min = kv.amin(dim=-1, keepdim=True)
-        qrange = kv_max - kv_min
-        zero_range_mask = qrange == 0
-
-        int_max = 255.0
-        int_min = 0.0
-        int_range = int_max - int_min
-        safe_qrange = torch.where(zero_range_mask, torch.ones_like(qrange), qrange)
-        kv_scale = (int_range / safe_qrange).to(dtype=torch.half)
-        kv_zp = ((0.0 - kv_min) * kv_scale + int_min).to(dtype=torch.half)
-
-        kv_scale = torch.where(zero_range_mask, torch.ones_like(kv_scale), kv_scale)
-        kv_zp = torch.where(zero_range_mask, (-kv_min).to(dtype=torch.half), kv_zp)
-
-        kv_u8 = torch.round(kv * kv_scale + kv_zp).clamp(int_min, int_max).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        dq_scale = (1.0 / kv_scale).view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        return torch.concat((kv_u8, dq_scale, kv_zp), dim=-1)
+        return quant_per_token_ref(kv)
 
     @staticmethod
-    def quant_per_channel(kv: torch.Tensor) -> torch.Tensor:
-        blk_num, kv_heads, _, head_size = kv.shape
-        kv_max = kv.amax(dim=2, keepdim=True)
-        kv_min = kv.amin(dim=2, keepdim=True)
-        qrange = kv_max - kv_min
-
-        int_max = 255.0
-        int_min = 0.0
-        int_range = int_max - int_min
-        kv_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
-        kv_scale[qrange != 0] = (int_range / qrange[qrange != 0]).to(dtype=torch.float16)
-        kv_zp = ((0.0 - kv_min) * kv_scale + int_min).to(dtype=torch.float16)
-        kv_u8 = torch.round(kv * kv_scale + kv_zp).clamp(int_min, int_max).to(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        dq_scale = torch.zeros(blk_num, kv_heads, 1, head_size, dtype=torch.float16)
-        dq_scale[kv_scale != 0] = (1.0 / kv_scale[kv_scale != 0]).to(dtype=torch.float16)
-        dq_scale = dq_scale.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
-        return torch.concat((kv_u8, dq_scale, kv_zp), dim=-1)
+    def quant_per_channel(kv: torch.Tensor, sub_block_size: int) -> torch.Tensor:
+        return quant_per_channel_ref(kv, sub_block_size)
 
     @staticmethod
     def dequant_per_token(cache: torch.Tensor, block_size: int, head_size: int) -> torch.Tensor:
         if cache.dtype != torch.uint8:
             raise ValueError("dequant_cache_per_token expects uint8 cache")
+        return dequant_per_token_ref(cache, head_size, block_size)
 
-        data_size = block_size * head_size
-        scale_size = block_size * 2
-        data = cache[:, :, :data_size].reshape(cache.shape[0], cache.shape[1], block_size, head_size).to(dtype=torch.float16)
-        dq_scale = cache[:, :, data_size:data_size + scale_size].reshape(cache.shape[0], cache.shape[1], block_size, 2).contiguous().view(dtype=torch.float16)
-        zp = cache[:, :, data_size + scale_size:].reshape(cache.shape[0], cache.shape[1], block_size, 2).contiguous().view(dtype=torch.float16)
-
-        return (data - zp) * dq_scale
+    @staticmethod
+    def dequant_per_channel(cache: torch.Tensor, block_size: int, head_size: int, sub_block_size: int) -> torch.Tensor:
+        if cache.dtype != torch.uint8:
+            raise ValueError("dequant_cache_per_channel expects uint8 cache")
+        return dequant_per_channel_ref(cache, head_size, block_size, sub_block_size)
 
 
 def quan_per_token(kv: torch.Tensor) -> torch.Tensor:
@@ -152,6 +136,10 @@ def dequant_cache_per_token(cache: torch.Tensor, block_size: int, head_size: int
     return KVCacheQuantizer.dequant_per_token(cache, block_size, head_size)
 
 
+def dequant_cache_per_channel(cache: torch.Tensor, block_size: int, head_size: int, sub_block_size: int) -> torch.Tensor:
+    return KVCacheQuantizer.dequant_per_channel(cache, block_size, head_size, sub_block_size)
+
+
 class KVCacheUpdater:
     def __init__(
         self,
@@ -159,15 +147,21 @@ class KVCacheUpdater:
         num_kv_heads: int,
         head_size: int,
         block_sz: int,
-        compressed_kvcache: bool,
+        compressed_kvcache: int,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
         is_causal: bool = True,
     ):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.block_sz = block_sz
-        self.compressed_kvcache = compressed_kvcache
+        self.compressed_kvcache = normalize_kv_cache_compression(compressed_kvcache)
+        self.sub_block_size = sub_block_size
         self.is_causal = is_causal
+        if self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL and self.block_sz % self.sub_block_size != 0:
+            raise ValueError(
+                f"block_sz ({self.block_sz}) must be divisible by sub_block_size ({self.sub_block_size}) for KV_CACHE_COMPRESSION_BY_CHANNEL"
+            )
 
     def _build_sequence_cache_blocks(self, key: torch.Tensor, value: torch.Tensor, context_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         padded_context_len = DIV_UP(context_len, self.block_sz) * self.block_sz
@@ -196,8 +190,12 @@ class KVCacheUpdater:
         local_num_blocks = int(past_key_cache_blocks.shape[0])
         local_block_indices = torch.arange(local_num_blocks, dtype=torch.long)
 
-        if self.compressed_kvcache:
+        if self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_TOKEN:
             past_key_cache_blocks = quan_per_token(past_key_cache_blocks)
+            past_value_cache_blocks = quan_per_token(past_value_cache_blocks)
+        elif self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            past_key_cache_blocks = KVCacheQuantizer.quant_per_channel(past_key_cache_blocks, self.sub_block_size)
+            # V stays by-token in mode-2 kernels.
             past_value_cache_blocks = quan_per_token(past_value_cache_blocks)
 
         k_past = self.recover_context_from_cache(
@@ -207,6 +205,8 @@ class KVCacheUpdater:
             self.head_size,
             self.block_sz,
             self.compressed_kvcache,
+            cache_kind="key",
+            sub_block_size=self.sub_block_size,
         )
         v_past = self.recover_context_from_cache(
             past_value_cache_blocks[local_block_indices].contiguous(),
@@ -215,13 +215,19 @@ class KVCacheUpdater:
             self.head_size,
             self.block_sz,
             self.compressed_kvcache,
+            cache_kind="value",
+            sub_block_size=self.sub_block_size,
         )
 
         k_cache_source = torch.cat((k_past, current_key), dim=0).contiguous()
         v_cache_source = torch.cat((v_past, current_value), dim=0).contiguous()
         sequence_key_cache, sequence_value_cache = self._build_sequence_cache_blocks(k_cache_source, v_cache_source, context_len)
-        if self.compressed_kvcache:
+        if self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_TOKEN:
             sequence_key_cache = quan_per_token(sequence_key_cache)
+            sequence_value_cache = quan_per_token(sequence_value_cache)
+        elif self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            sequence_key_cache = KVCacheQuantizer.quant_per_channel(sequence_key_cache, self.sub_block_size)
+            # V stays by-token in mode-2 kernels.
             sequence_value_cache = quan_per_token(sequence_value_cache)
         return sequence_key_cache, sequence_value_cache
 
@@ -232,10 +238,20 @@ class KVCacheUpdater:
         num_kv_heads: int,
         head_size: int,
         block_size: int,
-        compressed_kvcache: bool,
+        compressed_kvcache: int,
+        cache_kind: str,
+        sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE,
     ) -> torch.Tensor:
-        if compressed_kvcache:
+        mode = normalize_kv_cache_compression(compressed_kvcache)
+        if mode == KV_CACHE_COMPRESSION_BY_TOKEN:
             cache_blocks = dequant_cache_per_token(cache_blocks, block_size, head_size)
+        elif mode == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            if cache_kind == "key":
+                cache_blocks = dequant_cache_per_channel(cache_blocks, block_size, head_size, sub_block_size)
+            elif cache_kind == "value":
+                cache_blocks = dequant_cache_per_token(cache_blocks, block_size, head_size)
+            else:
+                raise ValueError(f"unsupported cache_kind: {cache_kind}")
         return cache_blocks.transpose(1, 2).reshape(-1, num_kv_heads, head_size)[:context_len].contiguous()
 
     def __call__(

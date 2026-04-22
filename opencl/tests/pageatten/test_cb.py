@@ -1,9 +1,63 @@
+"""
+test_cb.py
+
+Purpose
+-------
+This module tests continuous batching (CB) scheduling behavior on top of the
+paged-attention runners. It validates that session-level prompt/decode traffic
+is split into legal per-round plans and that each round is executable and
+correct.
+
+What this file verifies
+-----------------------
+1) Scheduler correctness
+    - `ContinuousBatchingScheduler` builds non-empty rounds that obey
+      `max_num_batched_tokens` and optional per-subsequence limits.
+    - Total token accounting is exact: all prompt tokens plus decode tokens are
+      scheduled exactly once.
+
+2) Dynamic split-fuse policy
+    - Decode-ready sequences can be fused with prompt chunks in the same round.
+    - Round plans remain capacity-safe and valid for kernel execution.
+
+3) Prompt-first policy
+    - Prompt-only rounds are preferred before decode rounds when configured.
+
+4) End-to-end execution checks
+    - Accuracy path: CB rounds match reference attention numerically.
+    - Perf path: host/GPU timing is collected and dispatch path is reported.
+
+Compression mode note
+---------------------
+`kv_cache_compression` is treated as integer mode (`KV_CACHE_COMPRESSION`):
+0 (none), 1 (by-token), 2 (by-channel).
+
+Implementation notes
+--------------------
+- `SessionDescriptor` describes one user/session request shape.
+- `RoundPlan` represents one scheduled iteration and can execute itself via
+  `PagedAttentionRunner` or `PagedAttentionPerfRunner`.
+
+In short, this file protects the scheduling and runtime behavior required for
+continuous batching workloads (Qwen3-like long prompt + decode patterns).
+
+How this differs from `test_pa_multiseq.py`
+-------------------------------------------
+- This file focuses on continuous-batching orchestration: round planning,
+    scheduling constraints, prompt/decode policy behavior, and end-to-end
+    execution across rounds.
+- `test_pa_multiseq.py` focuses on per-round attention kernel correctness
+    (multi-token, single-token, mixed-route) and reference parity.
+"""
+
 import torch
 import pytest
 import time
 from dataclasses import dataclass
 
 from pa_test_common import (
+    KV_CACHE_COMPRESSION_NONE,
+    KV_CACHE_COMPRESSION_BY_TOKEN,
     PagedAttentionTestCase,
     SubsequenceDescriptor,
     check_close,
@@ -56,8 +110,8 @@ class RoundPlan:
             k_head_size=template.k_head_size,
             v_head_size=template.v_head_size,
             block_size=template.block_size,
+            sub_block_size=template.sub_block_size,
             kv_cache_compression=template.kv_cache_compression,
-            key_cache_quant_mode=template.key_cache_quant_mode,
         )
 
     def create_runner_inputs(
@@ -233,7 +287,7 @@ class ContinuousBatchingScheduler:
 
 def _default_case_template(
     block_size: int = 16,
-    kv_cache_compression: bool = False,
+    kv_cache_compression: int = KV_CACHE_COMPRESSION_NONE,
 ) -> PagedAttentionTestCase:
     # Qwen3-8B-like metadata; subsequence content is replaced per-round.
     return PagedAttentionTestCase(
@@ -283,10 +337,10 @@ ACCURACY_SESSION_GROUPS = (
 )
 
 MODEL_CONFIGS = (
-    (16, False),
-    (16, True),
-    (256, False),
-    (256, True),
+    (16, KV_CACHE_COMPRESSION_NONE),
+    (16, KV_CACHE_COMPRESSION_BY_TOKEN),
+    (256, KV_CACHE_COMPRESSION_NONE),
+    (256, KV_CACHE_COMPRESSION_BY_TOKEN),
 )
 
 
@@ -295,7 +349,7 @@ MODEL_CONFIGS = (
 def test_cb_accuracy_short_prompts_against_reference(
     sessions: list[SessionDescriptor],
     block_size: int,
-    kv_cache_compression: bool,
+    kv_cache_compression: int,
 ):
     scheduler = ContinuousBatchingScheduler(max_num_batched_tokens=64, dynamic_split_fuse=True)
     round_plans = scheduler.schedule(sessions)
@@ -349,7 +403,7 @@ def test_cb_accuracy_short_prompts_against_reference(
 def test_cb_perf_qwen3_8b_long_prompts_dynamic_split_fuse(
     sessions: list[SessionDescriptor],
     block_size: int,
-    kv_cache_compression: bool,
+    kv_cache_compression: int,
 ):
     scheduler = ContinuousBatchingScheduler(max_num_batched_tokens=4096, dynamic_split_fuse=True)
     round_plans = scheduler.schedule(sessions)
@@ -392,7 +446,7 @@ def test_cb_perf_qwen3_8b_long_prompts_dynamic_split_fuse(
 @pytest.mark.parametrize("block_size,kv_cache_compression", MODEL_CONFIGS)
 def test_cb_perf_qwen3_8b_prompt_first_mode_valid_case(
     block_size: int,
-    kv_cache_compression: bool,
+    kv_cache_compression: int,
 ):
     sessions = [
         SessionDescriptor(num_input_tokens=4096, num_output_tokens=2),
