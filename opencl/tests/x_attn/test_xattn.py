@@ -521,60 +521,49 @@ def importance_estimate(
     # Attention Estimation
     A = Q_resh @ K_resh.transpose(-1, -2)
     print(f'{A.shape=} {Q_resh.shape=} {K_resh.shape=}')
-    A = F.softmax(A / math.sqrt(d) / S / norm, dim=-1, dtype=torch.float32
-                ).to(Q.dtype)
+    A = A / math.sqrt(d) / S / norm
+    if causal:
+        causal_mask = torch.zeros((B, H, q_len // S, k_len // S), dtype=A.dtype, device=A.device)
+        chunk_start = (k_len - q_len) // S
+        chunk_end = chunk_start + q_len // S
+        causal_mask[:, :, :, chunk_start:chunk_end] = torch.triu(
+            torch.ones((1, H, q_len // S, q_len // S), dtype=A.dtype, device=A.device) * float("-60000.0"),
+            diagonal=1,
+        )
+        A = A + causal_mask
+    A = F.softmax(A, dim=-1, dtype=torch.float32).to(Q.dtype)
     print(f'{A.shape=}')
 
     # Reshape softmax to blocks
     A_blocked = A.view(B, H, Q_block, block_size//S, K_block, block_size//S)
     attn_sums = A_blocked.sum(dim=-1).sum(dim=-2) # (B, H, Q_block, K_block)
     
-    # Thresholded Block Selection
-    def find_blocks(input_tensor):
-            input_tensor = input_tensor.to(float)
-            total_sum = input_tensor.sum(dim=-1, keepdim=True)
-            required_sum = total_sum * threshold
-            print(f'{threshold=}, {required_sum=}, {total_sum=}')
-
-            mask = torch.zeros_like(input_tensor, dtype=torch.bool)
-            sorted_values, index = torch.sort(
-                input_tensor, dim=-1, descending=True
+    # Thresholded Block Selection must follow the same per-query-chunk path as xattn_estimate.
+    q_chunk_num = (q_len + chunk_size - 1) // chunk_size
+    k_chunk_num = (k_len + chunk_size - 1) // chunk_size
+    q_block_per_chunk = chunk_size // block_size
+    offset_token_chunk_num = k_chunk_num - q_chunk_num
+    keep_mask_chunks = []
+    for chunk_idx in range(q_chunk_num):
+        q_block_begin = chunk_idx * q_block_per_chunk
+        q_block_end = min(q_block_begin + q_block_per_chunk, Q_block)
+        keep_mask_chunks.append(
+            find_blocks_chunked(
+                attn_sums[:, :, q_block_begin:q_block_end, :],
+                K_block - Q_block + chunk_idx * q_block_per_chunk + offset_token_chunk_num * q_block_per_chunk,
+                threshold,
+                None,
+                decoding=False,
+                mode="prefill",
+                causal=causal,
             )
-            print(f'{sorted_values=} {index=}')
-            sorted_values = sorted_values.to(input_tensor.device)
-            cumulative_sum_without_self = torch.cat(
-                [
-                    torch.zeros(
-                        (B, H, Q_block, 1), device=input_tensor.device
-                    ),
-                    sorted_values[:, :, :, 0:-1],
-                ],
-                dim=-1,
-            ).cumsum(dim=-1)
-            index_mask = cumulative_sum_without_self < required_sum
-            index = torch.where(index_mask, index, 0)
-            mask = mask.view(B, H * Q_block, K_block)
-            index = index.view(B, H * Q_block, K_block)
-            print(f'------------------------------ {mask.shape=} {index.shape=} {torch.arange(mask.shape[1], device=mask.device).unsqueeze(dim=-1)}')
-            mask[
-                :,
-                torch.arange(mask.shape[1], device=mask.device).unsqueeze(dim=-1),
-                index,
-            ] = True
-            mask = mask.view(B, H, Q_block, K_block)
-            return mask
-    if True:
-        keep_mask = find_blocks(attn_sums)
-    else:
-        # Find blocks based on threshold
-        keep_mask = find_blocks_chunked(
-            attn_sums,
-            0,
-            threshold,
-            None,
-            decoding=False,
-            mode="prefill",
-            causal=causal,
+        )
+    keep_mask = torch.cat(keep_mask_chunks, dim=-2)
+    if causal:
+        keep_mask[:, :, -Q_block:, -Q_block:] = torch.where(
+            torch.tril(torch.ones(Q_block, Q_block, dtype=torch.bool, device=keep_mask.device), diagonal=0),
+            keep_mask[:, :, -Q_block:, -Q_block:],
+            False,
         )
     return attn_sums, keep_mask, Q_resh, K_resh
 

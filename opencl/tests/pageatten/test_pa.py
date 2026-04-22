@@ -14,6 +14,13 @@ import sys
 from flashattn import get_flash0
 from check_density import paired_adjacent_row_diff_pct, load_ov_model_block_mask, verify_block_mask_integrity
 from generate_block_mask import generate_block_mask_with_ratio, count_false_percentage
+from kv_cache_quant_utils import (
+    DEFAULT_SUB_BLOCK_SIZE,
+    dequant_per_channel,
+    dequant_per_token,
+    quant_per_channel as quan_per_channel,
+    quant_per_token as quan_per_token,
+)
 
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
@@ -31,48 +38,36 @@ if CM_GRF_WIDTH == 256:
 else:
     xe_arch = 2
 
-def quan_per_token(kv):
-    blk_num, kv_heads, blksz, *_ = kv.shape
-    kv_max = kv.amax(dim=-1, keepdim = True)
-    kv_min = kv.amin(dim=-1, keepdim = True)
-    qrange = kv_max - kv_min
+KV_CACHE_COMPRESSION_NONE = 0
+KV_CACHE_COMPRESSION_BY_TOKEN = 1
+KV_CACHE_COMPRESSION_BY_CHANNEL = 2
+def normalize_kv_cache_compression(mode):
+    if isinstance(mode, bool):
+        return KV_CACHE_COMPRESSION_BY_TOKEN if mode else KV_CACHE_COMPRESSION_NONE
 
-    INTMAX = 255.0
-    INTMIN = 0.0
-    INTRAGNE = INTMAX - INTMIN
-    kv_scale = ((INTRAGNE)/qrange).to(dtype=torch.half)
-    kv_zp = ((0.0-kv_min)*kv_scale+INTMIN).to(dtype=torch.half)
-    #round half to even
-    kv_INT8 = torch.round((kv*kv_scale+kv_zp)).to(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    # print("################################################################################")
-    # print(f'KV\n:{kv.reshape(64, 16)}')
-    # print(f'kv_INT8\n:{kv_INT8.reshape(64, 16)}')
-    # print(f'kv_scale\n:{kv_scale.reshape( 1, 64)}')
-    # print(f'kv_zp\n:{kv_zp.reshape( 1, 64)}')
-    # print("################################################################################")
+    mode = int(mode)
+    if mode not in {
+        KV_CACHE_COMPRESSION_NONE,
+        KV_CACHE_COMPRESSION_BY_TOKEN,
+        KV_CACHE_COMPRESSION_BY_CHANNEL,
+    }:
+        raise ValueError(f"unsupported kv-cache compression mode: {mode}")
+    return mode
 
-    dq_scale = (1.0/kv_scale).view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
-    return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
 
-def dequant_per_token(kv, head_size, blk_size):
-    blk_num, kv_head_num, _ = kv.shape
-    kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
-    kv_scale = kv[:,:,head_size * blk_size:head_size * blk_size + blk_size * 2].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
-    kv_zp = kv[:,:,head_size * blk_size + blk_size * 2:head_size * blk_size + blk_size * 4].view(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, 1)
+def get_k_cache_layout(head_size, block_sz, compression_mode, sub_block_sz):
+    if compression_mode == KV_CACHE_COMPRESSION_BY_TOKEN:
+        return block_sz, head_size + 4
+    if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL:
+        return block_sz + block_sz // sub_block_sz * 4, head_size
+    return block_sz, head_size
 
-    # print("dequant_kv_u8 = ", kv_u8)
-    # print("dequant_kv_scale = ", kv_scale.reshape(blk_num, kv_head_num, blk_size))
-    # print("dequant_kv_zp    = ", kv_zp.reshape(blk_num, kv_head_num, blk_size))
 
-    kv_dequant = torch.empty([blk_num, kv_head_num, blk_size, head_size], dtype=torch.float16)
+def get_v_cache_layout(head_size, block_sz, compression_mode):
+    if compression_mode != KV_CACHE_COMPRESSION_NONE:
+        return block_sz, head_size + 4
+    return block_sz, head_size
 
-    for m in range(blk_num):
-        for n in range(kv_head_num):
-            for i in range(blk_size):
-                kv_dequant[m,n,i,:] = (kv_u8[m,n,i,:].to(dtype=torch.float16) - kv_zp[m,n,i,0].to(dtype=torch.float16)) * kv_scale[m,n,i,0].to(dtype=torch.float16)
-
-    return kv_dequant
 
 def ALIGN_UP(x, y):
     return (x + y -1) // y * y
@@ -84,7 +79,7 @@ def DIV_UP(x, y):
 DUMP_ENQUEUE_ARGUMENTS = True
 USE_RANDOM_MASK_BY_FORCE = True
 class page_atten_cm:
-    def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal = True, sparse_block_sz = 128):
+    def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE, is_causal = True, sparse_block_sz = 128):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
@@ -93,7 +88,8 @@ class page_atten_cm:
         self.block_sz = block_sz
         self.trunk_sz = trunk_sz
         self.sparse_block_sz = sparse_block_sz
-        self.compressed_kvcache = compressed_kvcache
+        self.compressed_kvcache = normalize_kv_cache_compression(compressed_kvcache)
+        self.sub_block_sz = sub_block_sz
         # assert sparse_block_sz == 1 or sparse_block_sz == 128 or sparse_block_sz == 256, f"unsupported sparse_block_sz:{sparse_block_sz}"
 
         wg_size = 16
@@ -117,7 +113,8 @@ class page_atten_cm:
                       f" -DCMPA_BLOCK_SZ={self.block_sz}"
                       f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
                       f" -DCMPA_WG_SEQ_LEN={int(self.wg_seq_len)}"
-                      f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
+                      f" -DKV_CACHE_COMPRESSION={self.compressed_kvcache}"
+                      f" -DSUB_BLOCK_SIZE={self.sub_block_sz}"
                       f" -mdump_asm -g2")
                      )
 
@@ -140,7 +137,7 @@ class page_atten_cm:
             padded_k = torch.nn.functional.pad(k,kv_padding_dims, "constant", 1)
             padded_v = torch.nn.functional.pad(v,kv_padding_dims, "constant", 1)
             #padding all to NAN to simulate the NAN case  when fp16
-            if self.compressed_kvcache == False:
+            if self.compressed_kvcache == KV_CACHE_COMPRESSION_NONE:
                 padded_k.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
                 padded_v.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
 
@@ -148,8 +145,11 @@ class page_atten_cm:
         # reorder K,V from [L, H, S] to [block_num, H, block_size, S]
         k_cache = padded_k.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
         v_cache = padded_v.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
-        if self.compressed_kvcache:
+        if self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_TOKEN:
             k_cache = quan_per_token(k_cache)
+            v_cache = quan_per_token(v_cache)
+        elif self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            k_cache = quan_per_channel(k_cache, self.sub_block_sz)
             v_cache = quan_per_token(v_cache)
         else:
             k_cache = k_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
@@ -163,9 +163,9 @@ class page_atten_cm:
         trunk_num = (aligned_seqlen+ self.trunk_sz - 1) // self.trunk_sz
         max_blks = aligned_seqlen // self.block_sz
 
-        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.half
-        #extra half zp and half scale per token. totally 4 bytes.
-        token_sz = (head_size+4) if self.compressed_kvcache else (head_size)
+        kv_dtype = torch.uint8 if self.compressed_kvcache != KV_CACHE_COMPRESSION_NONE else torch.half
+        k_block_sz, k_token_sz = get_k_cache_layout(head_size, self.block_sz, self.compressed_kvcache, self.sub_block_sz)
+        v_block_sz, v_token_sz = get_v_cache_layout(head_size, self.block_sz, self.compressed_kvcache)
 
         if self.sparse_block_sz > 1:
             block_mask_list = []
@@ -213,8 +213,8 @@ class page_atten_cm:
                 block_indices =  torch.randperm(blk_num)
                 # block_indices =  torch.arange(blk_num)
                 # print(f'==============={block_indices=}')
-                sub_k = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
-                sub_v = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
+                sub_k = torch.zeros(blk_num, self.num_kv_heads, k_block_sz * k_token_sz).to(kv_dtype)
+                sub_v = torch.zeros(blk_num, self.num_kv_heads, v_block_sz * v_token_sz).to(kv_dtype)
                 for i in  range(len(block_indices)):
                     sub_k[block_indices[i],:] = k_cache[i,:]
                     sub_v[block_indices[i],:] = v_cache[i,:]
@@ -337,14 +337,17 @@ class page_atten_cm:
             aligned_seqlen = seq_len + padding_tokens
             padded_k = torch.nn.functional.pad(k, kv_padding_dims, "constant", 1)
             padded_v = torch.nn.functional.pad(v, kv_padding_dims, "constant", 1)
-            if self.compressed_kvcache is False:
+            if self.compressed_kvcache == KV_CACHE_COMPRESSION_NONE:
                 padded_k.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
                 padded_v.view(torch.uint16)[seq_len:aligned_seqlen] = 0xfe00
 
         k_cache = padded_k.reshape(aligned_seqlen // self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
         v_cache = padded_v.reshape(aligned_seqlen // self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1, 2).contiguous()
-        if self.compressed_kvcache:
+        if self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_TOKEN:
             k_cache = quan_per_token(k_cache)
+            v_cache = quan_per_token(v_cache)
+        elif self.compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            k_cache = quan_per_channel(k_cache, self.sub_block_sz)
             v_cache = quan_per_token(v_cache)
         else:
             k_cache = k_cache.reshape(aligned_seqlen // self.block_sz, self.num_kv_heads, -1)
@@ -354,8 +357,9 @@ class page_atten_cm:
         trunk_num = (aligned_seqlen + self.trunk_sz - 1) // self.trunk_sz
         max_blks = aligned_seqlen // self.block_sz
 
-        kv_dtype = torch.uint8 if self.compressed_kvcache else torch.half
-        token_sz = (head_size + 4) if self.compressed_kvcache else head_size
+        kv_dtype = torch.uint8 if self.compressed_kvcache != KV_CACHE_COMPRESSION_NONE else torch.half
+        k_block_sz, k_token_sz = get_k_cache_layout(head_size, self.block_sz, self.compressed_kvcache, self.sub_block_sz)
+        v_block_sz, v_token_sz = get_v_cache_layout(head_size, self.block_sz, self.compressed_kvcache)
 
         # Precompute per-trunk masks once (CPU)
         block_mask_list = None
@@ -402,8 +406,8 @@ class page_atten_cm:
             else:
                 block_indices = torch.randperm(blk_num)
 
-            sub_k = torch.zeros(blk_num, self.num_kv_heads, self.block_sz * token_sz, dtype=kv_dtype)
-            sub_v = torch.zeros(blk_num, self.num_kv_heads, self.block_sz * token_sz, dtype=kv_dtype)
+            sub_k = torch.zeros(blk_num, self.num_kv_heads, k_block_sz * k_token_sz, dtype=kv_dtype)
+            sub_v = torch.zeros(blk_num, self.num_kv_heads, v_block_sz * v_token_sz, dtype=kv_dtype)
             for i in range(len(block_indices)):
                 sub_k[block_indices[i], :] = k_cache[i, :]
                 sub_v[block_indices[i], :] = v_cache[i, :]
@@ -487,8 +491,8 @@ class page_atten_cm:
 
     @staticmethod
     @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size,block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz):
-        return page_atten_cm(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
+    def create_instance(num_heads, num_kv_heads, head_size,block_sz, trunk_sz, compressed_kvcache, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE, is_causal=True, sparse_block_sz=128):
+        return page_atten_cm(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, sub_block_sz, is_causal, sparse_block_sz)
 
 # sparse to dense mask
 def block_mask_to_attention_mask(block_mask: torch.Tensor, q_len: int, kv_len: int, sparse_block_size: int, trunk_sz: int) -> torch.Tensor:
@@ -603,17 +607,19 @@ def check_close(input, other, atol=1e-2, rtol=1e-2):
         print(f"    other_tensor: {other[not_close_indices]}")
         assert 0
 
-def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=False, sparse_block_sz=128, density=0.5, check_acc = True, return_output = False):
+def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=KV_CACHE_COMPRESSION_NONE, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE, sparse_block_sz=128, density=0.5, check_acc = True, return_output = False):
     cl.profiling(True)
     torch.manual_seed(0)
     torch.set_printoptions(linewidth=1024)
+
+    compressed_kvcache = normalize_kv_cache_compression(compressed_kvcache)
 
     low = -1
     high = 2
     act_dtype = torch.float16
     q = torch.randint(low, high, [seq_len, num_heads, head_size]).to(dtype=act_dtype)
 
-    if compressed_kvcache:
+    if compressed_kvcache != KV_CACHE_COMPRESSION_NONE:
         k = torch.randint(low, high, [seq_len, num_kv_heads, head_size]).to(dtype=act_dtype) / 4.0
         k[0:seq_len:3, :, :] = (k[0:seq_len:3, :, :] + 0.25)/ 2.0
         v = torch.randint(low, high, [seq_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
@@ -672,7 +678,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
                 #     print(f"  pair rows ({q0},{q1}) : {pct_per_pair[l,h,p].item():.2f}%")
 
     # // warmup
-    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
+    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, sub_block_sz, is_causal, sparse_block_sz)
     out = pa_cm(q, k, v, approx_simple_mask)
     latency = cl.finish()
 
@@ -685,14 +691,14 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         # check_close(ref, ref0, atol=1e-2, rtol=1e-3)
         # print(ref)
         # print(out)
-        if (not compressed_kvcache) and sparse_block_sz == 128:
+        if compressed_kvcache == KV_CACHE_COMPRESSION_NONE and sparse_block_sz == 128:
             check_close(ref, out, atol=5e-2, rtol=2e-1)
         else:
             check_close(ref, out)
     else:
         # Roofline latency (ms) at density=1.0 scales with (num_heads * seq_len^2 * head_size)
         # Base: 293.20 ms for num_heads=32, seq_len=32768, head_size=128, fp16
-        roofline_base = 293.27 if compressed_kvcache else 293.20  # base config reference
+        roofline_base = 293.27 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else 293.20  # base config reference
         roofline = roofline_base * (head_size / 128) * (seq_len / 32768)**2 * (num_heads / 32)
         warmup = 5
         rep = 15
@@ -788,15 +794,25 @@ def test_ov():
         print(f'checked {files_checked} files')
         return is_tril & files_checked > 0
 
-    compressed_kvcache = False
+    compressed_kvcache = KV_CACHE_COMPRESSION_NONE
+    sub_block_sz = DEFAULT_SUB_BLOCK_SIZE
     xattn_thresh = 0.9
     sparse_block_sz, kv_block_size, trunk_sz = 256, 256, 4096 # trunk_sz no use
     num_heads, num_kv_heads, head_size = 32, 8, 128
     base = '/home/ceciliapeng/dump_debug_binary/'
 
+    key_block_sz, key_token_sz = get_k_cache_layout(head_size, kv_block_size, compressed_kvcache, sub_block_sz)
+    value_block_sz, value_token_sz = get_v_cache_layout(head_size, kv_block_size, compressed_kvcache)
+
     query = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src0__f16__612_4096_1_1__bfyx.bin').reshape([612, num_heads*head_size])
-    key_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_3__f16__3_8_256_128__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4 if compressed_kvcache else head_size])
-    value_cache   = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_4__f16__3_8_256_128__bfyx.bin', np.int8 if compressed_kvcache else np.float16).reshape([-1, num_kv_heads, kv_block_size, head_size+4 if compressed_kvcache else head_size])
+    key_cache = get_tensor(
+        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_3__f16__3_8_256_128__bfyx.bin',
+        np.int8 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else np.float16,
+    ).reshape([-1, num_kv_heads, key_block_sz, key_token_sz])
+    value_cache = get_tensor(
+        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_4__f16__3_8_256_128__bfyx.bin',
+        np.int8 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else np.float16,
+    ).reshape([-1, num_kv_heads, value_block_sz, value_token_sz])
     # low = -1
     # high = 2
     # act_dtype = torch.float16
@@ -838,7 +854,7 @@ def test_ov():
         check_sanity(key_cache_zps)
         check_sanity(value_cache_zps)
 
-    if compressed_kvcache:
+    if compressed_kvcache != KV_CACHE_COMPRESSION_NONE:
         show_scales_zp()
 
     block_mask  = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_intermediates_4__boolean__1536_1_1_1__bfyx.bin', dtype=np.int8).reshape([num_heads, q_block_pad, -1])
@@ -867,7 +883,7 @@ def test_ov():
     # print(f'{block_indices=}')
 
     is_causal = True
-    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, kv_block_size, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
+    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, kv_block_size, trunk_sz, compressed_kvcache, sub_block_sz, is_causal, sparse_block_sz)
 
     t_query = cl.tensor(query.detach().numpy())
     t_key_cache = cl.tensor(key_cache.detach().numpy())
@@ -978,10 +994,13 @@ def test_ov():
     check_close(ut_out, ov_out)
     sys.exit(0)
 
-    enable_dequant_check = True if compressed_kvcache else False
+    enable_dequant_check = compressed_kvcache != KV_CACHE_COMPRESSION_NONE
     if enable_dequant_check: # TODO: there is bug in this check?
-        k_dequan = dequant_per_token(key_cache.reshape(-1, num_kv_heads, kv_block_size*(head_size+2*2)), head_size, kv_block_size)
-        v_dequan = dequant_per_token(value_cache.reshape(-1, num_kv_heads, kv_block_size*(head_size+2*2)), head_size, kv_block_size)
+        if compressed_kvcache == KV_CACHE_COMPRESSION_BY_CHANNEL:
+            k_dequan = dequant_per_channel(key_cache.reshape(-1, num_kv_heads, key_block_sz * key_token_sz), head_size, kv_block_size, sub_block_sz)
+        else:
+            k_dequan = dequant_per_token(key_cache.reshape(-1, num_kv_heads, key_block_sz * key_token_sz), head_size, kv_block_size)
+        v_dequan = dequant_per_token(value_cache.reshape(-1, num_kv_heads, value_block_sz * value_token_sz), head_size, kv_block_size)
         # print(f'{k_dequan.shape = }, {v_dequan.shape = }')
 
         # => q [q_len, num_heads, head_size], k/v [kv_len, num_kv_heads, head_size]
@@ -1007,30 +1026,42 @@ def test_ov():
 
 if __name__ == "__main__":
 
-    # test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=True, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
+    # test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
     #ACC test PA base
     if 0:
         for block_sz in range(32, 144, 16):
             for blocks_per_trunk in range(1, 30, 6):
                 for seq_len in range(8192, 8248, 3):
-                    for compressed_kv in [True,False]:
+                    for compressed_kv in [KV_CACHE_COMPRESSION_NONE, KV_CACHE_COMPRESSION_BY_TOKEN]:
                         print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                         print(f'[PA_BASE_ACC_TETS]: seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache=={"U8" if compressed_kv else "F16"} sparse_block_sz=1')
                         print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sparse_block_sz = 1, check_acc=True)
-                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sparse_block_sz = 1, check_acc=False)
+                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sub_block_sz=block_sz, sparse_block_sz = 1, check_acc=True)
+                        test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kv, sub_block_sz=block_sz, sparse_block_sz = 1, check_acc=False)
 
         for block_sz in range(128, 257, 32):
                 for seq_len in range(32768, 32810):
                     for trunk_num in range(1, 21):
-                        for compressed_kvcache in [True,False,]:
+                        for compressed_kvcache in [KV_CACHE_COMPRESSION_BY_TOKEN, KV_CACHE_COMPRESSION_NONE]:
                             seq_in_blks = (seq_len + block_sz -1 ) // block_sz
                             blocks_per_trunk = seq_in_blks // trunk_num if seq_in_blks % trunk_num == 0 else seq_in_blks // (trunk_num - 1)
                             print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                             print(f'[PA_BASE_ACC_TETS]:seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache={"U8" if compressed_kvcache else "F16"}')
                             print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz=1, check_acc=True)
-                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz=1, check_acc=True)
+                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
+                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
+
+        if 1:
+            seq_len = 32 * 1024
+            block_sz = 256
+            trunk_sz = seq_len
+            compressed_kv = KV_CACHE_COMPRESSION_BY_CHANNEL
+            for sub_block_sz in [16, 32, 64, 128]:
+                print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+                print(f'[PA_BY_CHANNEL_ACC_TESTS]: seq_len={seq_len} block_sz={block_sz} trunk_sz={trunk_sz} kv_cache={compressed_kv} sub_block_sz={sub_block_sz}')
+                print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+                test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=trunk_sz, compressed_kvcache=compressed_kv, sub_block_sz=sub_block_sz, sparse_block_sz = 1, check_acc=True)
+                test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 32, block_sz=block_sz, trunk_sz=trunk_sz, compressed_kvcache=compressed_kv, sub_block_sz=sub_block_sz, sparse_block_sz = 1, check_acc=True)
     #ACC test sparse X Attention:
     if 0:
         for sparse_block_sz in [128, 256, 1]:
@@ -1039,26 +1070,26 @@ if __name__ == "__main__":
                     for blocks_per_trunk in [1, 15, 16, 17, 32, 300]:
                         for seq_len in [16*15, 16*16, 16*16+1, 1024, 1024+1, 8*1024, 8*1024+3, 16*1024]:
                             for head_size in [32, 96, 128]:
-                                for compressed_kvcache in [True,False,]:
+                                for compressed_kvcache in [KV_CACHE_COMPRESSION_BY_TOKEN, KV_CACHE_COMPRESSION_NONE]:
                                     print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                                     print(f'[XATTENION_ACC_TETS]:seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache={"U8" if compressed_kvcache else "F16"} {sparse_block_sz=} {density=}')
                                     print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-                                    test_page_attn_causal_batch1(seq_len, num_heads = 4, num_kv_heads = 2, head_size = head_size, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
+                                    test_page_attn_causal_batch1(seq_len, num_heads = 4, num_kv_heads = 2, head_size = head_size, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
 
-    def smoke_accuracy_test(blocks_per_trunk = 128, compressed_kvcache = True):
+    def smoke_accuracy_test(blocks_per_trunk = 128, compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE):
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sparse_block_sz = 1, density=1.0, check_acc=True)
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sparse_block_sz = 256, density=0.33, check_acc=True)
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sparse_block_sz = 128, density=0.33, check_acc=True)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=True)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 256, density=0.33, check_acc=True)
+        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 128, density=0.33, check_acc=True)
 
     # perf for sparse X attention, with QWen3 8K case
-    def smoke_perf_test(blocks_per_trunk = 128, compressed_kvcache = True):
+    def smoke_perf_test(blocks_per_trunk = 128, compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE):
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sparse_block_sz = 1, density=1.0, check_acc=False)
+        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
 
         for sparse_block_sz in [256, 128]:
             for density in [1.0, 0.99, 0.66, 0.33, 0.11]:
@@ -1066,11 +1097,12 @@ if __name__ == "__main__":
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
-                test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
+                test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
     smoke_accuracy_test()
     smoke_accuracy_test(16)
-    smoke_accuracy_test(compressed_kvcache = False)
+    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
+    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
 
     # HEAD_SIZE=256 accuracy tests: fp16 kvcache and compressed (by_token) kvcache
     for compressed_kv in [False, True]:
@@ -1080,7 +1112,8 @@ if __name__ == "__main__":
 
     smoke_perf_test()
     smoke_perf_test(16)
-    smoke_perf_test(compressed_kvcache = False)
+    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
+    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
 
     # HEAD_SIZE=256 perf benchmarks (matching smoke_perf_test pattern)
     def smoke_perf_test_256(blocks_per_trunk = 128, compressed_kvcache = True):

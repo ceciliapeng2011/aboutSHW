@@ -11,6 +11,7 @@ a.out
 *.visaasm
 *.dat
 
+.github/skills/CM_spec
 .vscode
 ocl.venv
 .venv

@@ -39,6 +39,7 @@ SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
 BLOCK_SG_M = 64
 BLOCK_SG_N = 32
+SUB_BLOCK_SIZE = 16
 
 if xe_arch == 1:
     BLOCK_SG_M = 32
@@ -54,8 +55,15 @@ class xattn_gemmQK:
     def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
         BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
 
-        if kvcache_compressed:
+        if isinstance(kvcache_compressed, bool):
+            kv_cache_compression = 1 if kvcache_compressed else 0
+        else:
+            kv_cache_compression = int(kvcache_compressed)
+
+        if kv_cache_compression == 1:
             self.HEAD_SIZE_KEY = head_size + 2 * 2
+        elif kv_cache_compression == 2:
+            self.HEAD_SIZE_KEY = head_size + head_size // 4
         else:
             self.HEAD_SIZE_KEY = head_size
 
@@ -67,7 +75,7 @@ class xattn_gemmQK:
         self.head_size = head_size
         self.xattn_block_size = xattn_block_size
         self.is_causal = is_causal
-        self.kvcache_compressed = kvcache_compressed
+        self.kv_cache_compression = kv_cache_compression
 
         INV_S = 1 / torch.sqrt(torch.tensor([head_size], dtype=torch.float32)) / STRIDE
         INV_S = int(INV_S.view(dtype=torch.uint32))
@@ -82,7 +90,8 @@ class xattn_gemmQK:
                             -Qxcm_register_file_size=256 -I{cwd}
                             -DSTRIDE={STRIDE} -DHQ={num_heads} -DHK={num_kv_heads} -DHEAD_SIZE={head_size} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
                             -DBLOCK_SIZE={int(xattn_block_size)} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={self.WALK_HQ}
-                            -DIS_CAUSAL={int(is_causal)} -DUSE_INT8={int(kvcache_compressed)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
+                            -DIS_CAUSAL={int(is_causal)} -DKV_CACHE_COMPRESSION={self.kv_cache_compression} -DUSE_INT8={int(self.kv_cache_compression != 0)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
+                            -DSUB_BLOCK_SIZE={SUB_BLOCK_SIZE}
                             -DBLOCK_WG_K={int(BLOCK_WG_K)}
                             ''')
         
@@ -148,6 +157,38 @@ class xattn_gemmQK:
     def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
         return xattn_gemmQK(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
 
+    @staticmethod
+    def _round_to_even(tensor: torch.Tensor) -> torch.Tensor:
+        rounded = torch.floor(tensor + 0.5)
+        adjustment = (rounded % 2 != 0) & (torch.abs(tensor - rounded) == 0.5000)
+        adjustment = adjustment | (rounded > 255)
+        result = rounded - adjustment.to(rounded.dtype)
+        return torch.clamp(result, min=0, max=255)
+
+    @staticmethod
+    def _quant_per_channel(kv_cache_blocks: torch.Tensor, tail_sub_block: int, tail_token: int):
+        blk_num, kv_heads, num_sub_blocks, sub_block_size, head_size = kv_cache_blocks.shape
+        mask = torch.ones_like(kv_cache_blocks, dtype=torch.bool)
+        if tail_token:
+            mask[:, :, tail_sub_block:tail_sub_block + 1, tail_token:, :] = False
+        kv_max = torch.where(mask, kv_cache_blocks, torch.tensor(float("-inf"), dtype=torch.float16)).amax(dim=3, keepdim=True)
+        kv_min = torch.where(mask, kv_cache_blocks, torch.tensor(float("inf"), dtype=torch.float16)).amin(dim=3, keepdim=True)
+        qrange = kv_max - kv_min
+
+        kv_scale = 255.0 / qrange.to(dtype=torch.float)
+        zero_mask = qrange == 0
+        if zero_mask.any():
+            kv_scale = torch.where(zero_mask, torch.ones_like(kv_scale), kv_scale)
+
+        kv_scale_div = (1.0 / kv_scale).to(dtype=torch.float16)
+        kv_zp = ((0.0 - kv_min) * kv_scale + 0.0).to(dtype=torch.float16)
+
+        kv_u8 = xattn_gemmQK._round_to_even((kv_cache_blocks * kv_scale).to(dtype=torch.float16) + kv_zp).to(dtype=torch.uint8)
+        kv_u8 = kv_u8.reshape(blk_num, kv_heads, -1)
+        dq_scale = kv_scale_div.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
+        kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num, kv_heads, -1)
+        return kv_u8, dq_scale, kv_zp
+
     def quant_i8(self, k:torch.Tensor):
         HEAD_SIZE = self.head_size
         B, Hk, Lk, S = k.shape
@@ -157,6 +198,16 @@ class xattn_gemmQK:
         B, Hk, Lk, S = k_pad.shape
         k_i8 = torch.zeros([B, Hk, Lk, self.HEAD_SIZE_KEY], dtype=torch.uint8)
         k_i8_4d = k_i8.reshape([B, Hk, -1, KV_BLOCK_SIZE * self.HEAD_SIZE_KEY])
+        if self.kv_cache_compression == 2:
+            num_sub_blocks = KV_BLOCK_SIZE // SUB_BLOCK_SIZE
+            k_groups = k_pad.reshape(B, Hk, -1, num_sub_blocks, SUB_BLOCK_SIZE, HEAD_SIZE)
+            kv_u8, dq_scale, kv_zp = self._quant_per_channel(k_groups, 0, 0)
+            k_i8_4d[:, :, :, :KV_BLOCK_SIZE * HEAD_SIZE] = kv_u8.reshape(B, Hk, -1, KV_BLOCK_SIZE * HEAD_SIZE)
+            scale_start = KV_BLOCK_SIZE * HEAD_SIZE
+            scale_end = scale_start + num_sub_blocks * HEAD_SIZE * 2
+            k_i8_4d[:, :, :, scale_start:scale_end] = dq_scale.reshape(B, Hk, -1, num_sub_blocks * HEAD_SIZE * 2)
+            k_i8_4d[:, :, :, scale_end:] = kv_zp.reshape(B, Hk, -1, num_sub_blocks * HEAD_SIZE * 2)
+            return k_i8, k_pad[:, :, :k.shape[2], :]
         if 0:
             max = torch.max(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
             min = torch.min(k_pad, dim=-1, keepdim=True)[0].to(torch.float32)
@@ -209,7 +260,7 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
     
     xattn_cm = xattn_gemmQK.create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, causal, kvcache_compressed)
 
-    if kvcache_compressed:
+    if xattn_cm.kv_cache_compression:
         k_pad, k = xattn_cm.quant_i8(k)
         key_cache = k_pad.reshape([B, Hk, -1, KV_BLOCK_SIZE, xattn_cm.HEAD_SIZE_KEY]).permute(0, 2, 1, 3, 4)
     else:

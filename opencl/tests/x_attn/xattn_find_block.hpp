@@ -14,7 +14,7 @@
  * limitations under the License.
  *******************************************************************************/
 
-// namespace KERNEL_NAME {
+namespace KERNEL_NAME {
 #include "find_block.hpp"
 
 #ifndef ATTR
@@ -66,4 +66,4 @@ extern "C" _GENX_MAIN_ void find_block(
     );
 }
 
-// }  // NAMESPACE
+}  // NAMESPACE
