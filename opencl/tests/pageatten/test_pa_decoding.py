@@ -51,7 +51,7 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-
 class DecodingCase:
     num_heads: int = 32
     num_kv_heads: int = 8
-    head_size: int = 128
+    head_size: int = 256
     block_size: int = 256
     sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE
     kv_len: int = 4097
@@ -568,7 +568,7 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
     case = DecodingCase(
         num_heads=32,
         num_kv_heads=8,
-        head_size=128,
+        head_size=256,
         block_size=256,
         kv_len=32769,
         kv_cache_compression=0,
