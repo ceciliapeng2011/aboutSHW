@@ -2,6 +2,7 @@ import os
 
 import torch
 import numpy as np
+import pytest
 
 import functools
 
@@ -51,6 +52,12 @@ BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
 KV_BLOCK_SIZE = 256
 PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
+
+
+def setup_module(module):
+    torch.manual_seed(3)
+    torch.set_printoptions(linewidth=1024)
+    cl.profiling(True)
 
 class xattn_gemmQK:
     def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
@@ -201,7 +208,8 @@ class xattn_gemmQK:
         k_i8_4d = k_i8.reshape([B, Hk, -1, KV_BLOCK_SIZE * self.HEAD_SIZE_KEY])
         if self.kv_cache_compression == 2:
             num_sub_blocks = KV_BLOCK_SIZE // SUB_BLOCK_SIZE
-            k_groups = k_pad.reshape(B, Hk, -1, num_sub_blocks, SUB_BLOCK_SIZE, HEAD_SIZE)
+            num_blocks = Lk // KV_BLOCK_SIZE
+            k_groups = k_pad.reshape(B * Hk * num_blocks, 1, num_sub_blocks, SUB_BLOCK_SIZE, HEAD_SIZE)
             kv_u8, dq_scale, kv_zp = self._quant_per_channel(k_groups, 0, 0)
             k_i8_4d[:, :, :, :KV_BLOCK_SIZE * HEAD_SIZE] = kv_u8.reshape(B, Hk, -1, KV_BLOCK_SIZE * HEAD_SIZE)
             scale_start = KV_BLOCK_SIZE * HEAD_SIZE
@@ -236,7 +244,7 @@ class xattn_gemmQK:
 
 # q: [B, Hq, L_q, S]
 # k: [B, Hk, L_k, S]
-def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, causal=True, perf=True):
+def run_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, causal=True, perf=True):
     B, Hq, Lq, S = q.shape
     _, Hk, Lk, _ = k.shape
     Lk = Lk // STRIDE * STRIDE
@@ -301,7 +309,7 @@ def test_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size,
 
     return t_kq_max_wg, t_kq_exp_partial_sum
 
-def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
+def run_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     dim = head_size
     sizes = [
         # real cases
@@ -339,9 +347,9 @@ def test_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 12
             assert q_start_strided >= 0, "length of key cache must be greater or equal than query"
         else:
             q_start_strided = 0
-        test_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=False)
+        run_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=False)
 
-def test_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
+def run_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     # 106 T/s:
     # bsz = 1
     # q_head = 1
@@ -361,7 +369,7 @@ def test_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 12
     k = torch.randint(-2, 4, size=[1, num_kv_heads, k_len, head_size], dtype=torch.int16).to(dtype=torch.float16)
     q_start_strided=k_len // STRIDE - q_len // STRIDE
 
-    test_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=True)
+    run_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=True)
 
 # ============================================================================
 # Multi-subsequence support
@@ -688,10 +696,33 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
         print(f'{Colors.GREEN}multi-subseq test "{desc}" passed{Colors.END}')
 
 
+@pytest.mark.parametrize("xattn_block_size", [128, 256])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads",
+    [
+        (1, 1),
+        (2, 1),
+        (4, 2),
+        (32, 8),
+        (16, 16),
+        (28, 4),
+    ],
+)
+def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, num_heads, num_kv_heads):
+    run_func(
+        xattn_block_size=xattn_block_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        kvcache_compressed=kvcache_compressed,
+        is_causal=True,
+    )
+
 def main():
     for xattn_block_size in [128, 256]:
-        test_func(xattn_block_size)
-        # test_perf(xattn_block_size)
+        run_func(xattn_block_size)
 
 def main_multi():
     for xattn_block_size in [128, 256]:
@@ -706,7 +737,11 @@ if __name__ == "__main__":
     import sys
     if '--multi-subseq' in sys.argv:
         main_multi()
+    elif '--perf' in sys.argv:
+        for xattn_block_size in [128, 256]:
+            run_perf(xattn_block_size)
     else:
         main()
-        # Uncomment to also run multi-subseq tests:
-        # main_multi()
+
+# Usage:
+# - python -m pytest opencl/tests/x_attn/test_gemm_qk.py -s -vv

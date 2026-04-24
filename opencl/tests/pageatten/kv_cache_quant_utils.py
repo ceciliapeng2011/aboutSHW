@@ -83,14 +83,19 @@ def quant_per_channel_parts(
 
     kv_max = torch.where(mask, kv, torch.tensor(float("-inf"), dtype=torch.float16)).amax(dim=3, keepdim=True)
     kv_min = torch.where(mask, kv, torch.tensor(float("inf"), dtype=torch.float16)).amin(dim=3, keepdim=True)
-    qrange = kv_max - kv_min
+    qrange = (kv_max - kv_min).to(dtype=torch.float)
+    zero_mask = qrange == 0
+
+    # Match the CM reference small-range guard used during by channel requantization.
+    min_range = kv_max.abs().to(dtype=torch.float) * 0.1
+    adjust_val = torch.maximum(min_range, torch.ones_like(min_range))
+    qrange = torch.where(qrange <= min_range, qrange + adjust_val, qrange)
 
     u8_max = torch.tensor(255.0, dtype=torch.float)
     u8_min = torch.tensor(0.0, dtype=torch.float)
     u8_range = u8_max - u8_min
 
-    kv_scale = u8_range / qrange.to(dtype=torch.float)
-    zero_mask = qrange == 0
+    kv_scale = u8_range / qrange
     if zero_mask.any():
         kv_scale = torch.where(zero_mask, torch.ones_like(kv_scale), kv_scale)
 
