@@ -563,6 +563,7 @@ if __name__ == "__main__":
             run_pa_kv_cache_update_case([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
             run_pa_kv_cache_update_case([1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
             run_pa_kv_cache_update_case([129], [0], num_kv_heads=2, k_head_size=64, v_head_size=64, block_size=16, check_perf=True)
+            run_pa_kv_cache_update_case([32*1024], [4*1024], num_kv_heads=8, k_head_size=256, v_head_size=256, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
 
     if 1:
         token_pairs_acc = [

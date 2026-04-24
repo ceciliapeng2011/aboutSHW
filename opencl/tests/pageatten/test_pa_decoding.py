@@ -86,7 +86,7 @@ class PaSingleTokenRunner:
 
         self.k_partition_block_num = 1
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
-        self.reduce_split_step = 8
+        self.reduce_split_step = 16 if head_size >= 256 else 8
 
         max_repeat_count = 8
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads
@@ -354,6 +354,9 @@ GENERATE_ONLY_SINGLE_SUBSEQ_CASES = (
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=0),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=1),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=2),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=256, block_size=256, kv_len=513, kv_cache_compression=0),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=256, block_size=256, kv_len=513, kv_cache_compression=1),
+    DecodingCase(num_heads=8, num_kv_heads=2, head_size=256, block_size=256, kv_len=513, kv_cache_compression=2),
 )
 
 
@@ -538,6 +541,28 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
 
     assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
     assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
+
+    # HEAD_SIZE=256 bandwidth benchmark — compare against head_size=128
+    for cmpr in [0, 1, 2]:
+        for hs in [128, 256]:
+            case_cmp = DecodingCase(
+                num_heads=32,
+                num_kv_heads=8,
+                head_size=hs,
+                block_size=256,
+                kv_len=32769,
+                kv_cache_compression=cmpr,
+            )
+            perf_cmp = _run_bandwidth_measurement(case_cmp, loop_cnt=50, warmup=5)
+            tag = f"hs{hs}_cmpr{cmpr}"
+            print(
+                f"[perf][{tag}] "
+                f"cm_sdpa_2nd_bw={perf_cmp['cm_sdpa_2nd_bw_gbs']:.3f} GB/s, "
+                f"cm_sdpa_2nd_reduce_bw={perf_cmp['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s, "
+                f"cm_sdpa_2nd_ms={perf_cmp['cm_sdpa_2nd_ms']:.3f}, "
+                f"cm_sdpa_2nd_reduce_ms={perf_cmp['cm_sdpa_2nd_reduce_ms']:.3f}"
+            )
+            assert perf_cmp["cm_sdpa_2nd_bw_gbs"] > 0.0
 
 # Usage:
 #   python -m py_compile test_pa_decoding.py
