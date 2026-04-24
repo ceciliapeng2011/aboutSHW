@@ -208,6 +208,8 @@ class PaSingleTokenRunner:
         lws = [1, 1, 1]
         gws_2 = [batch_size, self.num_heads, self.head_size // self.reduce_split_step]
         lws_2 = [1, 1, 1]
+        selected_sequence_ids = torch.tensor([0], dtype=torch.int32)
+        selected_sequence_count = int(selected_sequence_ids.numel())
 
         for _ in range(n_repeats):
             t_q = cl.tensor(query.detach().numpy())
@@ -217,6 +219,7 @@ class PaSingleTokenRunner:
             t_block_indices = cl.tensor(block_indices.detach().numpy())
             t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+            t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
             t_out = cl.tensor([batch_size, self.num_heads, kv_partition_num, self.head_size], np.dtype(np.float32))
             t_out_final = cl.tensor(out.contiguous().detach().numpy())
             t_lse = cl.tensor([batch_size, self.num_heads, kv_partition_num], np.dtype(np.float32))
@@ -232,6 +235,8 @@ class PaSingleTokenRunner:
                 t_block_indices,
                 t_block_indices_begins,
                 t_subsequence_begins,
+                t_selected_sequence_ids,
+                selected_sequence_count,
                 t_out,
                 t_lse,
                 1,
@@ -415,6 +420,8 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
     lws = [1, 1, 1]
     gws_2 = [batch, runner.num_heads, runner.head_size // runner.reduce_split_step]
     lws_2 = [1, 1, 1]
+    selected_sequence_ids = torch.tensor([0], dtype=torch.int32)
+    selected_sequence_count = int(selected_sequence_ids.numel())
 
     all_layers = []
     mem_size = 0
@@ -437,6 +444,7 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
     t_block_indices = cl.tensor(block_indices.detach().numpy())
     t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
     t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+    t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
     t_lse = cl.tensor([batch, runner.num_heads, kv_partition_num], np.dtype(np.float32))
 
     # Clear any previously recorded profiling events (e.g., cm_get_grf_width).
@@ -456,6 +464,8 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
             t_block_indices,
             t_block_indices_begins,
             t_subsequence_begins,
+            t_selected_sequence_ids,
+            selected_sequence_count,
             t_out,
             t_lse,
             1,

@@ -101,8 +101,12 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 #if SPARSE_BLOCK_SIZE > 1
     , bool* sparse_block_mask [[type("svmptr_t")]],
     bool* sparse_block_mask_wg [[type("svmptr_t")]],
+#if MULTI_SUBSEQ
+    int32_t* xattn_subseq_meta [[type("svmptr_t")]]
+#else
     int num_q_blocks,
     int num_k_blocks
+#endif
 #endif
     ) {
     constexpr int is_causal = CMFLA_IS_CAUSAL;
@@ -233,11 +237,35 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
 #if SPARSE_BLOCK_SIZE > 1
     bool *block_mask_base, *wg_block_mask_base;
+#if MULTI_SUBSEQ
+    // Per-subsequence metadata layout (16 ints per subseq, same as xattn_gemm_qk.hpp)
+    //   [12] buf_offset_mask, [13] buf_offset_mask_wg, [6] q_block_pad, [7] k_block_pad
+    constexpr int XATTN_META_STRIDE_PA = 16;
+    int meta_base_pa = subsequence_id * XATTN_META_STRIDE_PA;
+    int mask_offset = xattn_subseq_meta[meta_base_pa + 12];
+    int mask_wg_offset = xattn_subseq_meta[meta_base_pa + 13];
+    int subseq_num_q_blocks = xattn_subseq_meta[meta_base_pa + 6];
+    int subseq_num_k_blocks = xattn_subseq_meta[meta_base_pa + 7];
+    if (mask_offset >= 0) {
+        // Use subsequence-relative query position for block mask indexing
+        auto q_start_block = q_start_local / SPARSE_BLOCK_SIZE;
+        block_mask_base = sparse_block_mask + mask_offset + (h * subseq_num_q_blocks + q_start_block) * subseq_num_k_blocks;
+        int blocks_per_wg = wg_seq_len / SPARSE_BLOCK_SIZE;
+        int subseq_merged_q_blocks = (subseq_num_q_blocks + blocks_per_wg - 1) / blocks_per_wg;
+        int local_wg_idx = (block_start_pos - subseq_q_begin) / wg_seq_len;
+        wg_block_mask_base = sparse_block_mask_wg + mask_wg_offset + (h * subseq_merged_q_blocks + local_wg_idx) * subseq_num_k_blocks;
+    } else {
+        // Bypassed subsequence (decode): no sparse mask, dense fallback
+        block_mask_base = 0;
+        wg_block_mask_base = 0;
+    }
+#else
     //# sparse_block_mask [num_heads, num_q_blocks, num_k_blocks]
     //# sparse_block_mask_wg [num_heads, wg_count_along_query, num_k_blocks]
     auto q_start_block = q_start_sg/ SPARSE_BLOCK_SIZE;
     block_mask_base = sparse_block_mask + (h * num_q_blocks + q_start_block) * num_k_blocks;
     wg_block_mask_base = sparse_block_mask_wg + (h * cm_group_count(2) + wg_id) * num_k_blocks;
+#endif
  #endif
 
 #if KV_CACHE_COMPRESSION

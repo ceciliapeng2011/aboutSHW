@@ -43,7 +43,7 @@ KV_CACHE_COMPRESSION_BY_TOKEN = 1
 KV_CACHE_COMPRESSION_BY_CHANNEL = 2
 def normalize_kv_cache_compression(mode):
     if isinstance(mode, bool):
-        return KV_CACHE_COMPRESSION_BY_TOKEN if mode else KV_CACHE_COMPRESSION_NONE
+        raise TypeError("compressed_kvcache must be int in {0, 1, 2}, got bool")
 
     mode = int(mode)
     if mode not in {
@@ -116,6 +116,15 @@ class page_atten_cm:
                       f" -DSUB_BLOCK_SIZE={self.sub_block_sz}"
                       f" -mdump_asm -g2")
                      )
+
+    @staticmethod
+    def _build_blocked_q_starts_and_subseq_mapping(q_len: int, wg_seq_len: int) -> torch.Tensor:
+        wg_count = DIV_UP(q_len, wg_seq_len)
+        blocked_q_starts_and_subseq_mapping: list[int] = []
+        for mapped_wg_id in range(wg_count):
+            blocked_q_starts_and_subseq_mapping.append(mapped_wg_id * wg_seq_len)
+            blocked_q_starts_and_subseq_mapping.append(0)
+        return torch.tensor(blocked_q_starts_and_subseq_mapping, dtype=torch.int32)
 
     def __call__(self, q, k, v, block_mask, n_repeats = 1):
         seq_len, _, head_size = q.shape
@@ -266,6 +275,8 @@ class page_atten_cm:
                 t_past_lens=cl.tensor(past_lens.to(torch.int32).detach().numpy())
                 t_block_indices_begins=cl.tensor(block_indices_begins.to(torch.int32).detach().numpy())
                 t_subsequence_begins=cl.tensor(subsequence_begins.to(torch.int32).detach().numpy())
+                blocked_q_starts_and_subseq_mapping = self._build_blocked_q_starts_and_subseq_mapping(q_len, wg_seq_len)
+                t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
 
                 # print(f"calling cm_page_attention {GWS=} {LWS=} x {n_repeats} times, q:[{q_start}, {q_end}], past_lens:{int(past_lens)}, kv_blk_num:{blk_num}, sparse_block_sz:{self.sparse_block_sz} kv_cache:{"U8" if self.compressed_kvcache else "F16"}")
                 if self.sparse_block_sz > 1:
@@ -291,6 +302,7 @@ class page_atten_cm:
                         t_block_indices,
                         t_block_indices_begins,
                         t_subsequence_begins,
+                        t_blocked_q_starts_and_subseq_mapping,
                         t_out,
                         q_len,
                         t_block_mask,
@@ -310,6 +322,7 @@ class page_atten_cm:
                         t_block_indices,
                         t_block_indices_begins,
                         t_subsequence_begins,
+                        t_blocked_q_starts_and_subseq_mapping,
                         t_out,
                         q_len,
                     )
@@ -436,6 +449,8 @@ class page_atten_cm:
             t_past_lens = cl.tensor(past_lens.detach().numpy())
             t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
+            blocked_q_starts_and_subseq_mapping = self._build_blocked_q_starts_and_subseq_mapping(q_len, wg_seq_len)
+            t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
 
             if self.sparse_block_sz > 1:
                 t_block_mask = cl.tensor(block_mask_list[trunk_idx].detach().numpy())
@@ -449,12 +464,12 @@ class page_atten_cm:
             if self.sparse_block_sz > 1:
                 t_block_mask_in_wg = cl.tensor(block_mask_in_wg_list[trunk_idx].detach().numpy())
                 per_trunk_args.append(
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len, t_block_mask, t_block_mask_in_wg, num_q_blocks, num_k_blocks)
                 )
             else:
                 per_trunk_args.append(
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len)
                 )
 
@@ -465,26 +480,26 @@ class page_atten_cm:
         for _ in range(n_warmup):
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
                 else:
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len)
         cl.finish()
 
         # Timed
         for _ in range(n_iters):
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
                 else:
-                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out,
+                    (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_out, q_len)
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len)
 
         return cl.finish()
 
@@ -888,6 +903,8 @@ def test_ov():
     t_block_indices_begins = cl.tensor(block_indices_begins.to(torch.int32).detach().numpy())
     t_past_lens = cl.tensor(past_lens.to(torch.int32).detach().numpy())
     t_subsequence_begins = cl.tensor(subsequence_begins.to(torch.int32).detach().numpy())
+    blocked_q_starts_and_subseq_mapping = page_atten_cm._build_blocked_q_starts_and_subseq_mapping(q_len, wg_seq_len)
+    t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
 
     output = torch.zeros(q_len, num_heads*head_size).to(torch.float16)
     output = ov_out.clone()
@@ -953,6 +970,7 @@ def test_ov():
             t_block_indices,
             t_block_indices_begins,
             t_subsequence_begins,
+            t_blocked_q_starts_and_subseq_mapping,
             t_out,
             q_len,
             t_block_mask,
@@ -972,6 +990,7 @@ def test_ov():
             t_block_indices,
             t_block_indices_begins,
             t_subsequence_begins,
+            t_blocked_q_starts_and_subseq_mapping,
             t_out,
             q_len,
         )
