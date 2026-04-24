@@ -2,6 +2,7 @@ import os
 
 import torch
 import numpy as np
+import pytest
 
 import functools
 
@@ -50,6 +51,12 @@ SG_N = 8
 BLOCK_WG_M = BLOCK_SG_M * SG_M
 BLOCK_WG_N = BLOCK_SG_N * SG_N
 KV_BLOCK_SIZE = 256
+
+
+def setup_module(module):
+    torch.manual_seed(3)
+    torch.set_printoptions(linewidth=1024)
+    cl.profiling(True)
 
 class xattn_gemmQK:
     def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
@@ -362,10 +369,31 @@ def test_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 12
 
     test_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=True)
 
-def main():
-    for xattn_block_size in [128, 256]:
-        test_func(xattn_block_size)
-        test_perf(xattn_block_size)
+
+
+@pytest.mark.parametrize("xattn_block_size", [128, 256])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads",
+    [
+        (1, 1),
+        (2, 1),
+        (4, 2),
+        (32, 8),
+        (16, 16),
+        (28, 4),
+    ],
+)
+def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, num_heads, num_kv_heads):
+    test_func(
+        xattn_block_size=xattn_block_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        kvcache_compressed=kvcache_compressed,
+        is_causal=True,
+    )
 
 if __name__ == "__main__":
     torch.manual_seed(3)
@@ -377,4 +405,8 @@ if __name__ == "__main__":
     # num_q_head == num_kv_head
     # chunk size alignment
     # causal_mask
-    main()
+    for xattn_block_size in [128, 256]:
+        test_perf(xattn_block_size)
+        
+# Usage:
+# - python -m pytest opencl/tests/x_attn/test_gemm_qk.py -s -vv
