@@ -40,7 +40,7 @@ SOFTMAX_TYPE = 'float' # 'half'
 STRIDE = 16
 BLOCK_SG_M = 64
 BLOCK_SG_N = 32
-SUB_BLOCK_SIZE = 16
+DEFAULT_SUB_BLOCK_SIZE = 16
 
 if xe_arch == 1:
     BLOCK_SG_M = 32
@@ -60,7 +60,7 @@ def setup_module(module):
     cl.profiling(True)
 
 class xattn_gemmQK:
-    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
+    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
         BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
 
         if isinstance(kvcache_compressed, bool):
@@ -68,16 +68,18 @@ class xattn_gemmQK:
         else:
             kv_cache_compression = int(kvcache_compressed)
 
+        self.sub_block_size = sub_block_size
+
         if kv_cache_compression == 1:
             self.HEAD_SIZE_KEY = head_size + 2 * 2
         elif kv_cache_compression == 2:
-            self.HEAD_SIZE_KEY = head_size + head_size // 4
+            self.HEAD_SIZE_KEY = head_size + 4 * head_size // sub_block_size
         else:
             self.HEAD_SIZE_KEY = head_size
 
         # loop order walks HQ first and the step is WALK_HQ, 1 means not walk HQ, 2 means walks 2 heads first. Valid value: 1, 2, 4...
         self.WALK_HQ = 2 if num_heads != num_kv_heads else 1
-        
+
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
@@ -99,7 +101,7 @@ class xattn_gemmQK:
                             -DSTRIDE={STRIDE} -DHQ={num_heads} -DHK={num_kv_heads} -DHEAD_SIZE={head_size} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
                             -DBLOCK_SIZE={int(xattn_block_size)} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={self.WALK_HQ}
                             -DIS_CAUSAL={int(is_causal)} -DKV_CACHE_COMPRESSION={self.kv_cache_compression} -DUSE_INT8={int(self.kv_cache_compression != 0)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                            -DSUB_BLOCK_SIZE={SUB_BLOCK_SIZE}
+                            -DSUB_BLOCK_SIZE={self.sub_block_size}
                             -DBLOCK_WG_K={int(BLOCK_WG_K)}
                             ''')
         
@@ -162,8 +164,8 @@ class xattn_gemmQK:
 
     @staticmethod
     @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
-        return xattn_gemmQK(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
+    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
+        return xattn_gemmQK(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size)
 
     @staticmethod
     def _round_to_even(tensor: torch.Tensor) -> torch.Tensor:
@@ -207,9 +209,9 @@ class xattn_gemmQK:
         k_i8 = torch.zeros([B, Hk, Lk, self.HEAD_SIZE_KEY], dtype=torch.uint8)
         k_i8_4d = k_i8.reshape([B, Hk, -1, KV_BLOCK_SIZE * self.HEAD_SIZE_KEY])
         if self.kv_cache_compression == 2:
-            num_sub_blocks = KV_BLOCK_SIZE // SUB_BLOCK_SIZE
+            num_sub_blocks = KV_BLOCK_SIZE // self.sub_block_size
             num_blocks = Lk // KV_BLOCK_SIZE
-            k_groups = k_pad.reshape(B * Hk * num_blocks, 1, num_sub_blocks, SUB_BLOCK_SIZE, HEAD_SIZE)
+            k_groups = k_pad.reshape(B * Hk * num_blocks, 1, num_sub_blocks, self.sub_block_size, HEAD_SIZE)
             kv_u8, dq_scale, kv_zp = self._quant_per_channel(k_groups, 0, 0)
             k_i8_4d[:, :, :, :KV_BLOCK_SIZE * HEAD_SIZE] = kv_u8.reshape(B, Hk, -1, KV_BLOCK_SIZE * HEAD_SIZE)
             scale_start = KV_BLOCK_SIZE * HEAD_SIZE
@@ -244,7 +246,7 @@ class xattn_gemmQK:
 
 # q: [B, Hq, L_q, S]
 # k: [B, Hk, L_k, S]
-def run_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, causal=True, perf=True):
+def run_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, causal=True, perf=True, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
     B, Hq, Lq, S = q.shape
     _, Hk, Lk, _ = k.shape
     Lk = Lk // STRIDE * STRIDE
@@ -267,7 +269,7 @@ def run_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, 
     t_block_indices_begins = cl.tensor(block_indices_begins.to(torch.int32).detach().numpy())
     # t_subsequence_begins = cl.tensor(subsequence_begins.to(torch.int32).detach().numpy()) # N_kq has already been calculated
     
-    xattn_cm = xattn_gemmQK.create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, causal, kvcache_compressed)
+    xattn_cm = xattn_gemmQK.create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, causal, kvcache_compressed, sub_block_size)
 
     if xattn_cm.kv_cache_compression:
         k_pad, k = xattn_cm.quant_i8(k)
@@ -309,7 +311,7 @@ def run_gemm(q:torch.Tensor, k:torch.Tensor, q_start_strided, xattn_block_size, 
 
     return t_kq_max_wg, t_kq_exp_partial_sum
 
-def run_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
+def run_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True, sub_block_size = DEFAULT_SUB_BLOCK_SIZE):
     dim = head_size
     sizes = [
         # real cases
@@ -347,7 +349,7 @@ def run_func(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128
             assert q_start_strided >= 0, "length of key cache must be greater or equal than query"
         else:
             q_start_strided = 0
-        run_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=False)
+        run_gemm(q, k, q_start_strided, xattn_block_size, num_heads, num_kv_heads, head_size, kvcache_compressed, is_causal, perf=False, sub_block_size=sub_block_size)
 
 def run_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128, kvcache_compressed = True, is_causal = True):
     # 106 T/s:
@@ -453,7 +455,7 @@ def build_xattn_subseq_meta(subsequences, num_heads, xattn_block_size, merged_q_
 
 class xattn_gemmQK_multi:
     """Multi-subsequence variant of xattn_gemmQK. Compiles with -DMULTI_SUBSEQ=1."""
-    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
+    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
         BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
 
         if isinstance(kvcache_compressed, bool):
@@ -461,10 +463,12 @@ class xattn_gemmQK_multi:
         else:
             kv_cache_compression = int(kvcache_compressed)
 
+        self.sub_block_size = sub_block_size
+
         if kv_cache_compression == 1:
             self.HEAD_SIZE_KEY = head_size + 2 * 2
         elif kv_cache_compression == 2:
-            self.HEAD_SIZE_KEY = head_size + head_size // 4
+            self.HEAD_SIZE_KEY = head_size + 4 * head_size // sub_block_size
         else:
             self.HEAD_SIZE_KEY = head_size
 
@@ -491,7 +495,7 @@ class xattn_gemmQK_multi:
                             -DSTRIDE={STRIDE} -DHQ={num_heads} -DHK={num_kv_heads} -DHEAD_SIZE={head_size} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
                             -DBLOCK_SIZE={int(xattn_block_size)} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={self.WALK_HQ}
                             -DIS_CAUSAL={int(is_causal)} -DKV_CACHE_COMPRESSION={self.kv_cache_compression} -DUSE_INT8={int(self.kv_cache_compression != 0)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                            -DSUB_BLOCK_SIZE={SUB_BLOCK_SIZE}
+                            -DSUB_BLOCK_SIZE={self.sub_block_size}
                             -DBLOCK_WG_K={int(BLOCK_WG_K)}
                             -DMULTI_SUBSEQ=1
                             ''')
@@ -515,8 +519,8 @@ class xattn_gemmQK_multi:
 
     @staticmethod
     @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed):
-        return xattn_gemmQK_multi(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
+    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
+        return xattn_gemmQK_multi(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size)
 
 
 def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=128, kvcache_compressed=True, is_causal=True):
@@ -699,6 +703,9 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
 @pytest.mark.parametrize("xattn_block_size", [128, 256])
 @pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
+# Only DEFAULT_SUB_BLOCK_SIZE(16) is supported: estimate kernel's dec/load_scale_zp lambdas
+# assume SUB_BLOCK_SIZE == STRIDE (BLOCK_REG_K=16). Other values need dequant loop restructuring.
+@pytest.mark.parametrize("sub_block_sz", [DEFAULT_SUB_BLOCK_SIZE])
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads",
     [
@@ -710,7 +717,11 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
         (28, 4),
     ],
 )
-def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, num_heads, num_kv_heads):
+def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, sub_block_sz, num_heads, num_kv_heads):
+    if sub_block_sz > xattn_block_size:
+        pytest.skip(f"sub_block_sz={sub_block_sz} > xattn_block_size={xattn_block_size}")
+    if kvcache_compressed != 2 and sub_block_sz != DEFAULT_SUB_BLOCK_SIZE:
+        pytest.skip("sub_block_sz only affects by_channel (kvcache_compressed==2)")
     run_func(
         xattn_block_size=xattn_block_size,
         num_heads=num_heads,
@@ -718,6 +729,7 @@ def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, num_
         head_size=head_size,
         kvcache_compressed=kvcache_compressed,
         is_causal=True,
+        sub_block_size=sub_block_sz,
     )
 
 def main():
