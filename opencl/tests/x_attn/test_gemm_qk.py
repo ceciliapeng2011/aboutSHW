@@ -377,7 +377,9 @@ def run_perf(xattn_block_size, num_heads = 32, num_kv_heads = 8, head_size = 128
 @pytest.mark.parametrize("xattn_block_size", [128, 256])
 @pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
-@pytest.mark.parametrize("sub_block_sz", [DEFAULT_SUB_BLOCK_SIZE, 32])
+# Only DEFAULT_SUB_BLOCK_SIZE(16) is supported: estimate kernel's dec/load_scale_zp lambdas
+# assume SUB_BLOCK_SIZE == STRIDE (BLOCK_REG_K=16). Other values need dequant loop restructuring.
+@pytest.mark.parametrize("sub_block_sz", [DEFAULT_SUB_BLOCK_SIZE])
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads",
     [
@@ -419,3 +421,4 @@ if __name__ == "__main__":
         
 # Usage:
 # - python -m pytest test_gemm_qk.py -s -vv
+# - python -m pytest test_gemm_qk.py -s -vv -k "test_func_parametrized[1-1-32-2-128-128]"
