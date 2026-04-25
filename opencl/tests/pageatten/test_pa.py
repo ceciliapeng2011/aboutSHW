@@ -1099,11 +1099,13 @@ if __name__ == "__main__":
     smoke_accuracy_test(16)
     smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
     smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
+    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
 
     smoke_perf_test()
     smoke_perf_test(16)
     smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
     smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
+    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
 
     # test_ov()
     
