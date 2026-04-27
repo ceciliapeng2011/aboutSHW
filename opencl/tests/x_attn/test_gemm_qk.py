@@ -700,6 +700,217 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
         print(f'{Colors.GREEN}multi-subseq test "{desc}" passed{Colors.END}')
 
 
+def test_multi_subseq_with_decode_subseqs(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=128, kvcache_compressed=True, is_causal=True):
+    """Test that decode subsequences (q_len < STRIDE) are handled correctly
+    under both routing strategies:
+
+    - split-route: decode subseqs are filtered out before xattn; metadata
+      contains only prefill subseqs.
+    - multi-route: decode subseqs stay in the metadata with M=0 / wg_count=0
+      and must not corrupt prefill subseq results.
+    """
+    dim = head_size
+    softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+    sizeof_softmax = np.dtype(softmax_type).itemsize
+    sum_per_token_in_block = xattn_block_size // STRIDE
+    k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
+
+    # (q_len, kv_len) pairs — q_len < STRIDE means decode
+    cases = [
+        # split-route: after filtering, only 1 prefill subseq remains
+        ([(1, 4096), (2048, 2048)],
+         "1 decode + 1 prefill (split leaves single prefill)"),
+        # split-route: after filtering, 2 prefill subseqs remain
+        ([(1, 8192), (1024, 1024), (4096, 4096)],
+         "1 decode + 2 prefills"),
+        # decode between prefills — tests that interleaved M=0 entries
+        # don't shift buffer offsets for the prefills that follow
+        ([(2048, 2048), (1, 16384), (4096, 4096)],
+         "prefill, decode, prefill (interleaved)"),
+        # multiple decodes mixed with prefills
+        ([(1, 2048), (1, 4096), (1024, 1024), (2048, 2048)],
+         "2 decodes + 2 prefills"),
+        # all decode — should produce zero workgroups, no kernel launch
+        ([(1, 4096), (1, 8192)],
+         "all decode (zero WGs)"),
+    ]
+
+    for subseq_specs, desc in cases:
+        q_lens = [ql for ql, _ in subseq_specs]
+        kv_lens = [kvl for _, kvl in subseq_specs]
+
+        is_decode = [ql < STRIDE for ql in q_lens]
+        prefill_indices = [i for i, d in enumerate(is_decode) if not d]
+        decode_indices = [i for i, d in enumerate(is_decode) if d]
+
+        for route_mode in ["split", "multi"]:
+            if route_mode == "split" and len(prefill_indices) == 0:
+                continue
+            label = f'{route_mode}-route: "{desc}"'
+            print(f'{Colors.BLUE}test multi-subseq gemm({label}) xattn_block_size:{xattn_block_size} ...{Colors.END}')
+
+            xattn_cm_multi = xattn_gemmQK_multi.create_instance(
+                num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
+            xattn_cm_single = xattn_gemmQK.create_instance(
+                num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed)
+            HEAD_SIZE_KEY = xattn_cm_multi.HEAD_SIZE_KEY
+
+            # Build per-subseq data (all subseqs, including decode)
+            subseq_data = []
+            total_q_len = 0
+            for i, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+                q = torch.randint(-2, 4, size=[1, num_heads, q_len, dim], dtype=torch.int16).to(dtype=torch.float16)
+                k = torch.randint(-2, 4, size=[1, num_kv_heads, kv_len, dim], dtype=torch.int16).to(dtype=torch.float16)
+                Lk = kv_len // STRIDE * STRIDE
+                k = k[:, :, :Lk, :]
+                if is_causal:
+                    q_start_strided = Lk // STRIDE - q_len // STRIDE
+                else:
+                    q_start_strided = 0
+                subseq_data.append((q, k, q_start_strided, total_q_len))
+                total_q_len += q_len
+
+            # Build key caches and block indices for all subseqs
+            all_key_cache_blocks = []
+            all_block_indices = []
+            block_indices_begins = [0]
+            total_blocks_so_far = 0
+
+            for i, (q, k, q_start_strided, subseq_q_begin) in enumerate(subseq_data):
+                _, Hk, Lk, _ = k.shape
+                num_blocks = (Lk + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
+
+                if xattn_cm_single.kv_cache_compression:
+                    k_pad, k_ref = xattn_cm_single.quant_i8(k)
+                    subseq_data[i] = (q, k_ref, q_start_strided, subseq_q_begin)
+                    key_cache = k_pad.reshape([1, Hk, -1, KV_BLOCK_SIZE, HEAD_SIZE_KEY]).permute(0, 2, 1, 3, 4)
+                else:
+                    k_pad = torch.zeros([1, Hk, num_blocks * KV_BLOCK_SIZE, head_size], dtype=k.dtype)
+                    k_pad[:, :, :Lk, :] = k
+                    key_cache = k_pad.reshape([1, Hk, num_blocks, KV_BLOCK_SIZE, head_size]).permute(0, 2, 1, 3, 4)
+
+                perm_idx = torch.randperm(num_blocks)
+                key_cache = key_cache[:, perm_idx, :, :, :].contiguous()
+                inv_perm = torch.argsort(perm_idx)
+
+                all_key_cache_blocks.append(key_cache)
+                all_block_indices.append(inv_perm + total_blocks_so_far)
+                block_indices_begins.append(block_indices_begins[-1] + num_blocks)
+                total_blocks_so_far += num_blocks
+
+            all_key_cache = torch.cat(all_key_cache_blocks, dim=1).contiguous()
+            t_key_cache = cl.tensor(all_key_cache.detach().numpy())
+            all_block_indices_cat = torch.cat(all_block_indices).to(torch.int32)
+            t_block_indices = cl.tensor(all_block_indices_cat.detach().numpy())
+
+            # Concatenated query: all subseqs (including decode tokens)
+            Hq = num_heads
+            S = head_size
+            q_3d_list = []
+            for q, _, _, _ in subseq_data:
+                q_3d = q.permute(0, 2, 1, 3).reshape([1, q.shape[2], -1])
+                q_3d_list.append(q_3d)
+            q_3d_cat = torch.cat(q_3d_list, dim=1)
+            q_3d_with_padding = torch.zeros([1, total_q_len, Hq * S * 2], dtype=q_3d_cat.dtype)
+            q_3d_with_padding[:, :, :Hq * S] = q_3d_cat
+            t_query = cl.tensor(q_3d_with_padding.detach().numpy())
+            query_stride = S * STRIDE * num_heads * 2
+            K_dim = S * STRIDE
+
+            # Decide which subseqs go into metadata based on route mode
+            if route_mode == "split":
+                meta_indices = prefill_indices
+            else:
+                meta_indices = list(range(len(q_lens)))
+
+            subsequences_for_meta = []
+            for i in meta_indices:
+                _, _, _, subseq_q_begin = subseq_data[i]
+                bi_begin = block_indices_begins[i]
+                subsequences_for_meta.append((subseq_q_begin, q_lens[i], kv_lens[i], bi_begin))
+
+            merged_q_num = PA_WG_SIZE // xattn_block_size
+            meta_np, total_wg_count, buf_sizes = build_xattn_subseq_meta(
+                subsequences_for_meta, num_heads, xattn_block_size, merged_q_num)
+
+            print(f"  {route_mode}: meta_indices={meta_indices} total_wg_count={total_wg_count}")
+
+            if total_wg_count == 0:
+                print(f'{Colors.GREEN}  {label}: 0 WGs — no kernel dispatch needed, passed{Colors.END}')
+                continue
+
+            t_meta = cl.tensor(meta_np)
+            total_kq_max_bytes = buf_sizes['kq_max']
+            total_exp_sum_bytes = buf_sizes['exp_sum']
+            t_kq_max_wg = cl.tensor(np.ones(total_kq_max_bytes // sizeof_softmax, softmax_type))
+            t_kq_exp_partial_sum = cl.tensor(np.ones(total_exp_sum_bytes // sizeof_softmax, softmax_type))
+
+            num_subseqs = len(meta_indices)
+            GWS = [total_wg_count * SG_N * xattn_cm_multi.WALK_HQ, SG_M, num_heads // xattn_cm_multi.WALK_HQ]
+            LWS = [SG_N, SG_M, 1]
+            print(f"  calling multi-subseq CM_gemm_qk {GWS=} {LWS=} {num_subseqs=} ...")
+
+            cl.finish()
+            xattn_cm_multi.kernels.enqueue('gemm_qk', GWS, LWS,
+                                            t_key_cache, t_query, t_block_indices, t_meta,
+                                            t_kq_max_wg, t_kq_exp_partial_sum,
+                                            K_dim, query_stride, num_subseqs)
+            cl.finish()
+
+            # Validate only prefill subseqs (decode subseqs produce no output)
+            kq_max_wg_all = t_kq_max_wg.numpy()
+            kq_exp_all = t_kq_exp_partial_sum.numpy()
+
+            for meta_idx, orig_idx in enumerate(meta_indices):
+                q_len = q_lens[orig_idx]
+                kv_len = kv_lens[orig_idx]
+                M = q_len // STRIDE
+                if M == 0:
+                    print(f'{Colors.GREEN}  subseq[{meta_idx}] (orig {orig_idx}): decode (M=0), skipped{Colors.END}')
+                    continue
+
+                q, k, q_start_strided, _ = subseq_data[orig_idx]
+                Lk = kv_len // STRIDE * STRIDE
+                N = Lk // STRIDE
+                q_stride_pad = rnd_up(M, BLOCK_WG_M)
+                N_kq_groups = div_up(N, BLOCK_WG_N)
+                k_block_pad = k_block_in_group * N_kq_groups
+
+                kq_max_ref, kq_5d_max_ret_ref, kq_exp_partial_sum_ret_ref, _ = get_gemm_ref(
+                    q, k, q_start_strided=q_start_strided, block_size=xattn_block_size,
+                    S=STRIDE, threshold=THRESH, causal=is_causal, wg_k=BLOCK_WG_N, wg_q=BLOCK_WG_M)
+
+                meta_row = meta_np[meta_idx]
+                off_kq_max = meta_row[10]
+                off_exp_sum = meta_row[11]
+                per_head_max_size = N_kq_groups * q_stride_pad
+                per_head_exp_size = q_stride_pad * k_block_pad
+
+                kq_max_subseq = np.zeros([1, num_heads, N_kq_groups, q_stride_pad], dtype=softmax_type)
+                kq_exp_subseq = np.zeros([1, num_heads, q_stride_pad, k_block_pad], dtype=softmax_type)
+
+                for h in range(num_heads):
+                    start_max = (off_kq_max // sizeof_softmax) + h * per_head_max_size
+                    kq_max_subseq[0, h] = kq_max_wg_all[start_max:start_max + per_head_max_size].reshape(N_kq_groups, q_stride_pad)
+                    start_exp = (off_exp_sum // sizeof_softmax) + h * per_head_exp_size
+                    kq_exp_subseq[0, h] = kq_exp_all[start_exp:start_exp + per_head_exp_size].reshape(q_stride_pad, k_block_pad)
+
+                kq_5d_max_ret_ref_np = kq_5d_max_ret_ref.detach().numpy()[..., :M]
+                compare(kq_5d_max_ret_ref_np, kq_max_subseq[..., :M])
+                print(f'{Colors.GREEN}  subseq[{meta_idx}] (orig {orig_idx}): gemm:max_wg passed{Colors.END}')
+
+                kq_exp_partial_sum_ret_ref_np = kq_exp_partial_sum_ret_ref.detach().numpy()[:, :, :M, :]
+                compare(kq_exp_partial_sum_ret_ref_np, kq_exp_subseq[:, :, :M, :])
+                print(f'{Colors.GREEN}  subseq[{meta_idx}] (orig {orig_idx}): gemm:exp_partial passed{Colors.END}')
+
+            print(f'{Colors.GREEN}multi-subseq test {label} passed{Colors.END}')
+
+
+def main_multi_with_decode():
+    for xattn_block_size in [128, 256]:
+        test_multi_subseq_with_decode_subseqs(xattn_block_size)
+
+
 @pytest.mark.parametrize("xattn_block_size", [128, 256])
 @pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
@@ -747,7 +958,9 @@ if __name__ == "__main__":
     cl.profiling(True)
 
     import sys
-    if '--multi-subseq' in sys.argv:
+    if '--multi-subseq-decode' in sys.argv:
+        main_multi_with_decode()
+    elif '--multi-subseq' in sys.argv:
         main_multi()
     elif '--perf' in sys.argv:
         for xattn_block_size in [128, 256]:
