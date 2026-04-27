@@ -43,8 +43,6 @@ namespace KERNEL_NAME {
 #define XATTN_META_STRIDE           16
 #endif
 
-#if MULTI_SUBSEQ
-
 extern "C" _GENX_MAIN_ void find_block(
     svmptr_t kq_max_wg ATTR,
     svmptr_t kq_exp_partial_sum ATTR,
@@ -92,53 +90,5 @@ extern "C" _GENX_MAIN_ void find_block(
 #endif
     );
 }
-
-#else // !MULTI_SUBSEQ — original single-subsequence path
-
-extern "C" _GENX_MAIN_ void find_block(
-    svmptr_t kq_max_wg ATTR,
-    svmptr_t kq_exp_partial_sum ATTR,
-    svmptr_t block_mask ATTR,
-    uint q_len,
-    uint q_stride,
-    uint q_stride_pad,
-    uint q_block_pad,
-    uint k_block_pad,
-    uint causal_start_index,
-    float thresh
-#if DEBUG_ACC == 1
-    , svmptr_t kq_sum ATTR
-#endif
-) {
-    // kq_max_wg:          [b, hq, n_groups, q_stride_pad]
-    // kq_exp_partial_sum: [b, hq, q_stride_pad, k_block_pad]
-    // kq_sum:             [b, hq, q_stride_pad/TOKEN_IN_BLOCK, k_block_pad]
-    // block_mask:         [b, hq, q_stride_pad/TOKEN_IN_BLOCK, k_block_pad]
-    // [1, 32, 256], [1, 32, 64, 256], [1, 32, 256, 64 * 16], A_sum:[1, 32, 32, 64 * 16]
-    // global:            [q_block_pad, hq, b]
-    const int TOKEN_IN_BLOCK = BLOCK_SIZE / STRIDE;
-    const int TOKEN_SHARE_MAX = BLOCK_SHARE_MAX / TOKEN_IN_BLOCK;
-    uint m = cm_group_id(0);
-    uint hq = cm_group_id(1);
-    uint b = cm_group_id(2);
-    kq_max_wg += (b * HQ + hq) * (k_block_pad / TOKEN_SHARE_MAX) * q_stride_pad * (uint)sizeof(SOFTMAX_TYPE);
-    kq_exp_partial_sum += (b * HQ + hq) * q_stride_pad * k_block_pad * (uint)sizeof(SOFTMAX_TYPE);
-#if DEBUG_ACC == 1
-    kq_sum += (b * HQ + hq) * (q_stride_pad / TOKEN_IN_BLOCK) * k_block_pad * (uint)sizeof(half);
-#endif
-    block_mask += (b * HQ + hq) * q_block_pad * k_block_pad;
-
-    const uint slm_size = NUM_THREADS * 16 * sizeof(ushort);
-    cm_slm_init(slm_size);
-    auto slm = cm_slm_alloc(slm_size);
-
-    find(slm, m, kq_max_wg, kq_exp_partial_sum, block_mask, q_len, q_stride, q_stride_pad, k_block_pad, thresh, causal_start_index
-#if DEBUG_ACC == 1
-    , kq_sum
-#endif
-    );
-}
-
-#endif // MULTI_SUBSEQ
 
 }  // NAMESPACE

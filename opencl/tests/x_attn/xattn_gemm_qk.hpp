@@ -17,8 +17,6 @@
 namespace KERNEL_NAME {
 #include "estimate.hpp"
 
-#define ABS(x) (x) < 0 ? -(x) : (x)
-
 // Per-subsequence metadata field offsets (16 ints per subsequence for alignment)
 #define XATTN_META_SUBSEQ_Q_BEGIN    0
 #define XATTN_META_SUBSEQ_Q_LEN     1
@@ -38,55 +36,9 @@ namespace KERNEL_NAME {
 #define XATTN_META_WG_OFFSET        15
 #define XATTN_META_STRIDE           16
 
-CM_INLINE void get_mn(uint& id_wg_m, uint& id_wg_n, uint M, uint N, int slice_no, int slice, const int BLOCK_WG_M, const int BLOCK_WG_N) {
-    uint id_wg_mn = cm_group_id(0) / WALK_HQ;
-    if (slice_no == 0) {
-        if (slice == 0) {
-            // loop M first, N is shared, total = N/256*M+N
-            uint WG_MN = (M + BLOCK_WG_M - 1) / BLOCK_WG_M;
-            id_wg_m = id_wg_mn % WG_MN;
-            id_wg_n = id_wg_mn / WG_MN;
-        } else {
-            // loop N first, M is shared, total = M/128*N+M
-            uint WG_MN = (N + BLOCK_WG_N - 1) / BLOCK_WG_N;
-            id_wg_n = id_wg_mn % WG_MN;
-            id_wg_m = id_wg_mn / WG_MN;
-        }
-    } else {
-        uint wg_x = slice > 0 ? N / BLOCK_WG_N : M / BLOCK_WG_M;
-        uint slice_no_abs = ABS(slice_no);
-        uint slice_abs = ABS(slice);
-        int id_wg_mn_in_reminder = (int)id_wg_mn - (int)(slice_no_abs * slice_abs * wg_x);
-        uint slice_idx;
-        // in [slice_no x slice]
-        if (id_wg_mn_in_reminder < 0) {
-            slice_idx = id_wg_mn / (slice_abs * wg_x);
-            uint rem_in_slice = id_wg_mn % (slice_abs * wg_x);
-            uint x = rem_in_slice % slice_abs;
-            uint y = rem_in_slice / slice_abs;
-            id_wg_m = slice > 0 ? x + slice_idx * slice_abs : y;
-            id_wg_n = slice < 0 ? x + slice_idx * slice_abs : y;
-        } else {
-            uint slice_rem = slice_abs + (slice_no > 0 ? 1 : -1);
-            slice_idx = id_wg_mn_in_reminder / (slice_rem * wg_x);
-            uint rem_in_slice = id_wg_mn_in_reminder % (slice_rem * wg_x);
-            uint x = rem_in_slice % slice_rem;
-            uint y = rem_in_slice / slice_rem;
-            id_wg_m = slice > 0 ? x + slice_idx * slice_rem + slice_no_abs * slice_abs : y;
-            id_wg_n = slice < 0 ? x + slice_idx * slice_rem + slice_no_abs * slice_abs : y;
-        }
-    }
-}
-
 #define CONCAT_IMPL(a, b) KERNEL_NAME::gemm_qk
 #define CONCAT(x, y) CONCAT_IMPL(x, y)
 #define FUNC CONCAT(BLOCK_SG_M, BLOCK_SG_N)
-
-#if MULTI_SUBSEQ
-
-#ifndef CM_HAS_LSC_UNTYPED_2D
-#error "MULTI_SUBSEQ requires Xe2 (CM_HAS_LSC_UNTYPED_2D) — Xe1 SurfaceIndex path not yet supported"
-#endif
 
 extern "C" _GENX_MAIN_ void gemm_qk(
     #ifdef CM_HAS_LSC_UNTYPED_2D
@@ -171,72 +123,5 @@ extern "C" _GENX_MAIN_ void gemm_qk(
 
     FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_index_begin, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
 }
-
-#else // !MULTI_SUBSEQ — original single-subsequence path
-
-extern "C" _GENX_MAIN_ void gemm_qk(
-    #ifdef CM_HAS_LSC_UNTYPED_2D
-    svmptr_t key_cache ATTR,
-    svmptr_t query ATTR,
-    #else
-    SurfaceIndex key_cache [[type("buffer_t")]],
-    SurfaceIndex query [[type("buffer_t")]],
-    #endif
-    svmptr_t block_indices ATTR,
-    svmptr_t block_indices_begins ATTR,
-    svmptr_t kq_max_wg ATTR,
-    #ifdef CM_HAS_LSC_UNTYPED_2D
-    svmptr_t kq_exp_partial_sum ATTR,
-    #else
-    SurfaceIndex kq_exp_partial_sum [[type("buffer_t")]],
-    #endif
-    uint M, uint N, uint K, uint query_stride, int slice_no, int slice, uint q_start_strided) {
-    const uint BLOCK_WG_M = BLOCK_SG_M * SG_M;
-    const uint BLOCK_WG_N = BLOCK_SG_N * SG_N;
-    uint hq = cm_group_id(2) * WALK_HQ;
-    hq += cm_group_id(0) & (WALK_HQ - 1);
-    if (hq >= HQ) return;
-    uint hk = hq / (HQ / HK);
-    const uint slm_size = SG_N * BLOCK_WG_M * sizeof(SOFTMAX_TYPE);
-    cm_slm_init(slm_size);
-    auto slm = cm_slm_alloc(slm_size);
-
-    static_assert(HQ % HK == 0, "HQ must be multiple of HK");
-
-    uint id_wg_m, id_wg_n;
-    get_mn(id_wg_m, id_wg_n, M, N, slice_no, slice, BLOCK_WG_M, BLOCK_WG_N);
-
-    #ifdef CM_HAS_LSC_UNTYPED_2D
-    // key cache: [block, HQ, KV_BLOCK_SIZE, HEAD_SIZE_KEY]
-#if KV_CACHE_COMPRESSION
-    key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(char));
-#else
-    key_cache += hk * (KV_BLOCK_SIZE * HEAD_SIZE_KEY * (uint)sizeof(half));
-#endif
-    query += hq * HEAD_SIZE * (uint)sizeof(half);
-    #endif
-
-
-    // kq_max: [hq, m_pad]
-    // kq_max_wg: [hq, n_groups, m_pad]
-    // kq_exp_partial_sum: [hq, m_pad, n_groups*BLOCK_WG_M/(BLOCK_SIZE/STRIDE)]
-    uint m_pad = (M + BLOCK_WG_M - 1) / BLOCK_WG_M * BLOCK_WG_M;
-    uint n_groups = (N + BLOCK_WG_N - 1) / BLOCK_WG_N;
-    kq_max_wg += hq * n_groups * m_pad * (uint)sizeof(SOFTMAX_TYPE);
-
-    const uint sum_per_n_token_in_block = BLOCK_SIZE / STRIDE;
-    const uint n_after_sum_in_group = BLOCK_WG_N / sum_per_n_token_in_block;
-    const uint n_after_sum_pad = n_after_sum_in_group * n_groups;
-    const uint offset_partial_sum = hq * n_after_sum_pad * m_pad * (uint)sizeof(SOFTMAX_TYPE);
-    #ifdef CM_HAS_LSC_UNTYPED_2D
-    kq_exp_partial_sum += offset_partial_sum;
-    #endif
-
-    int block_index_begin = ((int*)block_indices_begins)[0];
-
-    FUNC(id_wg_m, id_wg_n, hq, slm, key_cache, query, block_indices, block_index_begin, kq_max_wg, kq_exp_partial_sum, M, N, K, query_stride, q_start_strided, offset_partial_sum);
-}
-
-#endif // MULTI_SUBSEQ
 
 }  // NAMESPACE

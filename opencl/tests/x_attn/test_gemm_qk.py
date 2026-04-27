@@ -104,33 +104,43 @@ class xattn_gemmQK:
                             -DSUB_BLOCK_SIZE={self.sub_block_size}
                             -DBLOCK_WG_K={int(BLOCK_WG_K)}
                             ''')
-        
+
     def __call__(self, t_key_cache, t_query, t_block_indices, t_block_indices_begins, q_start_strided, M, N, K, query_stride, n_repeats = 1):
         batch = 1
         q_stride_pad = rnd_up(M, BLOCK_WG_M)
-        # [1, 32, 64, 256]
         softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
         N_kq_groups = div_up(N, BLOCK_WG_N)
         t_kq_max_wg = cl.tensor(np.ones([batch, self.num_heads, N_kq_groups, q_stride_pad], softmax_type))
-        # [1, 32, 256, 64 * 16]
         sum_per_token_in_block = self.xattn_block_size // STRIDE
         k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
         k_block_pad = k_block_in_group * N_kq_groups
         t_kq_exp_partial_sum = cl.tensor(np.ones([batch, self.num_heads, q_stride_pad, k_block_pad], softmax_type))
 
-        # loop N first:[0, 1], loop M first:[0, 0]; block M first[slice_no, slice(>0)], block N first[slice_no, slice(<0)]
-        #default linear
-        slice_no = 0
-        block_m = M // BLOCK_WG_M
-        block_n = N // BLOCK_WG_N
-        devinfo = cl.dev_info()
-        eu_xecore = 8
-        xecores = devinfo["CL_DEVICE_MAX_COMPUTE_UNITS"] // eu_xecore
-        slice_no = 0
-        slice = 0
-        print(f'{xecores=} {block_m=} {block_n=} {slice=} {slice_no=}')
+        block_index_begin = 0
+        total_wg_count = N_kq_groups * (q_stride_pad // BLOCK_WG_M)
 
-        GWS = [N_kq_groups * (q_stride_pad // BLOCK_WG_M) * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
+        # Build single-entry metadata for the unified kernel
+        meta_np = np.array([[
+            0,                  # [0]  SUBSEQ_Q_BEGIN
+            M * STRIDE,         # [1]  SUBSEQ_Q_LEN
+            M,                  # [2]  M
+            N,                  # [3]  N
+            q_stride_pad,       # [4]  Q_STRIDE_PAD
+            N_kq_groups,        # [5]  N_KQ_GROUPS
+            0,                  # [6]  Q_BLOCK_PAD (unused by gemm_qk)
+            k_block_pad,        # [7]  K_BLOCK_PAD
+            0,                  # [8]  CAUSAL_START
+            q_start_strided,    # [9]  Q_START_STRIDED
+            0,                  # [10] BUF_OFF_KQ_MAX
+            0,                  # [11] BUF_OFF_EXP_SUM
+            0,                  # [12] BUF_OFF_MASK
+            0,                  # [13] BUF_OFF_MASK_WG
+            block_index_begin,  # [14] BLOCK_IDX_BEGIN
+            0,                  # [15] WG_OFFSET
+        ]], dtype=np.int32)
+        t_meta = cl.tensor(meta_np)
+
+        GWS = [total_wg_count * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
         LWS = [SG_N, SG_M, 1]
         print(f"calling CM_gemm_qk {GWS=} {LWS=} ...")
 
@@ -140,7 +150,7 @@ class xattn_gemmQK:
                 ("t_key_cache",            t_key_cache),
                 ("t_query",                t_query),
                 ("t_block_indices",        t_block_indices),
-                ("t_block_indices_begins", t_block_indices_begins),
+                ("t_meta",                 t_meta),
                 ("t_kq_max_wg",            t_kq_max_wg),
                 ("t_kq_exp_partial_sum",   t_kq_exp_partial_sum),
             ]
@@ -154,13 +164,13 @@ class xattn_gemmQK:
                 f"q_start_strided:{q_start_strided:<10} ")
 
         cl.finish()
-        # gemm
+        num_subseqs = 1
         for i in range(n_repeats):
-            self.kernels.enqueue('gemm_qk', GWS, LWS, t_key_cache, t_query, t_block_indices, t_block_indices_begins,
-                                 t_kq_max_wg, t_kq_exp_partial_sum, M, N, K, query_stride, slice_no, slice, q_start_strided)
+            self.kernels.enqueue('gemm_qk', GWS, LWS, t_key_cache, t_query, t_block_indices, t_meta,
+                                 t_kq_max_wg, t_kq_exp_partial_sum, K, query_stride, num_subseqs)
         latency = cl.finish()
         return latency, t_kq_max_wg, t_kq_exp_partial_sum
-        
+
 
     @staticmethod
     @functools.cache
@@ -453,74 +463,7 @@ def build_xattn_subseq_meta(subsequences, num_heads, xattn_block_size, merged_q_
     }
 
 
-class xattn_gemmQK_multi:
-    """Multi-subsequence variant of xattn_gemmQK. Compiles with -DMULTI_SUBSEQ=1."""
-    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
-        BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
-
-        if isinstance(kvcache_compressed, bool):
-            kv_cache_compression = 1 if kvcache_compressed else 0
-        else:
-            kv_cache_compression = int(kvcache_compressed)
-
-        self.sub_block_size = sub_block_size
-
-        if kv_cache_compression == 1:
-            self.HEAD_SIZE_KEY = head_size + 2 * 2
-        elif kv_cache_compression == 2:
-            self.HEAD_SIZE_KEY = head_size + 4 * head_size // sub_block_size
-        else:
-            self.HEAD_SIZE_KEY = head_size
-
-        self.WALK_HQ = 2 if num_heads != num_kv_heads else 1
-
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.xattn_block_size = xattn_block_size
-        self.is_causal = is_causal
-        self.kv_cache_compression = kv_cache_compression
-
-        INV_S = 1 / torch.sqrt(torch.tensor([head_size], dtype=torch.float32)) / STRIDE
-        INV_S = int(INV_S.view(dtype=torch.uint32))
-
-        src = r'''#include "xattn_gemm_qk.hpp"'''
-        cwd = os.path.dirname(os.path.realpath(__file__))
-        print(f"compiling multi-subseq {cwd} ...")
-
-        jit_option = '-abortonspill -noschedule '
-        self.kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
-                            -mCM_printregusage -mdump_asm -g2
-                            -Qxcm_register_file_size=256 -I{cwd}
-                            -DSTRIDE={STRIDE} -DHQ={num_heads} -DHK={num_kv_heads} -DHEAD_SIZE={head_size} -DSG_M={SG_M} -DSG_N={SG_N} -DBLOCK_SG_N={BLOCK_SG_N} -DBLOCK_SG_M={BLOCK_SG_M}
-                            -DBLOCK_SIZE={int(xattn_block_size)} -DINV_S={INV_S} -DKV_BLOCK_SIZE={KV_BLOCK_SIZE} -DBLOCK_SHARE_MAX={BLOCK_WG_N} -DWALK_HQ={self.WALK_HQ}
-                            -DIS_CAUSAL={int(is_causal)} -DKV_CACHE_COMPRESSION={self.kv_cache_compression} -DUSE_INT8={int(self.kv_cache_compression != 0)} -DHEAD_SIZE_KEY={self.HEAD_SIZE_KEY} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                            -DSUB_BLOCK_SIZE={self.sub_block_size}
-                            -DBLOCK_WG_K={int(BLOCK_WG_K)}
-                            -DMULTI_SUBSEQ=1
-                            ''')
-
-    def __call__(self, t_key_cache, t_query, t_block_indices, t_meta, total_wg_count, num_subseqs, K, query_stride, n_repeats=1):
-        softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
-        # Allocate output buffers sized for all subsequences combined
-        # The metadata contains per-head byte offsets; total size = last offset + last subseq size
-        # For simplicity, we pass pre-allocated buffers from the caller
-
-        GWS = [total_wg_count * SG_N * self.WALK_HQ, SG_M, self.num_heads // self.WALK_HQ]
-        LWS = [SG_N, SG_M, 1]
-        print(f"calling multi-subseq CM_gemm_qk {GWS=} {LWS=} {num_subseqs=} ...")
-
-        cl.finish()
-        for i in range(n_repeats):
-            self.kernels.enqueue('gemm_qk', GWS, LWS, t_key_cache, t_query, t_block_indices, t_meta,
-                                 *t_key_cache._extra_bufs, K, query_stride, num_subseqs)
-        latency = cl.finish()
-        return latency
-
-    @staticmethod
-    @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
-        return xattn_gemmQK_multi(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size)
+xattn_gemmQK_multi = xattn_gemmQK
 
 
 def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=128, kvcache_compressed=True, is_causal=True):

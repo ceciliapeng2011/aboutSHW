@@ -80,8 +80,6 @@ CM_INLINE void post_proc_impl(svmptr_t block_mask, svmptr_t merged_block_mask, u
     }
 }
 
-#if MULTI_SUBSEQ
-
 extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t merged_block_mask ATTR, svmptr_t xattn_subseq_meta ATTR) {
     // GWS: [max(q_block_pad/MERGED_Q_NUM), HQ, num_subseqs]
     uint b = cm_group_id(2);
@@ -109,24 +107,5 @@ extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t me
 
     post_proc_impl(mask_base, merged_base, q_stride_pad, q_block_pad, k_block_pad);
 }
-
-#else // !MULTI_SUBSEQ — original single-subsequence path
-
-extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t merged_block_mask ATTR, uint q_stride_pad, uint q_block_pad, uint k_block_pad) {
-    // block_mask:                [b, hq, q_block_pad, k_block_pad]
-    // merged_block_mask:         [b, hq, q_block_pad/MERGED_Q_NUM, k_block_pad]
-    // global:                    [q_block_pad/MERGED_Q_NUM, hq, b]
-    uint m_mereged = cm_group_id(0);
-    uint hq = cm_group_id(1);
-    uint b = cm_group_id(2);
-    block_mask += (b * HQ + hq) * q_block_pad * k_block_pad;
-    block_mask += m_mereged * MERGED_Q_NUM * k_block_pad;
-    merged_block_mask += (b * HQ + hq) * cm_group_count(0) * k_block_pad;
-    merged_block_mask += m_mereged * k_block_pad;
-
-    post_proc_impl(block_mask, merged_block_mask, q_stride_pad, q_block_pad, k_block_pad);
-}
-
-#endif // MULTI_SUBSEQ
 
 }  // NAMESPACE

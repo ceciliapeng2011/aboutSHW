@@ -65,12 +65,36 @@ class xattn_find_block:
         assert q_stride_pad == (q_stride + BLOCK_WG_M - 1) // BLOCK_WG_M * BLOCK_WG_M, "q_stride_pad padded to BLOCK_WG_M / STRIDE"
         q_block_input = q_stride_pad // sum_per_n_token_in_block
         q_block_pad = div_up(q_len, self.xattn_block_size)
-        
+
         t_kq_sum = cl.tensor(np.zeros([batch, num_heads, q_block_input, k_block_pad], dtype=np.float16))
-        
+
         # mask shape: [div_up(q_len, xattn_block_size), rnd_up(k_stride, WG_N) / sum_per_n_token_in_block]
         t_mask = cl.tensor(np.zeros([batch, self.num_heads, q_block_pad, k_block_pad], np.int8))
-        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, q_len, q_stride, q_stride_pad, q_block_pad, k_block_pad, k_block-q_block, xattn_thresh]
+
+        # Build single-entry metadata for the unified kernel
+        N_kq_groups = div_up(k_stride, BLOCK_WG_N)
+        softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+        meta_np = np.array([[
+            0,                      # [0]  SUBSEQ_Q_BEGIN
+            q_len,                  # [1]  SUBSEQ_Q_LEN
+            q_stride,               # [2]  M
+            k_stride,               # [3]  N
+            q_stride_pad,           # [4]  Q_STRIDE_PAD
+            N_kq_groups,            # [5]  N_KQ_GROUPS
+            q_block_pad,            # [6]  Q_BLOCK_PAD
+            k_block_pad,            # [7]  K_BLOCK_PAD
+            k_block - q_block,      # [8]  CAUSAL_START
+            0,                      # [9]  Q_START_STRIDED
+            0,                      # [10] BUF_OFF_KQ_MAX
+            0,                      # [11] BUF_OFF_EXP_SUM
+            0,                      # [12] BUF_OFF_MASK
+            0,                      # [13] BUF_OFF_MASK_WG
+            0,                      # [14] BLOCK_IDX_BEGIN
+            0,                      # [15] WG_OFFSET
+        ]], dtype=np.int32)
+        t_meta = cl.tensor(meta_np)
+
+        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, xattn_thresh]
         if FIND_DEBUG_ACC:
             params += [t_kq_sum]
 
@@ -316,36 +340,7 @@ def test_perf(xattn_block_size, xattn_thresh, HQ = 32, HK = 8, HEAD_SIZE = 128, 
 
 XATTN_META_STRIDE_PY = 16
 
-class xattn_find_block_multi:
-    """Multi-subsequence variant of xattn_find_block. Compiles with -DMULTI_SUBSEQ=1."""
-    def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal):
-        NUM_THREADS = 32 if xattn_block_size == 128 else 16
-
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_size = head_size
-        self.xattn_block_size = xattn_block_size
-        self.is_causal = is_causal
-
-        src = r'''#include "xattn_find_block.hpp"'''
-        cwd = os.path.dirname(os.path.realpath(__file__))
-        print(f"compiling multi-subseq find_block {cwd} ...")
-
-        jit_option = '-abortonspill -noschedule '
-        self.kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
-                            -mCM_printregusage -mdump_asm -g2
-                            -Qxcm_register_file_size=256 -I{cwd}
-                            -DSTRIDE={STRIDE} -DHQ={int(num_heads)} -DHK={int(num_kv_heads)} -DHEAD_SIZE={int(head_size)}
-                            -DBLOCK_SIZE={int(xattn_block_size)} -DBLOCK_SHARE_MAX={BLOCK_WG_N}
-                            -DDEBUG_ACC={FIND_DEBUG_ACC} -DIS_CAUSAL={int(is_causal)} -DSOFTMAX_TYPE={SOFTMAX_TYPE}
-                            -DNUM_THREADS={int(NUM_THREADS)}
-                            -DMULTI_SUBSEQ=1
-                            ''')
-
-    @staticmethod
-    @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal):
-        return xattn_find_block_multi(num_heads, num_kv_heads, head_size, xattn_block_size, is_causal)
+xattn_find_block_multi = xattn_find_block
 
 
 def test_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZE=128, is_causal=True):
@@ -356,7 +351,9 @@ def test_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZ
     k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
 
     cases = [
+        ([4096], [4096], "1 subseq baseline"),
         ([2048, 4096], [2048, 4096], "2 prefill subseqs"),
+        ([2048, 2048], [2048, 2048], "2 equal prefill subseqs"),
         ([1024, 2048, 4096], [1024, 2048, 4096], "3 prefill subseqs"),
     ]
 
@@ -497,6 +494,174 @@ def test_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZ
         print(f'{Colors.GREEN}multi-subseq find_block "{desc}" passed{Colors.END}')
 
 
+def test_find_multi_subseq_with_decode(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZE=128, is_causal=True):
+    """Test find_block with decode+prefill mixing (split-route only).
+
+    Decode subseqs have q_len < STRIDE, so M=0 and softmax buffers are empty.
+    find_block with q_block_pad=1 but empty softmax data is unsafe in multi-route,
+    so only split-route (filtering out decode subseqs) is tested.
+    """
+    softmax_type = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+    sizeof_softmax = np.dtype(softmax_type).itemsize
+    sum_per_token_in_block = xattn_block_size // STRIDE
+    k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
+
+    cases = [
+        ([(1, 4096), (2048, 2048)],
+         "1 decode + 1 prefill"),
+        ([(1, 8192), (1024, 1024), (4096, 4096)],
+         "1 decode + 2 prefills"),
+        ([(2048, 2048), (1, 16384), (4096, 4096)],
+         "prefill, decode, prefill (interleaved)"),
+        ([(1, 2048), (1, 4096), (1024, 1024), (2048, 2048)],
+         "2 decodes + 2 prefills"),
+        ([(1, 4096), (1, 8192)],
+         "all decode (zero WGs)"),
+    ]
+
+    for subseq_specs, desc in cases:
+        q_lens = [ql for ql, _ in subseq_specs]
+        kv_lens = [kvl for _, kvl in subseq_specs]
+
+        is_decode = [ql < STRIDE for ql in q_lens]
+        prefill_indices = [i for i, d in enumerate(is_decode) if not d]
+
+        if len(prefill_indices) == 0:
+            print(f'{Colors.GREEN}split-route: "{desc}": all decode — no kernel dispatch, passed{Colors.END}')
+            continue
+
+        label = f'split-route: "{desc}"'
+        print(f'{Colors.BLUE}test find_block decode+prefill ({label}) xattn_block_size:{xattn_block_size} ...{Colors.END}')
+
+        # Build per-subseq softmax reference data (only for prefill subseqs)
+        per_subseq_refs = []
+        meta_rows = []
+        offset_kq_max = 0
+        offset_exp_sum = 0
+        offset_mask = 0
+        max_q_block_pad = 0
+
+        for orig_idx in prefill_indices:
+            q_len = q_lens[orig_idx]
+            k_len = kv_lens[orig_idx]
+            q_stride = q_len // STRIDE
+            k_stride = k_len // STRIDE
+            q_stride_pad = rnd_up(q_stride, BLOCK_WG_M)
+            N_kq_groups = div_up(k_stride, BLOCK_WG_N)
+            q_block_pad = div_up(q_len, xattn_block_size)
+            k_block_pad = k_block_in_group * N_kq_groups
+            q_block = div_up(q_stride, sum_per_token_in_block)
+            k_block = div_up(k_stride, sum_per_token_in_block)
+            causal_start = k_block - q_block
+            q_start_strided = (k_len - q_len) // STRIDE
+
+            max_q_block_pad = max(max_q_block_pad, q_block_pad)
+
+            qk = torch.randint(-2000, 3000, size=[1, HQ, q_stride, k_stride], dtype=torch.int16).to(dtype=torch.float32)
+            qk_max, kq_5d_max, qk_exp_partial_sum, qk_sum = get_partial_softmax_ref(qk, xattn_block_size, STRIDE, BLOCK_WG_N, BLOCK_WG_M, valid_q=q_stride)
+            mask_ref, _, _, _, _ = find_blocks_ref(qk_sum, xattn_thresh, q_block, k_block, causal=is_causal, current_index=causal_start)
+
+            per_subseq_refs.append({
+                'kq_5d_max': kq_5d_max.detach().numpy().astype(softmax_type),
+                'qk_exp_partial_sum': qk_exp_partial_sum.detach().numpy().astype(softmax_type),
+                'mask_ref': mask_ref,
+                'qk_sum': qk_sum,
+                'q_stride': q_stride,
+                'q_stride_pad': q_stride_pad,
+                'N_kq_groups': N_kq_groups,
+                'q_block_pad': q_block_pad,
+                'k_block_pad': k_block_pad,
+                'q_block': q_block,
+                'k_block': k_block,
+                'orig_idx': orig_idx,
+            })
+
+            meta_rows.append([
+                0,              # [0] SUBSEQ_Q_BEGIN
+                q_len,          # [1] SUBSEQ_Q_LEN
+                q_stride,       # [2] M
+                k_stride,       # [3] N
+                q_stride_pad,   # [4] Q_STRIDE_PAD
+                N_kq_groups,    # [5] N_KQ_GROUPS
+                q_block_pad,    # [6] Q_BLOCK_PAD
+                k_block_pad,    # [7] K_BLOCK_PAD
+                causal_start,   # [8] CAUSAL_START
+                q_start_strided,# [9] Q_START_STRIDED
+                offset_kq_max,  # [10] BUF_OFF_KQ_MAX
+                offset_exp_sum, # [11] BUF_OFF_EXP_SUM
+                offset_mask,    # [12] BUF_OFF_MASK
+                0,              # [13] BUF_OFF_MASK_WG
+                0,              # [14] BLOCK_IDX_BEGIN
+                0,              # [15] WG_OFFSET
+            ])
+
+            offset_kq_max += N_kq_groups * q_stride_pad * sizeof_softmax * HQ
+            offset_exp_sum += q_stride_pad * k_block_pad * sizeof_softmax * HQ
+            offset_mask += q_block_pad * k_block_pad * HQ
+
+        meta_np = np.array(meta_rows, dtype=np.int32)
+        t_meta = cl.tensor(meta_np)
+        num_subseqs = len(prefill_indices)
+
+        total_kq_max_elems = offset_kq_max // sizeof_softmax
+        total_exp_sum_elems = offset_exp_sum // sizeof_softmax
+        total_mask_elems = offset_mask
+
+        combined_kq_max = np.ones(total_kq_max_elems, softmax_type) * -60000
+        combined_exp_sum = np.zeros(total_exp_sum_elems, softmax_type)
+
+        for i, ref in enumerate(per_subseq_refs):
+            off_max = meta_rows[i][10] // sizeof_softmax
+            off_exp = meta_rows[i][11] // sizeof_softmax
+            kq_max_flat = ref['kq_5d_max'].reshape(-1)
+            exp_sum_flat = ref['qk_exp_partial_sum'].reshape(-1)
+            combined_kq_max[off_max:off_max + kq_max_flat.size] = kq_max_flat
+            combined_exp_sum[off_exp:off_exp + exp_sum_flat.size] = exp_sum_flat
+
+        t_kq_max_wg = cl.tensor(combined_kq_max)
+        t_kq_exp_partial_sum = cl.tensor(combined_exp_sum)
+        t_mask = cl.tensor(np.zeros(total_mask_elems, np.int8))
+
+        find_cm = xattn_find_block_multi.create_instance(HQ, HK, HEAD_SIZE, xattn_block_size, is_causal)
+        GWS = [max_q_block_pad, HQ, num_subseqs]
+        LWS = [1, 1, 1]
+        print(f"  calling find_block {GWS=} {LWS=} {num_subseqs=} ...")
+
+        max_q_stride_pad = max(ref['q_stride_pad'] for ref in per_subseq_refs)
+        max_k_block_pad = max(ref['k_block_pad'] for ref in per_subseq_refs)
+        kq_sum_size = num_subseqs * HQ * (max_q_stride_pad // (xattn_block_size // STRIDE)) * max_k_block_pad
+        t_kq_sum = cl.tensor(np.zeros(kq_sum_size, np.float16))
+
+        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, xattn_thresh, t_kq_sum]
+        cl.finish()
+        find_cm.kernels.enqueue("find_block", GWS, LWS, *params)
+        cl.finish()
+
+        mask_all = t_mask.numpy()
+        for i, ref in enumerate(per_subseq_refs):
+            off_mask = meta_rows[i][12]
+            q_block = ref['q_block']
+            k_block = ref['k_block']
+            q_block_pad = ref['q_block_pad']
+            k_block_pad = ref['k_block_pad']
+
+            mask_subseq = np.zeros([1, HQ, q_block_pad, k_block_pad], np.int8)
+            for h in range(HQ):
+                start = off_mask + h * q_block_pad * k_block_pad
+                mask_subseq[0, h] = mask_all[start:start + q_block_pad * k_block_pad].reshape(q_block_pad, k_block_pad)
+
+            cur_mask = mask_subseq[..., :q_block, :k_block]
+            ref_mask = ref['mask_ref'].to(torch.int8).detach().numpy()
+            if not np.all(cur_mask == ref_mask):
+                find_block_single = xattn_find_block.create_instance(HQ, HK, HEAD_SIZE, xattn_block_size, is_causal)
+                find_block_single.cmp_mask(ref_mask, cur_mask, ref['qk_sum'],
+                                           ref['qk_exp_partial_sum'].reshape(1, HQ, ref['q_stride_pad'], ref['k_block_pad']),
+                                           xattn_thresh)
+            print(f'{Colors.GREEN}  subseq[{i}] (orig {ref["orig_idx"]}): find_block:mask passed{Colors.END}')
+
+        print(f'{Colors.GREEN}find_block decode+prefill ({label}) passed{Colors.END}')
+
+
 def main():
     for xattn_block_size in [128, 256]:
         for xattn_thresh in [0.9]:
@@ -507,6 +672,10 @@ def main_multi():
     for xattn_block_size in [128, 256]:
         test_find_multi_subseq(xattn_block_size, 0.9)
 
+def main_multi_with_decode():
+    for xattn_block_size in [128, 256]:
+        test_find_multi_subseq_with_decode(xattn_block_size, 0.9)
+
 if __name__ == "__main__":
     torch.manual_seed(3)
     torch.set_printoptions(linewidth=1024)
@@ -516,7 +685,9 @@ if __name__ == "__main__":
     cl.profiling(True)
 
     import sys
-    if '--multi-subseq' in sys.argv:
+    if '--multi-subseq-decode' in sys.argv:
+        main_multi_with_decode()
+    elif '--multi-subseq' in sys.argv:
         main_multi()
     else:
         main()
