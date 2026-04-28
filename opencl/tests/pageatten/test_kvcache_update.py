@@ -45,6 +45,7 @@ class pa_kvcache_update_cm:
         jit_option = '-abortonspill -noschedule '
         self.kernels = cl.kernels(src,
                       (f' -cmc -Qxcm_jit_option="{jit_option}" -Qxcm_register_file_size=256 -mCM_printregusage -I{cwd}'
+                      f" -DXE_ARCH=1"
                       f" -DKV_HEADS_NUM={num_kv_heads}"
                       f" -DK_HEAD_SIZE={k_head_size}"
                       f" -DV_HEAD_SIZE={v_head_size}"
@@ -402,11 +403,7 @@ def run_pa_kv_cache_update_case(num_tokens:list, past_lens:list, num_kv_heads=1,
 
 @pytest.mark.parametrize(
     "enable_kvcache_compress",
-    [
-        0,
-        1,
-        pytest.param(2, marks=pytest.mark.xfail(reason="Per-channel (mode 2) non-perf reference mismatch")),
-    ],
+    [0, 1, 2],
 )
 @pytest.mark.parametrize(
     "num_tokens,past_lens,num_kv_heads,k_head_size,v_head_size,block_size,sub_block_size",
