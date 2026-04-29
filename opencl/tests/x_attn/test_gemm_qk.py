@@ -912,4 +912,5 @@ if __name__ == "__main__":
         main()
 
 # Usage:
-# - python -m pytest opencl/tests/x_attn/test_gemm_qk.py -s -vv
+# - python -m pytest test_gemm_qk.py -s -vv
+# - python -m pytest test_gemm_qk.py -s -vv -k "test_func_parametrized[1-1-32-2-128-128]"
