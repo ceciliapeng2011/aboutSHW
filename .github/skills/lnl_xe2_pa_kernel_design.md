@@ -342,3 +342,27 @@ actual_ms      = max(mem_floor_ms, (xve_cycles + scalar_cycles) / clock / num_VE
 ```
 
 For detailed TurboQuant cycle analysis, see `turboquant_single_token_analysis.md`.
+
+---
+
+## KV Cache Update Dispatch Comparison (by-token vs by-channel)
+
+Assume `sub_block_size = 16` for by-channel rows.
+
+| Mode | `enable_kvcache_compress` | `kvcache_block_size` | `wg_size` | `LWS` | `GWS` | Tokens/thread | Tokens/WG |
+|------|----------------------------|----------------------|-----------|-------|-------|---------------|-----------|
+| by-token | `1` | `16` | `16` (fixed) | `[1, 1, 16]` | `[1, num_kv_heads, 16 * ceil(process_tokens / 16)]` | `1` | `16` |
+| by-token | `1` | `256` | `16` (fixed) | `[1, 1, 16]` | `[1, num_kv_heads, 16 * ceil(process_tokens / 16)]` | `1` | `16` |
+| by-channel | `2` | `16` | `16/16 = 1` | `[1, 1, 1]` | `[1, num_kv_heads, ceil(process_tokens / 16)]` | up to `16`* | `16` |
+| by-channel | `2` | `256` | `256/16 = 16` | `[1, 1, 16]` | `[1, num_kv_heads, 16 * ceil(process_tokens / 256)]` | up to `16`* | `256` |
+
+Where:
+
+- by-token: `process_tokens = batch_size_in_tokens`
+- by-channel: `process_tokens = sum_i(ceil((past_tail_i + cur_tokens_i)/sub_block_size) * sub_block_size)`
+- by-channel identities:
+    - `wg_size = block_size / sub_block_size`
+    - `wg_count = ceil(process_tokens / block_size)`
+    - `GWS.z = wg_count * wg_size`
+
+\* by-channel boundary work-items can process fewer than `sub_block_size` tokens (`cur_sub_block_size`), and padded/out-of-range work-items may do no useful work.
