@@ -422,19 +422,52 @@ def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
 
 
 def main():
+    # Default configuration
     test_post_proc(BLOCK_SIZE = 128)
     if xe_arch == 2:
         test_post_proc(BLOCK_SIZE = 256)
 
+    # phi-3-mini-128k-instruct (head_size=96, num_heads=4)
+    test_post_proc(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4 (head_ratio 16:1, num_heads=32)
+    test_post_proc(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc(HQ=32, BLOCK_SIZE=256)
+
 def main_multi():
+    # Default configuration
     test_post_proc_multi_subseq(BLOCK_SIZE=128)
     if xe_arch == 2:
         test_post_proc_multi_subseq(BLOCK_SIZE=256)
 
+    # phi-3-mini-128k-instruct
+    test_post_proc_multi_subseq(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4
+    test_post_proc_multi_subseq(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq(HQ=32, BLOCK_SIZE=256)
+
 def main_multi_with_decode():
+    # Default configuration
     test_post_proc_multi_subseq_with_decode(BLOCK_SIZE=128)
     if xe_arch == 2:
         test_post_proc_multi_subseq_with_decode(BLOCK_SIZE=256)
+
+    # phi-3-mini-128k-instruct
+    test_post_proc_multi_subseq_with_decode(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq_with_decode(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4
+    test_post_proc_multi_subseq_with_decode(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq_with_decode(HQ=32, BLOCK_SIZE=256)
 
 if __name__ == "__main__":
     torch.manual_seed(3)

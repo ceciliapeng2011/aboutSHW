@@ -88,10 +88,33 @@ class PaSingleTokenRunner:
         self.kv_partition_size = int(self.block_size * self.k_partition_block_num)
         self.reduce_split_step = 8
 
+        # Calculate Q head chunking matching OpenVINO's get_single_token_q_chunking logic
+        # Reference: src/plugins/intel_gpu/src/graph/impls/cm/paged_attention_gen.hpp
         max_repeat_count = 8
+        reg_m = 1
+        reg_n = 8 if self.xe_arch == 1 else 16
+        bytes_per_float = 4
+        reg_file_size = 256
+        grf_bytes = 32 if self.xe_arch == 1 else 64
+
+        kv_partition_step_num = self.kv_partition_size // self.kv_step
+        rs_cols = reg_m * kv_partition_step_num * reg_n
+        budget_bytes = reg_file_size * grf_bytes - 1  # 8191 bytes for Xe1
+
+        max_q_by_matrix = budget_bytes // (bytes_per_float * rs_cols)
+        if max_q_by_matrix < 1:
+            max_q_by_matrix = 1
+
         q_heads_per_kv_head = self.num_heads // self.num_kv_heads
-        self.q_head_chunks_per_kv_head = (q_heads_per_kv_head + (max_repeat_count - 1)) // max_repeat_count
-        self.q_head_chunk_size = self.num_heads // (self.num_kv_heads * self.q_head_chunks_per_kv_head)
+        target_chunk = min(max_repeat_count, max_q_by_matrix)
+
+        q_head_chunk_size = min(q_heads_per_kv_head, target_chunk)
+        # Ensure even division
+        while q_head_chunk_size > 1 and (q_heads_per_kv_head % q_head_chunk_size) != 0:
+            q_head_chunk_size -= 1
+
+        self.q_head_chunks_per_kv_head = q_heads_per_kv_head // q_head_chunk_size
+        self.q_head_chunk_size = q_head_chunk_size
         self.scale_factor = 1.0 / (self.head_size**0.5)
 
     @staticmethod
@@ -145,7 +168,7 @@ class PaSingleTokenRunner:
                         -Qxcm_register_file_size=256 -I{cwd}
                         -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
                         -DQ_STEP=32 -DKV_STEP={kv_step}
-                        -DWG_SIZE=1 -DKV_BLOCK_SIZE={block_size}
+                        -DKV_BLOCK_SIZE={block_size}
                         -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
                         -DCLEAN_UNUSED_KVCACHE={clean_unused_kvcache}
                         -DKV_CACHE_COMPRESSION={kv_cache_compression}
@@ -359,6 +382,14 @@ GENERATE_ONLY_SINGLE_SUBSEQ_CASES = (
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=0),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=1),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=2),
+    # head_size 96 as phi-3-mini-128k-instruct
+    DecodingCase(num_heads=4, num_kv_heads=2, head_size=96, block_size=256, kv_len=513, kv_cache_compression=0),
+    DecodingCase(num_heads=4, num_kv_heads=2, head_size=96, block_size=256, kv_len=513, kv_cache_compression=1),
+    DecodingCase(num_heads=4, num_kv_heads=2, head_size=96, block_size=256, kv_len=513, kv_cache_compression=2),
+    # head_ratio 16:1 as minicpm4
+    DecodingCase(num_heads=32, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=0),
+    DecodingCase(num_heads=32, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=1),
+    DecodingCase(num_heads=32, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=2),
 )
 
 
@@ -554,3 +585,7 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
 #   python -m pytest --collect-only -q test_pa_decoding.py
 #   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv
 #   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv -k 'generate_only and (cmprby_token or cmprby_channel)'
+#   # Test phi-3-mini-128k-instruct (head_size=96):
+#   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv -k 'test_pa_smoke_paged_attention_generate_only[1x513_h4_kv2_hs96_bls256_sbls16_cmprfp16]'
+#   # Test minicpm4 (head_ratio 16:1):
+#   timeout 120s python -m pytest -s -q test_pa_decoding.py -vv -k 'test_pa_smoke_paged_attention_generate_only[1x513_h32_kv2_hs64_bls256_sbls16_cmprfp16]'

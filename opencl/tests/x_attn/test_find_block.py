@@ -665,16 +665,39 @@ def test_find_multi_subseq_with_decode(xattn_block_size, xattn_thresh, HQ=32, HK
 def main():
     for xattn_block_size in [128, 256]:
         for xattn_thresh in [0.9]:
+            # Default configuration
             test_func(xattn_block_size, xattn_thresh)
             test_perf(xattn_block_size, xattn_thresh)
 
+            # phi-3-mini-128k-instruct (head_size=96)
+            test_func(xattn_block_size, xattn_thresh, HQ=4, HK=2, HEAD_SIZE=96)
+            test_perf(xattn_block_size, xattn_thresh, HQ=4, HK=2, HEAD_SIZE=96)
+
+            # minicpm4 (head_ratio 16:1)
+            test_func(xattn_block_size, xattn_thresh, HQ=32, HK=2, HEAD_SIZE=64)
+            test_perf(xattn_block_size, xattn_thresh, HQ=32, HK=2, HEAD_SIZE=64)
+
 def main_multi():
     for xattn_block_size in [128, 256]:
+        # Default configuration
         test_find_multi_subseq(xattn_block_size, 0.9)
+
+        # phi-3-mini-128k-instruct (head_size=96)
+        test_find_multi_subseq(xattn_block_size, 0.9, HQ=4, HK=2, HEAD_SIZE=96)
+
+        # minicpm4 (head_ratio 16:1)
+        test_find_multi_subseq(xattn_block_size, 0.9, HQ=32, HK=2, HEAD_SIZE=64)
 
 def main_multi_with_decode():
     for xattn_block_size in [128, 256]:
+        # Default configuration
         test_find_multi_subseq_with_decode(xattn_block_size, 0.9)
+
+        # phi-3-mini-128k-instruct (head_size=96)
+        test_find_multi_subseq_with_decode(xattn_block_size, 0.9, HQ=4, HK=2, HEAD_SIZE=96)
+
+        # minicpm4 (head_ratio 16:1)
+        test_find_multi_subseq_with_decode(xattn_block_size, 0.9, HQ=32, HK=2, HEAD_SIZE=64)
 
 if __name__ == "__main__":
     torch.manual_seed(3)

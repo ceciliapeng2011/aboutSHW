@@ -53,7 +53,6 @@ class pa_kvcache_update_cm:
                       f" -DBLOCK_SIZE={self.block_size}"
                       f" -DADJUSTED_BLOCK_SIZE={adjusted_block_size}"
                       f" -DSUB_BLOCK_SIZE={self.sub_block_size}"
-                      f" -DWG_SIZE={self.wg_size}"
                       f" -DKV_CACHE_COMPRESSION={int(enable_kvcache_compress)}"
                       f" -mdump_asm -g2")
                     )
@@ -414,6 +413,14 @@ def run_pa_kv_cache_update_case(num_tokens:list, past_lens:list, num_kv_heads=1,
         pytest.param([16], [0], 1, 16, 16, 16, 16, id="single_subsequence_case1"),
         pytest.param([1], [0], 8, 128, 128, 256, 16, id="single_subsequence_case2"),
         pytest.param([1024], [0], 2, 16, 16, 32, 16, id="single_subsequence_case3"),
+
+        # phi-3-mini-128k-instruct (head_size=96)
+        pytest.param([32], [0], 2, 96, 96, 256, 16, id="phi3_mini_prefill"),
+        pytest.param([1], [512], 2, 96, 96, 256, 16, id="phi3_mini_generate"),
+
+        # minicpm4 (head_ratio 16:1) - use 2 kv_heads
+        pytest.param([32], [0], 2, 64, 64, 256, 16, id="minicpm4_prefill"),
+        pytest.param([1], [512], 2, 64, 64, 256, 16, id="minicpm4_generate"),
     ],
 )
 def test_pa_kv_cache_update_functional(

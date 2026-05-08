@@ -477,7 +477,7 @@ class PaSingleTokenRunner:
                             -Qxcm_register_file_size=256 -I{cwd}
                             -DHEADS_NUM={num_heads} -DKV_HEADS_NUM={num_kv_heads} -DHEAD_SIZE={head_size}
                             -DQ_STEP=32 -DKV_STEP={kv_step}
-                            -DWG_SIZE=1 -DKV_BLOCK_SIZE={block_size}
+                            -DKV_BLOCK_SIZE={block_size}
                             -DKV_PARTITION_SIZE={kv_partition_size} -DREDUCE_SPLIT_SIZE={reduce_split_step}
                             -DCLEAN_UNUSED_KVCACHE={clean_unused_kvcache}
                             -DKV_CACHE_COMPRESSION={kv_cache_compression}

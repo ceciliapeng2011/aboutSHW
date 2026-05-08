@@ -855,7 +855,7 @@ def main_multi_with_decode():
 
 
 @pytest.mark.parametrize("xattn_block_size", [128, 256])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 96, 128])  # Added 96 for phi-3-mini
 @pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
 # Only DEFAULT_SUB_BLOCK_SIZE(16) is supported: estimate kernel's dec/load_scale_zp lambdas
 # assume SUB_BLOCK_SIZE == STRIDE (BLOCK_REG_K=16). Other values need dequant loop restructuring.
@@ -865,8 +865,9 @@ def main_multi_with_decode():
     [
         (1, 1),
         (2, 1),
-        (4, 2),
+        (4, 2),  # phi-3-mini with head_size=96
         (32, 8),
+        (32, 2),  # minicpm4 (head_ratio 16:1)
         (16, 16),
         (28, 4),
     ],
