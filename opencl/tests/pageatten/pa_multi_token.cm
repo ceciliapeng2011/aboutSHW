@@ -278,6 +278,8 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 #ifndef CM_HAS_LSC_UNTYPED_2D
     uint v_offset_bytes = v_offset; // U8: byte offset
 #endif
+// printf("[TokenDebug] WG processes token [%d:%d]: batch=%d h=%d q_start=%d q_len_sg=%d subseq_id=%d\n", wg_id, wg_local_id,
+//                    batch, h, q_start_sg, q_len_sg, subsequence_id);
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
                             slm_V,

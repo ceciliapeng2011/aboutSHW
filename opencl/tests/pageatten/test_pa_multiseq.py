@@ -345,6 +345,7 @@ class PaMultiTokenRunner:
             print("[enqueue] block_indices=", block_indices.tolist())
             print("[enqueue] block_indices_begins=", block_indices_begins.tolist())
             print("[enqueue] subsequence_begins=", subsequence_begins.tolist())
+            print("[enqueue] blocked_q_starts_and_subseq_mapping=", blocked_q_starts_and_subseq_mapping.tolist())
             print("[enqueue] prefill_seq_indices=", prefill_seq_indices)
             print("[enqueue] prefill_seq_count=", prefill_seq_count)
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
@@ -1145,8 +1146,8 @@ _PREFILL_ONLY_SMOKE_BASE_CASES = (
         v_head_size=32,
         block_size=32,
     ),
-    # Align with smoke_cm_xattention/basic long prefill shapes (indices 15/18/27).
-    # kv_cache_compression is expanded by _with_kv_cache_compression_modes(...).
+    # # Align with smoke_cm_xattention/basic long prefill shapes (indices 15/18/27).
+    # # kv_cache_compression is expanded by _with_kv_cache_compression_modes(...).
     PagedAttentionTestCase(
         subsequences=(ss(2048),),
         num_heads=2,
@@ -1164,8 +1165,6 @@ _PREFILL_ONLY_SMOKE_BASE_CASES = (
         block_size=256,
     ),
     # Align with smoke_cm_xattention/xattention_test.basic/89
-    # Multi-subsequence prefill with BY_TOKEN compression (expanded by _with_kv_cache_compression_modes)
-    # This test case exposed a CM compiler bug with cur_sum = cm_inv(cur_sum) causing NaN
     PagedAttentionTestCase(
         subsequences=(ss(10), ss(30)),
         num_heads=4,
@@ -1173,6 +1172,7 @@ _PREFILL_ONLY_SMOKE_BASE_CASES = (
         k_head_size=64,
         v_head_size=64,
         block_size=256,
+        sparse_block_size=1,
     ),
 )
 
@@ -1352,7 +1352,8 @@ def test_pa_smoke_paged_attention_mixed_only_route_matches_reference(
 #   timeout 120s python -m pytest -q test_pa_multiseq.py -vv
 #   timeout 120s python -m pytest -q test_pa_multiseq.py -vv -k 'cmpr0 and (generate_only or mixed_only)'
 #   python -m pytest -q test_pa_multiseq.py -k '(prefill_only and spbs128) or (mixed_only and spbs256 and route_split)'
-#   python -m pytest -s test_pa_multiseq.py -vv -k 'test_pa_smoke_paged_attention_prefill_only[10_30__h4_kv2_khs64_vhs64_bls256_sbls16_spbs256_cmpr1]'
+#   python -m pytest -s test_pa_multiseq.py -vv -k '(sbls16_spbs128_cmpr1) and (prefill_only)'
+#   python -m pytest -s test_pa_multiseq.py -vv -k 'test_pa_smoke_paged_attention_prefill_only[128_256__h2_kv2_khs64_vhs64_bls16_sbls16_spbs1_cmpr0]'
 #
 # Notes:
 #   - Mixed routing is selected explicitly by the parametrized `mixed_route_mode` test argument.

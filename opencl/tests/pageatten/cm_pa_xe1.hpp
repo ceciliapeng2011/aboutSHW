@@ -311,7 +311,26 @@ void pa_lsc_u8(
 
     //# save cur_O/cur_sum.transpose(0, 1)
     matrix<half, num_P_tiles*REG_M, REG_N> cur_O_f16;
+
+    // Debug: Check ALL 8 cur_sum elements BEFORE cm_inv
+    // if (1) {
+    //     auto wg_id = cm_group_id(2);
+    //     cm_printf("[Token13Debug] [%d:%d] BEFORE cm_inv cur_sum[0-7]:\n", wg_id, wg_local_id);
+    //     cm_printf("  %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+    //               (float)cur_sum[0], (float)cur_sum[1], (float)cur_sum[2], (float)cur_sum[3],
+    //               (float)cur_sum[4], (float)cur_sum[5], (float)cur_sum[6], (float)cur_sum[7]);
+    // }
+
     cur_sum = cm_inv(cur_sum);
+
+    // Debug: Check ALL 8 cur_sum elements AFTER cm_inv
+    // if (1) {
+    //     auto wg_id = cm_group_id(2);
+    //     cm_printf("[Token13Debug] [%d:%d] AFTER cm_inv cur_sum[0-7]:\n", wg_id, wg_local_id);
+    //     cm_printf("  %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+    //               (float)cur_sum[0], (float)cur_sum[1], (float)cur_sum[2], (float)cur_sum[3],
+    //               (float)cur_sum[4], (float)cur_sum[5], (float)cur_sum[6], (float)cur_sum[7]);
+    // }
 
     #pragma unroll
     for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
@@ -325,8 +344,8 @@ void pa_lsc_u8(
             int o_stride_elems = o_pitch / sizeof(half);
             half* output_ptr = (half*)o_base + p * REG_M * o_stride_elems + k;
             auto cur_O_ref = cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p).format<half, REG_M, REG_N>();
-            #pragma unroll
-            for (int r = 0; r < REG_M; r++) {
+
+            for (int r = 0; r < q_len; r++) {
                 cm_svm_block_write<half, REG_N>((svmptr_t)(output_ptr + r * o_stride_elems), cur_O_ref.row(r).format<half>());
             }
         }
@@ -608,8 +627,8 @@ void pa_kernel_lsc_prefetch_f16(
             int o_stride_elems = o_pitch / sizeof(half);
             half* output_ptr = (half*)o_base + p * REG_M * o_stride_elems + k;
             auto cur_O_ref = cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(p).format<half, REG_M, REG_N>();
-            #pragma unroll
-            for (int r = 0; r < REG_M; r++) {
+
+            for (int r = 0; r < q_len; r++) {
                 cm_svm_block_write<half, REG_N>((svmptr_t)(output_ptr + r * o_stride_elems), cur_O_ref.row(r).format<half>());
             }
         }
