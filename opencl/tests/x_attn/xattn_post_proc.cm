@@ -15,39 +15,12 @@
  *******************************************************************************/
 
 namespace KERNEL_NAME {
-#include <cm/cm.h>
-#include <cm/cmtl.h>
-
-#ifndef ATTR
-#define ATTR [[type("svmptr_t")]]
-#define ATTR_BUF [[type("buffer_t")]]
-#endif
-
-// Shared metadata field offsets
-#ifndef XATTN_META_STRIDE
-#define XATTN_META_SUBSEQ_Q_BEGIN    0
-#define XATTN_META_SUBSEQ_Q_LEN     1
-#define XATTN_META_M                 2
-#define XATTN_META_N                 3
-#define XATTN_META_Q_STRIDE_PAD      4
-#define XATTN_META_N_KQ_GROUPS       5
-#define XATTN_META_Q_BLOCK_PAD       6
-#define XATTN_META_K_BLOCK_PAD       7
-#define XATTN_META_CAUSAL_START      8
-#define XATTN_META_Q_START_STRIDED   9
-#define XATTN_META_BUF_OFF_KQ_MAX   10
-#define XATTN_META_BUF_OFF_EXP_SUM  11
-#define XATTN_META_BUF_OFF_MASK     12
-#define XATTN_META_BUF_OFF_MASK_WG  13
-#define XATTN_META_BLOCK_IDX_BEGIN  14
-#define XATTN_META_WG_OFFSET        15
-#define XATTN_META_STRIDE           16
-#endif
+#include "estimate.hpp"
+#include "xattn_subseq_meta.hpp"
 
 CM_INLINE void post_proc_impl(svmptr_t block_mask, svmptr_t merged_block_mask, uint q_stride_pad, uint q_block_pad, uint k_block_pad) {
     const int TOKEN_IN_BLOCK = BLOCK_SIZE / STRIDE;
     uint m_mereged = cm_group_id(0);
-    uint hq = cm_group_id(1);
 
     int j = 0;
     {
@@ -80,11 +53,18 @@ CM_INLINE void post_proc_impl(svmptr_t block_mask, svmptr_t merged_block_mask, u
     }
 }
 
-extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t merged_block_mask ATTR, svmptr_t xattn_subseq_meta ATTR) {
-    // GWS: [max(q_block_pad/MERGED_Q_NUM), HQ, num_subseqs]
-    uint b = cm_group_id(2);
+extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR,
+                                         svmptr_t merged_block_mask ATTR,
+                                         svmptr_t xattn_subseq_meta ATTR,
+                                         svmptr_t xattn_post_wg_map ATTR) {
+    // GWS: [xattn_post_wg_count, HQ, 1]
     uint hq = cm_group_id(1);
-    uint m_mereged = cm_group_id(0);
+    uint wg_flat = cm_group_id(0);
+
+    int* wg_map = (int*)xattn_post_wg_map;
+    int map_base = wg_flat * 2;
+    uint b = (uint)wg_map[map_base + 0];
+    uint m_mereged = (uint)wg_map[map_base + 1];
 
     int* meta = (int*)xattn_subseq_meta;
     int meta_base = b * XATTN_META_STRIDE;
@@ -96,9 +76,6 @@ extern "C" _GENX_MAIN_ void post_proc_mask(svmptr_t block_mask ATTR, svmptr_t me
     uint buf_off_mask_wg = (uint)meta[meta_base + XATTN_META_BUF_OFF_MASK_WG];
 
     uint merged_q_blocks = (q_block_pad + MERGED_Q_NUM - 1) / MERGED_Q_NUM;
-
-    // Early-return for padding workgroups beyond this subsequence
-    if (m_mereged >= merged_q_blocks) return;
 
     svmptr_t mask_base = block_mask + buf_off_mask + hq * q_block_pad * k_block_pad;
     mask_base += m_mereged * MERGED_Q_NUM * k_block_pad;
