@@ -34,6 +34,22 @@ else:
     xe_arch = 2
 print(f"xe_arch: {xe_arch}")
 
+# Xe1 supports only block size 128 for xattn gemm_qk tests.
+XATTN_BLOCK_SIZES = [128] if xe_arch == 1 else [128, 256]
+
+
+def get_xattn_block_wg_k_workaround(num_heads, num_kv_heads, head_size, xattn_block_size, kvcache_compressed):
+    if isinstance(kvcache_compressed, bool):
+        kv_cache_compression = 1 if kvcache_compressed else 0
+    else:
+        kv_cache_compression = int(kvcache_compressed)
+
+    if (xattn_block_size == 256 and kv_cache_compression == 1 and head_size == 64 and
+            num_heads == 1 and num_kv_heads == 1):
+        return 32
+
+    return 64 if head_size % 64 == 0 else 32
+
 DUMP_ENQUEUE_ARGUMENTS = True
 THRESH = 0.9 # useless in gemmQK actually
 SOFTMAX_TYPE = 'float' # 'half'
@@ -61,7 +77,8 @@ def setup_module(module):
 
 class xattn_gemmQK:
     def __init__(self, num_heads, num_kv_heads, head_size, xattn_block_size, is_causal, kvcache_compressed, sub_block_size=DEFAULT_SUB_BLOCK_SIZE):
-        BLOCK_WG_K = 64 if head_size % 64 == 0 else 32
+        BLOCK_WG_K = get_xattn_block_wg_k_workaround(
+            num_heads, num_kv_heads, head_size, xattn_block_size, kvcache_compressed)
 
         if isinstance(kvcache_compressed, bool):
             kv_cache_compression = 1 if kvcache_compressed else 0
@@ -90,7 +107,7 @@ class xattn_gemmQK:
         INV_S = 1 / torch.sqrt(torch.tensor([head_size], dtype=torch.float32)) / STRIDE
         INV_S = int(INV_S.view(dtype=torch.uint32))
 
-        src = r'''#include "xattn_gemm_qk.hpp"'''
+        src = r'''#include "xattn_gemm_qk.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} ...")
 
@@ -158,7 +175,7 @@ class xattn_gemmQK:
             print("gemm_qk size of memories:")
             for name, value in lines:
                 print(f"  {name:<{LABEL_WIDTH}} {value}")
-            print("\gemm_qk scalers:")
+            print("gemm_qk scalers:")
             print(f"  M:{M:<10}  N:{N:<10}  "
                 f"mask_H:{K:<10}  query_stride:{query_stride:<10}  "
                 f"q_start_strided:{q_start_strided:<10} ")
@@ -167,7 +184,7 @@ class xattn_gemmQK:
         num_subseqs = 1
         for i in range(n_repeats):
             self.kernels.enqueue('gemm_qk', GWS, LWS, t_key_cache, t_query, t_block_indices, t_meta,
-                                 t_kq_max_wg, t_kq_exp_partial_sum, K, query_stride, num_subseqs)
+                                 t_kq_max_wg, t_kq_exp_partial_sum, query_stride, num_subseqs)
         latency = cl.finish()
         return latency, t_kq_max_wg, t_kq_exp_partial_sum
 
@@ -466,6 +483,7 @@ def build_xattn_subseq_meta(subsequences, num_heads, xattn_block_size, merged_q_
 xattn_gemmQK_multi = xattn_gemmQK
 
 
+@pytest.mark.parametrize("xattn_block_size", XATTN_BLOCK_SIZES)
 def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=128, kvcache_compressed=True, is_causal=True):
     """Test gemm_qk with multiple subsequences in a single kernel dispatch.
 
@@ -591,7 +609,7 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
         xattn_cm_multi.kernels.enqueue('gemm_qk', GWS, LWS,
                                         t_key_cache, t_query, t_block_indices, t_meta,
                                         t_kq_max_wg, t_kq_exp_partial_sum,
-                                        K_dim, query_stride, num_subseqs)
+                                        query_stride, num_subseqs)
         cl.finish()
 
         # Validate each subsequence independently against single-subseq reference
@@ -643,6 +661,7 @@ def test_multi_subseq(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=
         print(f'{Colors.GREEN}multi-subseq test "{desc}" passed{Colors.END}')
 
 
+@pytest.mark.parametrize("xattn_block_size", XATTN_BLOCK_SIZES)
 def test_multi_subseq_with_decode_subseqs(xattn_block_size, num_heads=32, num_kv_heads=8, head_size=128, kvcache_compressed=True, is_causal=True):
     """Test that decode subsequences (q_len < STRIDE) are handled correctly
     under both routing strategies:
@@ -797,7 +816,7 @@ def test_multi_subseq_with_decode_subseqs(xattn_block_size, num_heads=32, num_kv
             xattn_cm_multi.kernels.enqueue('gemm_qk', GWS, LWS,
                                             t_key_cache, t_query, t_block_indices, t_meta,
                                             t_kq_max_wg, t_kq_exp_partial_sum,
-                                            K_dim, query_stride, num_subseqs)
+                                            query_stride, num_subseqs)
             cl.finish()
 
             # Validate only prefill subseqs (decode subseqs produce no output)
@@ -850,11 +869,11 @@ def test_multi_subseq_with_decode_subseqs(xattn_block_size, num_heads=32, num_kv
 
 
 def main_multi_with_decode():
-    for xattn_block_size in [128, 256]:
+    for xattn_block_size in XATTN_BLOCK_SIZES:
         test_multi_subseq_with_decode_subseqs(xattn_block_size)
 
 
-@pytest.mark.parametrize("xattn_block_size", [128, 256])
+@pytest.mark.parametrize("xattn_block_size", XATTN_BLOCK_SIZES)
 @pytest.mark.parametrize("head_size", [64, 96, 128])  # Added 96 for phi-3-mini
 @pytest.mark.parametrize("kvcache_compressed", [0, 1, 2])
 # Only DEFAULT_SUB_BLOCK_SIZE(16) is supported: estimate kernel's dec/load_scale_zp lambdas
@@ -888,11 +907,11 @@ def test_func_parametrized(xattn_block_size, head_size, kvcache_compressed, sub_
     )
 
 def main():
-    for xattn_block_size in [128, 256]:
+    for xattn_block_size in XATTN_BLOCK_SIZES:
         run_func(xattn_block_size)
 
 def main_multi():
-    for xattn_block_size in [128, 256]:
+    for xattn_block_size in XATTN_BLOCK_SIZES:
         test_multi_subseq(xattn_block_size)
 
 if __name__ == "__main__":
@@ -907,7 +926,7 @@ if __name__ == "__main__":
     elif '--multi-subseq' in sys.argv:
         main_multi()
     elif '--perf' in sys.argv:
-        for xattn_block_size in [128, 256]:
+        for xattn_block_size in XATTN_BLOCK_SIZES:
             run_perf(xattn_block_size)
     else:
         main()
