@@ -94,7 +94,13 @@ class xattn_find_block:
         ]], dtype=np.int32)
         t_meta = cl.tensor(meta_np)
 
-        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, xattn_thresh]
+        # Build wg_map for find_block: [subseq_id, q_block_idx] pairs
+        wg_map_data = []
+        for m in range(q_block_pad):
+            wg_map_data.extend([0, m])  # subseq_id=0 (single subseq), q_block_idx=m
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
+        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, t_wg_map, xattn_thresh]
         if FIND_DEBUG_ACC:
             params += [t_kq_sum]
 
@@ -430,6 +436,14 @@ def test_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZ
         meta_np = np.array(meta_rows, dtype=np.int32)
         t_meta = cl.tensor(meta_np)
 
+        # Build wg_map for multi-subseq find_block
+        wg_map_data = []
+        for i in range(num_subseqs):
+            ref = per_subseq_refs[i]
+            for m in range(ref['q_block_pad']):
+                wg_map_data.extend([i, m])  # subseq_id=i, q_block_idx=m
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
         # Allocate combined buffers and copy per-subseq data into them
         total_kq_max_elems = offset_kq_max // sizeof_softmax
         total_exp_sum_elems = offset_exp_sum // sizeof_softmax
@@ -462,7 +476,7 @@ def test_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZ
         kq_sum_size = num_subseqs * HQ * (max_q_stride_pad // (xattn_block_size // STRIDE)) * max_k_block_pad
         t_kq_sum = cl.tensor(np.zeros(kq_sum_size, np.float16))
 
-        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, xattn_thresh, t_kq_sum]
+        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, t_wg_map, xattn_thresh, t_kq_sum]
         cl.finish()
         find_cm.kernels.enqueue("find_block", GWS, LWS, *params)
         cl.finish()
@@ -603,6 +617,13 @@ def test_find_multi_subseq_with_decode(xattn_block_size, xattn_thresh, HQ=32, HK
         t_meta = cl.tensor(meta_np)
         num_subseqs = len(prefill_indices)
 
+        # Build wg_map for decode+prefill find_block (only prefill subseqs)
+        wg_map_data = []
+        for i, ref in enumerate(per_subseq_refs):
+            for m in range(ref['q_block_pad']):
+                wg_map_data.extend([i, m])  # subseq_id=i, q_block_idx=m
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
         total_kq_max_elems = offset_kq_max // sizeof_softmax
         total_exp_sum_elems = offset_exp_sum // sizeof_softmax
         total_mask_elems = offset_mask
@@ -632,7 +653,7 @@ def test_find_multi_subseq_with_decode(xattn_block_size, xattn_thresh, HQ=32, HK
         kq_sum_size = num_subseqs * HQ * (max_q_stride_pad // (xattn_block_size // STRIDE)) * max_k_block_pad
         t_kq_sum = cl.tensor(np.zeros(kq_sum_size, np.float16))
 
-        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, xattn_thresh, t_kq_sum]
+        params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, t_wg_map, xattn_thresh, t_kq_sum]
         cl.finish()
         find_cm.kernels.enqueue("find_block", GWS, LWS, *params)
         cl.finish()

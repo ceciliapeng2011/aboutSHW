@@ -89,8 +89,14 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
         ]], dtype=np.int32)
         t_meta = cl.tensor(meta_np)
 
+        # Build wg_map for post_proc: [subseq_id, merged_q_block_idx] pairs
+        wg_map_data = []
+        for m_merged in range(merged_q_blocks):
+            wg_map_data.extend([0, m_merged])  # subseq_id=0 (single subseq), merged_q_block_idx=m_merged
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
         cl.finish()
-        kernels.enqueue("post_proc_mask", [merged_q_blocks, HQ, 1], [1, 1, 1], t_mask, t_merged_mask, t_meta)
+        kernels.enqueue("post_proc_mask", [merged_q_blocks, HQ, 1], [1, 1, 1], t_mask, t_merged_mask, t_meta, t_wg_map)
         ns = cl.finish()
         t_merged_mask_np = t_merged_mask.numpy()
 
@@ -202,6 +208,13 @@ def test_post_proc_multi_subseq(HQ=1, BLOCK_SIZE=128):
         meta_np = np.array(meta_rows, dtype=np.int32)
         t_meta = cl.tensor(meta_np)
 
+        # Build wg_map for multi-subseq post_proc
+        wg_map_data = []
+        for i, s in enumerate(per_subseq):
+            for m_merged in range(s['merged_q_blocks']):
+                wg_map_data.extend([i, m_merged])  # subseq_id=i, merged_q_block_idx=m_merged
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
         # Build combined mask buffer
         combined_mask = np.zeros(offset_mask, dtype=np.int8)
         for i, s in enumerate(per_subseq):
@@ -216,7 +229,7 @@ def test_post_proc_multi_subseq(HQ=1, BLOCK_SIZE=128):
         LWS = [1, 1, 1]
 
         cl.finish()
-        kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta)
+        kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta, t_wg_map)
         cl.finish()
 
         # Validate per-subsequence
@@ -368,12 +381,19 @@ def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
                 offset_mask += HQ * q_block_pad * k_block_pad
                 offset_mask_wg += HQ * merged_q_blocks * k_block_pad
 
+            meta_np = np.array(meta_rows, dtype=np.int32)
+            t_meta = cl.tensor(meta_np)
+
             if max_merged_q_blocks == 0:
                 print(f'{Colors.GREEN}  {label}: no work — passed{Colors.END}')
                 continue
 
-            meta_np = np.array(meta_rows, dtype=np.int32)
-            t_meta = cl.tensor(meta_np)
+            # Build wg_map for decode+prefill post_proc
+            wg_map_data = []
+            for i, s in enumerate(per_subseq):
+                for m_merged in range(s['merged_q_blocks']):
+                    wg_map_data.extend([i, m_merged])  # subseq_id=i, merged_q_block_idx=m_merged
+            t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
 
             combined_mask = np.zeros(offset_mask, dtype=np.int8)
             for i, s in enumerate(per_subseq):
@@ -388,7 +408,7 @@ def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
             LWS = [1, 1, 1]
 
             cl.finish()
-            kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta)
+            kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta, t_wg_map)
             cl.finish()
 
             merged_all = t_merged_mask.numpy()

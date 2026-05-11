@@ -217,32 +217,84 @@ class PaMultiTokenRunner:
         selected_sequence_ids: torch.Tensor,
         batch_size_in_tokens: int,
         wg_count: int,
-    ) -> tuple[object | None, object | None, int, int]:
+    ) -> tuple[object | None, object | None, object | None]:
         if self.sparse_block_size <= 1:
-            return None, None, 0, 0
+            return None, None, None
 
         past_lens = kern_attn_inputs["past_lens"]
+        block_indices_begins = kern_attn_inputs["block_indices_begins"]
         assert isinstance(past_lens, torch.Tensor)
+        assert isinstance(block_indices_begins, torch.Tensor)
 
-        num_q_blocks = DIV_UP(batch_size_in_tokens, self.sparse_block_size)
-        max_context_len = 0
+        # Calculate per-subsequence dimensions and build metadata
+        STRIDE = 16
+        sum_per_token_in_block = self.sparse_block_size // STRIDE
+
+        # Simplified block size calculation for multi-token kernel
+        BLOCK_WG_M = 256  # From xattn kernel constants
+        BLOCK_WG_N = 256
+
+        meta_rows = []
+        cumul_mask_elems = 0
+        cumul_mask_wg_elems = 0
+
         for sequence_id in selected_sequence_ids.tolist():
             sequence_index = int(sequence_id)
             q_start, q_end, _, _ = get_sequence_ranges(kern_attn_inputs, sequence_index)
             q_len = q_end - q_start
             past_len = int(past_lens[sequence_index].item())
-            context_len = past_len + q_len
-            if context_len > max_context_len:
-                max_context_len = context_len
-        num_k_blocks = DIV_UP(max_context_len, self.sparse_block_size)
+            kv_len = past_len + q_len
+            bi_begin = int(block_indices_begins[sequence_index].item())
 
-        sparse_block_mask = torch.ones((self.num_heads, num_q_blocks, num_k_blocks), dtype=torch.bool)
-        sparse_block_mask_wg = torch.ones((self.num_heads, int(wg_count), num_k_blocks), dtype=torch.bool)
+            q_stride = q_len // STRIDE
+            k_stride = kv_len // STRIDE
+            q_stride_pad = DIV_UP(q_stride, BLOCK_WG_M) * BLOCK_WG_M
+            N_kq_groups = DIV_UP(k_stride, BLOCK_WG_N)
+            k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
+
+            q_block_pad = DIV_UP(q_len, self.sparse_block_size)
+            k_block_pad = k_block_in_group * N_kq_groups
+
+            # Calculate merged_q_blocks based on PA workgroup merging factor
+            # PA_WG_SIZE = 256 (XE2) or 128 (XE1)
+            # MERGED_Q_NUM = PA_WG_SIZE // sparse_block_size
+            PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
+            MERGED_Q_NUM = PA_WG_SIZE // self.sparse_block_size
+            merged_q_blocks = DIV_UP(q_block_pad, MERGED_Q_NUM)
+
+            meta_rows.append([
+                q_start,            # [0]  SUBSEQ_Q_BEGIN
+                q_len,              # [1]  SUBSEQ_Q_LEN
+                q_stride,           # [2]  M
+                k_stride,           # [3]  N
+                q_stride_pad,       # [4]  Q_STRIDE_PAD
+                N_kq_groups,        # [5]  N_KQ_GROUPS
+                q_block_pad,        # [6]  Q_BLOCK_PAD
+                k_block_pad,        # [7]  K_BLOCK_PAD
+                0,                  # [8]  CAUSAL_START (not used by pa_multi_token)
+                0,                  # [9]  Q_START_STRIDED
+                0,                  # [10] BUF_OFF_KQ_MAX
+                0,                  # [11] BUF_OFF_EXP_SUM
+                cumul_mask_elems,   # [12] BUF_OFF_MASK
+                cumul_mask_wg_elems,# [13] BUF_OFF_MASK_WG
+                bi_begin,           # [14] BLOCK_IDX_BEGIN
+                0,                  # [15] WG_OFFSET
+            ])
+
+            cumul_mask_elems += self.num_heads * q_block_pad * k_block_pad
+            cumul_mask_wg_elems += self.num_heads * merged_q_blocks * k_block_pad
+
+        # Allocate combined sparse masks
+        sparse_block_mask = torch.ones(cumul_mask_elems, dtype=torch.bool)
+        sparse_block_mask_wg = torch.ones(cumul_mask_wg_elems, dtype=torch.bool)
+
+        # Build metadata tensor
+        meta_np = np.array(meta_rows, dtype=np.int32)
+
         return (
             cl.tensor(sparse_block_mask.detach().numpy()),
             cl.tensor(sparse_block_mask_wg.detach().numpy()),
-            int(num_q_blocks),
-            int(num_k_blocks),
+            cl.tensor(meta_np),
         )
 
     def __call__(
@@ -317,7 +369,7 @@ class PaMultiTokenRunner:
             gws = [1, self.num_heads, int(wg_count * wg_size)]
             lws = [1, 1, wg_size]
 
-            t_sparse_block_mask, t_sparse_block_mask_wg, num_q_blocks, num_k_blocks = self._create_sparse_mask_tensors(
+            t_sparse_block_mask, t_sparse_block_mask_wg, t_xattn_meta = self._create_sparse_mask_tensors(
                 kern_attn_inputs,
                 selected_sequence_ids,
                 batch_size_in_tokens,
@@ -349,9 +401,11 @@ class PaMultiTokenRunner:
             print("[enqueue] prefill_seq_indices=", prefill_seq_indices)
             print("[enqueue] prefill_seq_count=", prefill_seq_count)
             print("[enqueue] q_len=", batch_size_in_tokens, "out.shape=", out_shape)
+            if self.sparse_block_size > 1 and t_xattn_meta is not None:
+                print(f"[enqueue] sparse_block_size={self.sparse_block_size}, xattn_meta shape={t_xattn_meta.shape}")
 
             if self.sparse_block_size > 1:
-                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None and t_xattn_meta is not None
                 selected_kernels.enqueue(
                     "cm_page_attention",
                     gws,
@@ -368,8 +422,7 @@ class PaMultiTokenRunner:
                     batch_size_in_tokens,
                     t_sparse_block_mask,
                     t_sparse_block_mask_wg,
-                    int(num_q_blocks),
-                    int(num_k_blocks),
+                    t_xattn_meta,
                 )
             else:
                 selected_kernels.enqueue(
@@ -596,10 +649,10 @@ class PaSingleTokenRunner:
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                decode_seq_count,
                 t_out,
                 t_lse,
-                1,
+                1,  # q_len
+                decode_seq_count,  # selected_sequence_count
             )
             kernels.enqueue(
                 "cm_sdpa_2nd_reduce",
