@@ -220,11 +220,12 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         t_blocked_q_starts_and_subseq_mapping = cl.tensor(blocked_q_starts_and_subseq_mapping.detach().numpy())
         gws = [1, self.num_heads, int(wg_count * wg_size)]
         lws = [1, 1, wg_size]
-        t_sparse_block_mask, t_sparse_block_mask_wg, num_q_blocks, num_k_blocks = self._create_sparse_mask_tensors(
+        t_sparse_block_mask, t_sparse_block_mask_wg, t_xattn_meta = self._create_sparse_mask_tensors(
             kern_attn_inputs,
             selected_sequence_ids,
             batch_size_in_tokens,
             wg_count,
+            wg_seq_len,
         )
 
         use_optimized_dispatch = (
@@ -241,7 +242,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
 
         for _ in range(n_warmup):
             if self.sparse_block_size > 1:
-                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None and t_xattn_meta is not None
                 selected_kernels.enqueue(
                     "cm_page_attention",
                     gws,
@@ -258,8 +259,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
                     batch_size_in_tokens,
                     t_sparse_block_mask,
                     t_sparse_block_mask_wg,
-                    int(num_q_blocks),
-                    int(num_k_blocks),
+                    t_xattn_meta,
                 )
             else:
                 selected_kernels.enqueue(
@@ -282,7 +282,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         t0 = time.perf_counter()
         for _ in range(n_iters):
             if self.sparse_block_size > 1:
-                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None
+                assert t_sparse_block_mask is not None and t_sparse_block_mask_wg is not None and t_xattn_meta is not None
                 selected_kernels.enqueue(
                     "cm_page_attention",
                     gws,
@@ -299,8 +299,7 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
                     batch_size_in_tokens,
                     t_sparse_block_mask,
                     t_sparse_block_mask_wg,
-                    int(num_q_blocks),
-                    int(num_k_blocks),
+                    t_xattn_meta,
                 )
             else:
                 selected_kernels.enqueue(

@@ -291,6 +291,28 @@ class page_atten_cm:
                 validate = True
                 if self.sparse_block_sz > 1:
                     t_block_mask_in_wg  = cl.tensor(block_mask_in_wg_list[trunk_idx].to(torch.bool).detach().numpy())
+                    q_stride = q_len // 16
+                    kv_len = trunk_idx * self.trunk_sz + q_len
+                    k_stride = kv_len // 16
+                    sum_per_token_in_block = self.sparse_block_sz // 16
+                    BLOCK_WG_M = 256
+                    BLOCK_WG_N = 256
+                    q_stride_pad = DIV_UP(max(1, q_stride), BLOCK_WG_M) * BLOCK_WG_M
+                    n_kq_groups = DIV_UP(max(1, k_stride), BLOCK_WG_N)
+                    meta_np = np.array([[
+                        0,            # [0] SUBSEQ_Q_BEGIN
+                        q_len,        # [1] SUBSEQ_Q_LEN
+                        q_stride,     # [2] M
+                        k_stride,     # [3] N
+                        q_stride_pad, # [4] Q_STRIDE_PAD
+                        n_kq_groups,  # [5] N_KQ_GROUPS
+                        int(num_q_blocks),  # [6] Q_BLOCK_PAD
+                        int(num_k_blocks),  # [7] K_BLOCK_PAD
+                        0, 0, 0, 0,   # [8..11]
+                        0, 0,         # [12] BUF_OFF_MASK, [13] BUF_OFF_MASK_WG
+                        0, 0          # [14] BLOCK_IDX_BEGIN, [15] WG_OFFSET
+                    ]], dtype=np.int32)
+                    t_xattn_meta = cl.tensor(meta_np)
                     self.kernels.enqueue(
                         "cm_page_attention",
                         GWS,
@@ -307,8 +329,7 @@ class page_atten_cm:
                         q_len,
                         t_block_mask,
                         t_block_mask_in_wg,
-                        num_q_blocks,
-                        num_k_blocks,
+                        t_xattn_meta,
                     )
                 else:
                     self.kernels.enqueue(
@@ -463,9 +484,30 @@ class page_atten_cm:
 
             if self.sparse_block_sz > 1:
                 t_block_mask_in_wg = cl.tensor(block_mask_in_wg_list[trunk_idx].detach().numpy())
+                q_stride = q_len // 16
+                kv_len = trunk_idx * self.trunk_sz + q_len
+                k_stride = kv_len // 16
+                BLOCK_WG_M = 256
+                BLOCK_WG_N = 256
+                q_stride_pad = DIV_UP(max(1, q_stride), BLOCK_WG_M) * BLOCK_WG_M
+                n_kq_groups = DIV_UP(max(1, k_stride), BLOCK_WG_N)
+                meta_np = np.array([[
+                    0,
+                    q_len,
+                    q_stride,
+                    k_stride,
+                    q_stride_pad,
+                    n_kq_groups,
+                    int(num_q_blocks),
+                    int(num_k_blocks),
+                    0, 0, 0, 0,
+                    0, 0,
+                    0, 0
+                ]], dtype=np.int32)
+                t_xattn_meta = cl.tensor(meta_np)
                 per_trunk_args.append(
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
-                     q_len, t_block_mask, t_block_mask_in_wg, num_q_blocks, num_k_blocks)
+                     q_len, t_block_mask, t_block_mask_in_wg, t_xattn_meta)
                 )
             else:
                 per_trunk_args.append(
@@ -481,8 +523,8 @@ class page_atten_cm:
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
-                     q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
+                     q_len, t_block_mask, t_block_mask_in_wg, t_xattn_meta) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, t_xattn_meta)
                 else:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len) = args
@@ -494,8 +536,8 @@ class page_atten_cm:
             for args in per_trunk_args:
                 if self.sparse_block_sz > 1:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
-                     q_len, t_block_mask, t_block_mask_in_wg, nq, nk) = args
-                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, nq, nk)
+                     q_len, t_block_mask, t_block_mask_in_wg, t_xattn_meta) = args
+                    self.kernels.enqueue("cm_page_attention", GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out, q_len, t_block_mask, t_block_mask_in_wg, t_xattn_meta)
                 else:
                     (GWS, LWS, t_q, t_k, t_v, t_past_lens, t_block_indices, t_block_indices_begins, t_subsequence_begins, t_blocked_q_starts_and_subseq_mapping, t_out,
                      q_len) = args
@@ -1100,31 +1142,50 @@ if __name__ == "__main__":
         test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 128, density=0.33, check_acc=True)
 
     # perf for sparse X attention, with QWen3 8K case
-    def smoke_perf_test(blocks_per_trunk = 128, compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE):
+    def smoke_perf_test(
+        blocks_per_trunk = 128,
+        compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN,
+        sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+        sparse_block_sizes=(256, 128),
+        densities=(1.0, 0.99, 0.66, 0.33, 0.11),
+    ):
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
         test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
 
-        for sparse_block_sz in [256, 128]:
-            for density in [1.0, 0.99, 0.66, 0.33, 0.11]:
+        for sparse_block_sz in sparse_block_sizes:
+            for density in densities:
             # for density in [1.0]:
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
-    smoke_accuracy_test()
-    smoke_accuracy_test(16)
-    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
-    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
-    smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
+    pa_perf_mode = os.getenv("PA_PERF", "0") == "1"
+    if pa_perf_mode:
+        # Keep runtime bounded for CI/timeout runs (e.g. `timeout 120s python test_pa.py`).
+        smoke_perf_test(
+            blocks_per_trunk=16,
+            compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
+            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+            sparse_block_sizes=(256,),
+            densities=(1.0, 0.33),
+        )
+    else:
+        smoke_accuracy_test()
+        smoke_accuracy_test(16)
+        smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
+        smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
+        smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
 
-    smoke_perf_test()
-    smoke_perf_test(16)
-    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
-    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
-    smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
+        smoke_perf_test()
+        smoke_perf_test(16)
+        smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
+        smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
+        smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
 
     # test_ov()
     
+# Usage:
+# PA_PERF=1 timeout 120s python test_pa.py
