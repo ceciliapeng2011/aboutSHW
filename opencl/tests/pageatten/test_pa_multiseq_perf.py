@@ -435,10 +435,10 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                decode_seq_count,
                 t_out,
                 t_lse,
-                1,
+                1,  # q_len
+                decode_seq_count,  # selected_sequence_count (last parameter)
             )
             kernels.enqueue(
                 "cm_sdpa_2nd_reduce",
@@ -447,6 +447,9 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_out,
                 t_out_final,
                 t_lse,
+                t_subsequence_begins,
+                t_selected_sequence_ids,
+                decode_seq_count,  # selected_sequence_count
                 kv_partition_num,
             )
         cl.finish()
@@ -465,10 +468,10 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                decode_seq_count,
                 t_out,
                 t_lse,
-                1,
+                1,  # q_len
+                decode_seq_count,  # selected_sequence_count (last parameter)
             )
             kernels.enqueue(
                 "cm_sdpa_2nd_reduce",
@@ -477,6 +480,9 @@ class PaSingleTokenPerfRunner(PaSingleTokenRunner):
                 t_out,
                 t_out_final,
                 t_lse,
+                t_subsequence_begins,
+                t_selected_sequence_ids,
+                decode_seq_count,  # selected_sequence_count
                 kv_partition_num,
             )
         gpu_latency_ns = cl.finish()

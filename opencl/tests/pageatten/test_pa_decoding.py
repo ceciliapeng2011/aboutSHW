@@ -259,10 +259,10 @@ class PaSingleTokenRunner:
                 t_block_indices_begins,
                 t_subsequence_begins,
                 t_selected_sequence_ids,
-                selected_sequence_count,
-                t_out,
-                t_lse,
-                1,
+                t_out,                       # Output buffer
+                t_lse,                       # LSE buffer
+                1,                           # q_len
+                selected_sequence_count,     # selected_sequence_count (last parameter)
             )
             kernels.enqueue(
                 "cm_sdpa_2nd_reduce",
@@ -271,6 +271,9 @@ class PaSingleTokenRunner:
                 t_out,
                 t_out_final,
                 t_lse,
+                t_subsequence_begins,
+                t_selected_sequence_ids,
+                selected_sequence_count,
                 kv_partition_num,
             )
 
@@ -496,10 +499,10 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
             t_block_indices_begins,
             t_subsequence_begins,
             t_selected_sequence_ids,
-            selected_sequence_count,
-            t_out,
-            t_lse,
-            1,
+            t_out,                       # Output buffer
+            t_lse,                       # LSE buffer
+            1,                           # q_len
+            selected_sequence_count,     # selected_sequence_count (last parameter)
         )
         kernels.enqueue(
             "cm_sdpa_2nd_reduce",
@@ -508,6 +511,9 @@ def _run_bandwidth_measurement(case: DecodingCase, loop_cnt: int = 100, warmup: 
             t_out,
             t_out_final,
             t_lse,
+            t_subsequence_begins,
+            t_selected_sequence_ids,
+            selected_sequence_count,
             kv_partition_num,
         )
 

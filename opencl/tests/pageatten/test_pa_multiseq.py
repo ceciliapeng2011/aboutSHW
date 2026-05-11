@@ -217,7 +217,54 @@ class PaMultiTokenRunner:
         selected_sequence_ids: torch.Tensor,
         batch_size_in_tokens: int,
         wg_count: int,
+        wg_seq_len: int,
     ) -> tuple[object | None, object | None, object | None]:
+        """Create sparse block mask tensors and metadata for XAttention.
+
+        XAttention Bypass Strategy Comparison:
+        ======================================
+
+        **OpenVINO Approach** (kernel switching):
+        -----------------------------------------
+        - Detects bypass condition: bypass_xattn() returns true when:
+          * q_len < STRIDE (16), OR
+          * xattn_thresh >= 1.0 (when allow_bypass is enabled)
+        - If bypass_xattn() is true for ANY subsequence in the batch:
+          * Switches to pa_multi_token_1 (compiled with SPARSE_BLOCK_SIZE=1)
+          * Entire batch processed without sparse attention
+          * No sparse mask parameters passed to kernel
+        - Reference: paged_attention.cpp lines 523-527
+
+        **aboutSHW Approach** (per-subsequence handling):
+        -------------------------------------------------
+        - Uses SAME sparse kernel for ALL subsequences (no kernel switching)
+        - For short subsequences (q_len < STRIDE=16):
+          * q_block_pad = DIV_UP(q_len, sparse_block_size) (based on actual q_len)
+          * k_block_pad = DIV_UP(kv_len, sparse_block_size) (based on actual kv_len)
+          * Clamp to minimum of 1 to ensure non-NULL pointers
+          * Allocate mask buffers (initialized to all-True = no masking)
+        - For normal subsequences (q_len >= STRIDE):
+          * Calculate proper block counts from token lengths
+          * Kernel uses real sparse masking
+        - Key difference from OpenVINO:
+          * Block counts based on ACTUAL token counts, not stride-inflated values
+          * This prevents reading beyond valid KV cache entries
+          * For q_len=10, kv_len=10: q_block_pad=1, k_block_pad=1 (correct!)
+          * Not k_block_pad=32 from inflated stride calculation
+        - Benefits:
+          * Supports mixed batches (short + long subsequences)
+          * No kernel switching overhead
+          * Each subsequence gets appropriate masking treatment
+
+        Kernel Behavior:
+        ---------------
+        The kernel checks: if (subseq_num_q_blocks > 0 && subseq_num_k_blocks > 0)
+        - True: Uses sparse masking with provided pointers
+        - False: Sets pointers to NULL (would crash if actually dereferenced)
+
+        By ensuring block counts >= 1, we keep pointers valid and let all-True
+        masks effectively disable sparse filtering for short subsequences.
+        """
         if self.sparse_block_size <= 1:
             return None, None, None
 
@@ -246,21 +293,32 @@ class PaMultiTokenRunner:
             kv_len = past_len + q_len
             bi_begin = int(block_indices_begins[sequence_index].item())
 
+            # For short sequences (q_len < STRIDE), we must still provide valid metadata
+            # Key: q_block_pad and k_block_pad are based on actual token counts, NOT strides
+            # This prevents reading beyond valid KV cache entries
             q_stride = q_len // STRIDE
             k_stride = kv_len // STRIDE
-            q_stride_pad = DIV_UP(q_stride, BLOCK_WG_M) * BLOCK_WG_M
-            N_kq_groups = DIV_UP(k_stride, BLOCK_WG_N)
+
+            # For XAttention internal calculations (unused by pa_multi_token directly)
+            q_stride_pad = DIV_UP(max(1, q_stride), BLOCK_WG_M) * BLOCK_WG_M
+            N_kq_groups = DIV_UP(max(1, k_stride), BLOCK_WG_N)
             k_block_in_group = BLOCK_WG_N // sum_per_token_in_block
 
+            # Block counts based on ACTUAL token counts divided by sparse_block_size
+            # For q_len=10, kv_len=10: q_block_pad=1, k_block_pad=1 (not inflated)
             q_block_pad = DIV_UP(q_len, self.sparse_block_size)
-            k_block_pad = k_block_in_group * N_kq_groups
+            k_block_pad = DIV_UP(kv_len, self.sparse_block_size)
 
-            # Calculate merged_q_blocks based on PA workgroup merging factor
-            # PA_WG_SIZE = 256 (XE2) or 128 (XE1)
-            # MERGED_Q_NUM = PA_WG_SIZE // sparse_block_size
-            PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
-            MERGED_Q_NUM = PA_WG_SIZE // self.sparse_block_size
-            merged_q_blocks = DIV_UP(q_block_pad, MERGED_Q_NUM)
+            # Ensure at least 1 to avoid NULL pointers in kernel
+            if q_block_pad == 0: q_block_pad = 1
+            if k_block_pad == 0: k_block_pad = 1
+
+            # Calculate merged_q_blocks to match kernel's calculation:
+            # blocks_per_wg = wg_seq_len / SPARSE_BLOCK_SIZE
+            # subseq_merged_q_blocks = (subseq_num_q_blocks + blocks_per_wg - 1) / blocks_per_wg
+            blocks_per_wg = wg_seq_len // self.sparse_block_size
+            merged_q_blocks = DIV_UP(q_block_pad, blocks_per_wg)
+            if merged_q_blocks == 0: merged_q_blocks = 1
 
             meta_rows.append([
                 q_start,            # [0]  SUBSEQ_Q_BEGIN
@@ -374,6 +432,7 @@ class PaMultiTokenRunner:
                 selected_sequence_ids,
                 batch_size_in_tokens,
                 wg_count,
+                wg_seq_len,
             )
 
             use_optimized_dispatch = (
@@ -661,6 +720,9 @@ class PaSingleTokenRunner:
                 t_out,
                 t_out_final,
                 t_lse,
+                t_subsequence_begins,
+                t_selected_sequence_ids,
+                decode_seq_count,  # selected_sequence_count
                 kv_partition_num,
             )
             cl.finish()
@@ -1332,8 +1394,35 @@ def make_smoke_case_id(case: PagedAttentionTestCase) -> str:
     )
 
 
+def _check_hardware_compatibility(case: PagedAttentionTestCase) -> None:
+    """Skip test if sparse_block_size is incompatible with hardware architecture.
+
+    Architecture constraints:
+    - XE1 (CM_GRF_WIDTH=256): PA_WG_SIZE=128, supports sparse_block_size up to 128
+    - XE2 (CM_GRF_WIDTH=512): PA_WG_SIZE=256, supports sparse_block_size up to 256
+
+    The PA workgroup size must be >= sparse_block_size for proper operation.
+    When sparse_block_size > PA_WG_SIZE:
+    - MERGED_Q_NUM = PA_WG_SIZE // sparse_block_size would be 0, causing division by zero
+    - Even if handled, the kernel would malfunction due to architectural mismatch
+
+    Example: sparse_block_size=256 on XE1 would require PA_WG_SIZE=256, but XE1 only has 128.
+    """
+    if case.sparse_block_size <= 1:
+        return  # No sparse attention, no constraint
+
+    PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
+    if case.sparse_block_size > PA_WG_SIZE:
+        pytest.skip(
+            f"sparse_block_size={case.sparse_block_size} not supported on this architecture. "
+            f"Hardware: CM_GRF_WIDTH={CM_GRF_WIDTH}, PA_WG_SIZE={PA_WG_SIZE}. "
+            f"XE1 supports sparse_block_size up to 128. XE2 supports up to 256."
+        )
+
+
 @pytest.mark.parametrize("case", PREFILL_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
 def test_pa_smoke_paged_attention_prefill_only(case: PagedAttentionTestCase):
+    _check_hardware_compatibility(case)
     print(f"{Colors.GREEN}[testcase] prefill_only id={make_smoke_case_id(case)}{Colors.END}")
     kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=True)
     max_context_len = int(kern_attn_inputs["max_context_len"])
@@ -1352,6 +1441,7 @@ def test_pa_smoke_paged_attention_prefill_only(case: PagedAttentionTestCase):
 
 @pytest.mark.parametrize("case", GENERATE_ONLY_SMOKE_CASES, ids=make_smoke_case_id)
 def test_pa_smoke_paged_attention_generate_only(case: PagedAttentionTestCase):
+    _check_hardware_compatibility(case)
     print(f"{Colors.GREEN}[testcase] generate_only id={make_smoke_case_id(case)}{Colors.END}")
 
     kern_attn_inputs = run_paged_attention_smoke_case(case, check_acc=True)
@@ -1371,6 +1461,7 @@ def test_pa_smoke_paged_attention_mixed_only_route_matches_reference(
     case: PagedAttentionTestCase,
     mixed_route_mode: str,
 ):
+    _check_hardware_compatibility(case)
     print(
         f"{Colors.GREEN}[testcase] mixed_only case={make_smoke_case_id(case)} route={mixed_route_mode}{Colors.END}"
     )
