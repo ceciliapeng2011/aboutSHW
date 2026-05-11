@@ -13,13 +13,13 @@ Features:
 Examples:
   # Interactive merge (default)
   python3 merge_folders_interactive.py \
-    /home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn
+    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn
 
   # Reverse direction
   python3 merge_folders_interactive.py \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn \
-    /home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn \
+    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm
 
   # Brutal-force overwrite destination
   python3 merge_folders_interactive.py SRC DST --force
@@ -41,8 +41,8 @@ from pathlib import Path
 from typing import Dict, List
 
 
-DEFAULT_SOURCE = Path("/home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm")
-DEFAULT_DESTINATION = Path("/home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn")
+DEFAULT_SOURCE = "$HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm"
+DEFAULT_DESTINATION = "$HOME/OCL/aboutSHW/opencl/tests/x_attn"
 KERNEL_SUFFIXES = {".cm", ".hpp"}
 KERNEL_DECL_RE = re.compile(r'(\bextern\s+"C"\s+_GENX_MAIN_\s+void\s+)([A-Za-z_]\w*|KERNEL_NAME)(\s*\()')
 
@@ -61,6 +61,11 @@ def c(text: str, code: str, use_color: bool) -> str:
     if not use_color:
         return text
     return f"{code}{text}{Color.RESET}"
+
+
+def normalize_dir_input(path_str: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(path_str))
+    return Path(expanded).resolve()
 
 
 def build_root_labels(roots: List[Path]) -> Dict[Path, str]:
@@ -378,14 +383,12 @@ def main() -> int:
     parser.add_argument(
         "source",
         nargs="?",
-        type=Path,
         default=DEFAULT_SOURCE,
         help=f"Source folder (default: {DEFAULT_SOURCE})",
     )
     parser.add_argument(
         "destination",
         nargs="?",
-        type=Path,
         default=DEFAULT_DESTINATION,
         help=f"Destination folder (default: {DEFAULT_DESTINATION})",
     )
@@ -407,8 +410,8 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    src_root = args.source.resolve()
-    dst_root = args.destination.resolve()
+    src_root = normalize_dir_input(args.source)
+    dst_root = normalize_dir_input(args.destination)
 
     if not src_root.exists() or not src_root.is_dir():
         parser.error(f"Invalid source folder: {src_root}")

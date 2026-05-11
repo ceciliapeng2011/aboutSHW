@@ -4,34 +4,35 @@
 Examples:
   # Common files between 2 folders
   python3 find_same_name_files.py \
-    /home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn
+    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn
 
   # Common files across 3 folders (intersection of all)
   python3 find_same_name_files.py \
-    /home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn
+    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/OCL/aboutSHW/opencl/tests/pageatten \
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn
 
   # Compare the first folder against each of the others separately
   python3 find_same_name_files.py --pairwise \
-    /home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten \
-    /home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn
+    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/OCL/aboutSHW/opencl/tests/pageatten \
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Set
 
 
 DEFAULT_DIRS = [
-    Path("/home/ceciliapeng/openvino/src/plugins/intel_gpu/src/graph/impls/cm"),
-    Path("/home/ceciliapeng/OCL/aboutSHW/opencl/tests/pageatten"),
-    Path("/home/ceciliapeng/OCL/aboutSHW/opencl/tests/x_attn"),
+    "$HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm",
+    "$HOME/OCL/aboutSHW/opencl/tests/pageatten",
+    "$HOME/OCL/aboutSHW/opencl/tests/x_attn",
 ]
 
 
@@ -89,6 +90,11 @@ def c(text: str, code: str, use_color: bool) -> str:
     if not use_color:
         return text
     return f"{code}{text}{Color.RESET}"
+
+
+def normalize_dir_input(path_str: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(path_str))
+    return Path(expanded).resolve()
 
 
 def _is_text_file(path: Path, sample_bytes: int = 8192) -> bool:
@@ -262,12 +268,12 @@ def main() -> int:
     args = parser.parse_args()
 
     use_default_dirs = not args.dirs
-    dirs = args.dirs if args.dirs else [str(p) for p in DEFAULT_DIRS]
+    dirs = args.dirs if args.dirs else DEFAULT_DIRS
 
     if len(dirs) < 2:
         parser.error("Provide at least two directories.")
 
-    roots = [Path(d).resolve() for d in dirs]
+    roots = [normalize_dir_input(d) for d in dirs]
     for r in roots:
         if not r.exists() or not r.is_dir():
             parser.error(f"Invalid directory: {r}")
