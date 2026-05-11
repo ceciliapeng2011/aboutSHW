@@ -24,6 +24,53 @@ def get_cm_grf_width():
 CM_GRF_WIDTH = get_cm_grf_width()
 PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
 
+
+def get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask"):
+    # Keep this aligned with OV XAttentionEstimateGeneratorBase/XAttentionEstimatePostProc JIT constants.
+    SG_M = 4
+    SG_N = 8
+    block_sg_m = 64 if xe_arch == 2 else 32
+    block_sg_n = 32 if xe_arch == 2 else 16
+    block_wg_k = block_sg_m * SG_M
+    block_wg_n = block_sg_n * SG_N
+
+    # post_proc does not consume all base constants directly, but OV emits them from the common XAttention JIT path.
+    head_size = 128
+    hk = HQ
+    block_wg_k_unroll = 64 if head_size % 64 == 0 else 32
+    kv_block_size = 256
+    sub_block_size = 16
+    walk_hq = 1
+    is_causal = 1
+    kv_cache_compression = 0
+    head_size_key = head_size
+    scale_factor = 1.0 / np.sqrt(float(head_size)) / STRIDE
+    inv_s_i = np.frombuffer(np.float32(scale_factor).tobytes(), dtype=np.int32)[0]
+
+    return f'''
+        -DKERNEL_NAME={kernel_name}
+        -DSTRIDE={STRIDE}
+        -DHQ={HQ}
+        -DHK={hk}
+        -DHEAD_SIZE={head_size}
+        -DSG_M={SG_M}
+        -DSG_N={SG_N}
+        -DBLOCK_SG_M={block_sg_m}
+        -DBLOCK_SG_N={block_sg_n}
+        -DBLOCK_WG_K={block_wg_k_unroll}
+        -DBLOCK_SIZE={BLOCK_SIZE}
+        -DKV_BLOCK_SIZE={kv_block_size}
+        -DINV_S={inv_s_i}
+        -DBLOCK_SHARE_MAX={block_wg_n}
+        -DWALK_HQ={walk_hq}
+        -DIS_CAUSAL={is_causal}
+        -DKV_CACHE_COMPRESSION={kv_cache_compression}
+        -DHEAD_SIZE_KEY={head_size_key}
+        -DSUB_BLOCK_SIZE={sub_block_size}
+        -DSOFTMAX_TYPE=float
+        -DMERGED_Q_NUM={MERGED_Q_NUM}
+    '''
+
 def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
     assert PA_WG_SIZE % BLOCK_SIZE == 0, "PA WG size must be divisible by XATTN block size."
     MERGED_Q_NUM = PA_WG_SIZE // BLOCK_SIZE
@@ -32,17 +79,16 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
     STRIDE = 16
     def create_kernels():
         # kernel
-        src = r'''#include "xattn_post_proc.hpp"'''
+        src = r'''#include "xattn_post_proc.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} ...")
 
         jit_option = '-abortonspill -noschedule '
+        jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
         kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
                             -mCM_printregusage -mdump_asm -g2
                             -Qxcm_register_file_size=256 -I{cwd}
-                            -DSTRIDE={STRIDE} -DHQ={HQ}
-                            -DBLOCK_SIZE={BLOCK_SIZE}
-                            -DMERGED_Q_NUM={MERGED_Q_NUM}''')
+                            {jit_defs}''')
         return kernels
 
     kernels = create_kernels()
@@ -96,7 +142,8 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
         t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
 
         cl.finish()
-        kernels.enqueue("post_proc_mask", [merged_q_blocks, HQ, 1], [1, 1, 1], t_mask, t_merged_mask, t_meta, t_wg_map)
+        post_wg_count = len(wg_map_data) // 2
+        kernels.enqueue("post_proc_mask", [post_wg_count, HQ, 1], [1, 1, 1], t_mask, t_merged_mask, t_meta, t_wg_map)
         ns = cl.finish()
         t_merged_mask_np = t_merged_mask.numpy()
 
@@ -131,17 +178,16 @@ def test_post_proc_multi_subseq(HQ=1, BLOCK_SIZE=128):
     STRIDE = 16
     sum_per_token_in_block = BLOCK_SIZE // STRIDE
 
-    src = r'''#include "xattn_post_proc.hpp"'''
+    src = r'''#include "xattn_post_proc.cm"'''
     cwd = os.path.dirname(os.path.realpath(__file__))
     print(f"compiling multi-subseq post_proc {cwd} ...")
 
     jit_option = '-abortonspill -noschedule '
+    jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
     kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
                         -mCM_printregusage -mdump_asm -g2
                         -Qxcm_register_file_size=256 -I{cwd}
-                        -DSTRIDE={STRIDE} -DHQ={HQ}
-                        -DBLOCK_SIZE={BLOCK_SIZE}
-                        -DMERGED_Q_NUM={MERGED_Q_NUM}
+                        {jit_defs}
                         ''')
 
     cases = [
@@ -225,7 +271,8 @@ def test_post_proc_multi_subseq(HQ=1, BLOCK_SIZE=128):
         t_mask = cl.tensor(combined_mask)
         t_merged_mask = cl.tensor(np.ones(offset_mask_wg, dtype=np.int8) * 100)
 
-        GWS = [max_merged_q_blocks, HQ, num_subseqs]
+        post_wg_count = len(wg_map_data) // 2
+        GWS = [post_wg_count, HQ, 1]
         LWS = [1, 1, 1]
 
         cl.finish()
@@ -279,17 +326,16 @@ def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
     STRIDE = 16
     sum_per_token_in_block = BLOCK_SIZE // STRIDE
 
-    src = r'''#include "xattn_post_proc.hpp"'''
+    src = r'''#include "xattn_post_proc.cm"'''
     cwd = os.path.dirname(os.path.realpath(__file__))
     print(f"compiling decode+prefill post_proc {cwd} ...")
 
     jit_option = '-abortonspill -noschedule '
+    jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
     kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
                         -mCM_printregusage -mdump_asm -g2
                         -Qxcm_register_file_size=256 -I{cwd}
-                        -DSTRIDE={STRIDE} -DHQ={HQ}
-                        -DBLOCK_SIZE={BLOCK_SIZE}
-                        -DMERGED_Q_NUM={MERGED_Q_NUM}
+                        {jit_defs}
                         ''')
 
     cases = [
@@ -404,7 +450,8 @@ def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
             t_mask = cl.tensor(combined_mask)
             t_merged_mask = cl.tensor(np.ones(offset_mask_wg, dtype=np.int8) * 100)
 
-            GWS = [max_merged_q_blocks, HQ, num_subseqs]
+            post_wg_count = len(wg_map_data) // 2
+            GWS = [post_wg_count, HQ, 1]
             LWS = [1, 1, 1]
 
             cl.finish()
@@ -502,3 +549,8 @@ if __name__ == "__main__":
         main_multi()
     else:
         main()
+        
+# Usage
+# python test_post_proc.py
+# python test_post_proc.py --multi-subseq
+# python test_post_proc.py --multi-subseq-decode
