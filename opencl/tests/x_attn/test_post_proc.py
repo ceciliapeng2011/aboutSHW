@@ -24,6 +24,53 @@ def get_cm_grf_width():
 CM_GRF_WIDTH = get_cm_grf_width()
 PA_WG_SIZE = 256 if CM_GRF_WIDTH == 512 else 128
 
+
+def get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask"):
+    # Keep this aligned with OV XAttentionEstimateGeneratorBase/XAttentionEstimatePostProc JIT constants.
+    SG_M = 4
+    SG_N = 8
+    block_sg_m = 64 if xe_arch == 2 else 32
+    block_sg_n = 32 if xe_arch == 2 else 16
+    block_wg_k = block_sg_m * SG_M
+    block_wg_n = block_sg_n * SG_N
+
+    # post_proc does not consume all base constants directly, but OV emits them from the common XAttention JIT path.
+    head_size = 128
+    hk = HQ
+    block_wg_k_unroll = 64 if head_size % 64 == 0 else 32
+    kv_block_size = 256
+    sub_block_size = 16
+    walk_hq = 1
+    is_causal = 1
+    kv_cache_compression = 0
+    head_size_key = head_size
+    scale_factor = 1.0 / np.sqrt(float(head_size)) / STRIDE
+    inv_s_i = np.frombuffer(np.float32(scale_factor).tobytes(), dtype=np.int32)[0]
+
+    return f'''
+        -DKERNEL_NAME={kernel_name}
+        -DSTRIDE={STRIDE}
+        -DHQ={HQ}
+        -DHK={hk}
+        -DHEAD_SIZE={head_size}
+        -DSG_M={SG_M}
+        -DSG_N={SG_N}
+        -DBLOCK_SG_M={block_sg_m}
+        -DBLOCK_SG_N={block_sg_n}
+        -DBLOCK_WG_K={block_wg_k_unroll}
+        -DBLOCK_SIZE={BLOCK_SIZE}
+        -DKV_BLOCK_SIZE={kv_block_size}
+        -DINV_S={inv_s_i}
+        -DBLOCK_SHARE_MAX={block_wg_n}
+        -DWALK_HQ={walk_hq}
+        -DIS_CAUSAL={is_causal}
+        -DKV_CACHE_COMPRESSION={kv_cache_compression}
+        -DHEAD_SIZE_KEY={head_size_key}
+        -DSUB_BLOCK_SIZE={sub_block_size}
+        -DSOFTMAX_TYPE=float
+        -DMERGED_Q_NUM={MERGED_Q_NUM}
+    '''
+
 def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
     assert PA_WG_SIZE % BLOCK_SIZE == 0, "PA WG size must be divisible by XATTN block size."
     MERGED_Q_NUM = PA_WG_SIZE // BLOCK_SIZE
@@ -32,17 +79,16 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
     STRIDE = 16
     def create_kernels():
         # kernel
-        src = r'''#include "xattn_post_proc.hpp"'''
+        src = r'''#include "xattn_post_proc.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} ...")
 
         jit_option = '-abortonspill -noschedule '
+        jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
         kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
                             -mCM_printregusage -mdump_asm -g2
                             -Qxcm_register_file_size=256 -I{cwd}
-                            -DSTRIDE={STRIDE} -DHQ={HQ}
-                            -DBLOCK_SIZE={BLOCK_SIZE}
-                            -DMERGED_Q_NUM={MERGED_Q_NUM}''')
+                            {jit_defs}''')
         return kernels
 
     kernels = create_kernels()
@@ -60,18 +106,44 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
         q_block_valid = q_stride_pad // sum_per_token_in_block
         q_block_pad = div_up(q, BLOCK_SIZE)
         k_block_pad = div_up(k, BLOCK_SIZE)
+        merged_q_blocks = div_up(q_block_pad, MERGED_Q_NUM)
         org = np.random.randint(low=0, high=2, size=[1, HQ, q_block_pad, k_block_pad], dtype=np.int8)
         if q_block_valid != q_block_pad:
             org[:,:,-1,:] = 1
-        # print(f'{org=}')
 
         t_mask = cl.tensor(org)
-        t_merged_mask = cl.tensor(np.ones([1, HQ, div_up(q_block_pad, MERGED_Q_NUM), k_block_pad], dtype=np.int8) * 100)
-        # block_mask, merged_block_mask, q_stride_pad, q_block_pad, k_block_pad
-        params = [t_mask, t_merged_mask, q_stride_pad, q_block_pad, k_block_pad]
+        t_merged_mask = cl.tensor(np.ones([1, HQ, merged_q_blocks, k_block_pad], dtype=np.int8) * 100)
+
+        # Build single-entry metadata for the unified kernel
+        meta_np = np.array([[
+            0,              # [0]  SUBSEQ_Q_BEGIN
+            q,              # [1]  SUBSEQ_Q_LEN
+            0,              # [2]  M
+            0,              # [3]  N
+            q_stride_pad,   # [4]  Q_STRIDE_PAD
+            0,              # [5]  N_KQ_GROUPS
+            q_block_pad,    # [6]  Q_BLOCK_PAD
+            k_block_pad,    # [7]  K_BLOCK_PAD
+            0,              # [8]  CAUSAL_START
+            0,              # [9]  Q_START_STRIDED
+            0,              # [10] BUF_OFF_KQ_MAX
+            0,              # [11] BUF_OFF_EXP_SUM
+            0,              # [12] BUF_OFF_MASK
+            0,              # [13] BUF_OFF_MASK_WG
+            0,              # [14] BLOCK_IDX_BEGIN
+            0,              # [15] WG_OFFSET
+        ]], dtype=np.int32)
+        t_meta = cl.tensor(meta_np)
+
+        # Build wg_map for post_proc: [subseq_id, merged_q_block_idx] pairs
+        wg_map_data = []
+        for m_merged in range(merged_q_blocks):
+            wg_map_data.extend([0, m_merged])  # subseq_id=0 (single subseq), merged_q_block_idx=m_merged
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
 
         cl.finish()
-        kernels.enqueue("post_proc_mask", [t_merged_mask.shape[2], HQ, 1], [1, 1, 1], *params)
+        post_wg_count = len(wg_map_data) // 2
+        kernels.enqueue("post_proc_mask", [post_wg_count, HQ, 1], [1, 1, 1], t_mask, t_merged_mask, t_meta, t_wg_map)
         ns = cl.finish()
         t_merged_mask_np = t_merged_mask.numpy()
 
@@ -92,15 +164,393 @@ def test_post_proc(HQ = 1, BLOCK_SIZE = 128):
             print(f'(POSTPROC)TPUT_{i}: {time_opt*1e-3:,.0f} us')
     print(f'{Colors.GREEN}test_post_proc done.{Colors.END}')
 
+# ============================================================================
+# Multi-subsequence support
+# ============================================================================
+
+XATTN_META_STRIDE_PY = 16
+
+def test_post_proc_multi_subseq(HQ=1, BLOCK_SIZE=128):
+    assert PA_WG_SIZE % BLOCK_SIZE == 0
+    MERGED_Q_NUM = PA_WG_SIZE // BLOCK_SIZE
+    assert MERGED_Q_NUM == 1 or MERGED_Q_NUM == 2
+
+    STRIDE = 16
+    sum_per_token_in_block = BLOCK_SIZE // STRIDE
+
+    src = r'''#include "xattn_post_proc.cm"'''
+    cwd = os.path.dirname(os.path.realpath(__file__))
+    print(f"compiling multi-subseq post_proc {cwd} ...")
+
+    jit_option = '-abortonspill -noschedule '
+    jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
+    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
+                        -mCM_printregusage -mdump_asm -g2
+                        -Qxcm_register_file_size=256 -I{cwd}
+                        {jit_defs}
+                        ''')
+
+    cases = [
+        ([4096], [4096], "1 subseq baseline"),
+        ([4096, 4096], [4096, 4096], "2 subseqs equal"),
+        ([4096, 32768], [4096, 32768], "2 subseqs unequal"),
+        ([2048, 2048], [2048, 2048], "2 equal subseqs"),
+        ([4096, 4096, 32768], [4096, 4096, 32768], "3 subseqs"),
+    ]
+
+    for q_lens, k_lens, desc in cases:
+        print(f"{Colors.GREEN}Test multi-subseq post_proc {desc} BLOCK_SIZE={BLOCK_SIZE} ... {Colors.END}")
+        num_subseqs = len(q_lens)
+
+        meta_rows = []
+        offset_mask = 0
+        offset_mask_wg = 0
+        max_merged_q_blocks = 0
+        per_subseq = []
+
+        for q, k in zip(q_lens, k_lens):
+            q_stride_pad = q // STRIDE
+            q_block_valid = q_stride_pad // sum_per_token_in_block
+            q_block_pad = div_up(q, BLOCK_SIZE)
+            k_block_pad = div_up(k, BLOCK_SIZE)
+            merged_q_blocks = div_up(q_block_pad, MERGED_Q_NUM)
+            max_merged_q_blocks = max(max_merged_q_blocks, merged_q_blocks)
+
+            org = np.random.randint(low=0, high=2, size=[1, HQ, q_block_pad, k_block_pad], dtype=np.int8)
+            if q_block_valid != q_block_pad:
+                org[:, :, -1, :] = 1
+
+            per_subseq.append({
+                'org': org,
+                'q_stride_pad': q_stride_pad,
+                'q_block_pad': q_block_pad,
+                'k_block_pad': k_block_pad,
+                'q_block_valid': q_block_valid,
+                'merged_q_blocks': merged_q_blocks,
+            })
+
+            meta_rows.append([
+                0,              # [0]
+                q,              # [1] SUBSEQ_Q_LEN
+                0,              # [2] M
+                0,              # [3] N
+                q_stride_pad,   # [4] Q_STRIDE_PAD
+                0,              # [5]
+                q_block_pad,    # [6] Q_BLOCK_PAD
+                k_block_pad,    # [7] K_BLOCK_PAD
+                0,              # [8]
+                0,              # [9]
+                0,              # [10]
+                0,              # [11]
+                offset_mask,    # [12] BUF_OFF_MASK
+                offset_mask_wg, # [13] BUF_OFF_MASK_WG
+                0,              # [14]
+                0,              # [15]
+            ])
+
+            offset_mask += HQ * q_block_pad * k_block_pad
+            offset_mask_wg += HQ * merged_q_blocks * k_block_pad
+
+        meta_np = np.array(meta_rows, dtype=np.int32)
+        t_meta = cl.tensor(meta_np)
+
+        # Build wg_map for multi-subseq post_proc
+        wg_map_data = []
+        for i, s in enumerate(per_subseq):
+            for m_merged in range(s['merged_q_blocks']):
+                wg_map_data.extend([i, m_merged])  # subseq_id=i, merged_q_block_idx=m_merged
+        t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
+        # Build combined mask buffer
+        combined_mask = np.zeros(offset_mask, dtype=np.int8)
+        for i, s in enumerate(per_subseq):
+            off = meta_rows[i][12]
+            flat = s['org'].reshape(-1)
+            combined_mask[off:off + flat.size] = flat
+
+        t_mask = cl.tensor(combined_mask)
+        t_merged_mask = cl.tensor(np.ones(offset_mask_wg, dtype=np.int8) * 100)
+
+        post_wg_count = len(wg_map_data) // 2
+        GWS = [post_wg_count, HQ, 1]
+        LWS = [1, 1, 1]
+
+        cl.finish()
+        kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta, t_wg_map)
+        cl.finish()
+
+        # Validate per-subsequence
+        merged_all = t_merged_mask.numpy()
+        for i, s in enumerate(per_subseq):
+            off_wg = meta_rows[i][13]
+            merged_q_blocks = s['merged_q_blocks']
+            k_block_pad = s['k_block_pad']
+            q_block_pad = s['q_block_pad']
+            q_block_valid = s['q_block_valid']
+            org = s['org']
+
+            merged_subseq = np.zeros([1, HQ, merged_q_blocks, k_block_pad], dtype=np.int8)
+            for h in range(HQ):
+                start = off_wg + h * merged_q_blocks * k_block_pad
+                merged_subseq[0, h] = merged_all[start:start + merged_q_blocks * k_block_pad].reshape(merged_q_blocks, k_block_pad)
+
+            # Reference
+            if MERGED_Q_NUM == 2:
+                if q_block_valid != q_block_pad:
+                    org_pad = np.ones([1, HQ, q_block_pad + 1, k_block_pad], dtype=np.int8)
+                    org_pad[:, :, :-1, :] = org
+                    ref = org_pad[:, :, 0::2, :] | org_pad[:, :, 1::2, :]
+                else:
+                    ref = org[:, :, 0::2, :] | org[:, :, 1::2, :]
+            else:
+                ref = org.copy()
+
+            assert np.all(ref == merged_subseq), f"multi-subseq post_proc failed for subseq {i}"
+            print(f'{Colors.GREEN}  subseq[{i}] post_proc passed{Colors.END}')
+
+        print(f'{Colors.GREEN}multi-subseq post_proc "{desc}" passed{Colors.END}')
+
+
+def test_post_proc_multi_subseq_with_decode(HQ=1, BLOCK_SIZE=128):
+    """Test post_proc with decode+prefill mixing under both routing strategies.
+
+    post_proc is safe with decode subseqs (operates only on mask data, no softmax
+    buffers), so both split-route and multi-route are tested.
+    For decode subseqs: q_len < STRIDE → q_block_pad=1, q_stride_pad=0.
+    In multi-route, the decode subseq produces a trivial 1-row mask (all ones).
+    """
+    assert PA_WG_SIZE % BLOCK_SIZE == 0
+    MERGED_Q_NUM = PA_WG_SIZE // BLOCK_SIZE
+    assert MERGED_Q_NUM == 1 or MERGED_Q_NUM == 2
+
+    STRIDE = 16
+    sum_per_token_in_block = BLOCK_SIZE // STRIDE
+
+    src = r'''#include "xattn_post_proc.cm"'''
+    cwd = os.path.dirname(os.path.realpath(__file__))
+    print(f"compiling decode+prefill post_proc {cwd} ...")
+
+    jit_option = '-abortonspill -noschedule '
+    jit_defs = get_post_proc_ov_jit_opts(HQ, BLOCK_SIZE, STRIDE, MERGED_Q_NUM, kernel_name="post_proc_mask")
+    kernels = cl.kernels(src, f'''-cmc -Qxcm_jit_option="{jit_option}"
+                        -mCM_printregusage -mdump_asm -g2
+                        -Qxcm_register_file_size=256 -I{cwd}
+                        {jit_defs}
+                        ''')
+
+    cases = [
+        ([(1, 4096), (4096, 4096)],
+         "1 decode + 1 prefill"),
+        ([(1, 8192), (4096, 4096), (32768, 32768)],
+         "1 decode + 2 prefills"),
+        ([(4096, 4096), (1, 16384), (32768, 32768)],
+         "prefill, decode, prefill (interleaved)"),
+        ([(1, 2048), (1, 4096), (4096, 4096), (32768, 32768)],
+         "2 decodes + 2 prefills"),
+        ([(1, 4096), (1, 8192)],
+         "all decode (zero prefill WGs)"),
+    ]
+
+    for subseq_specs, desc in cases:
+        q_lens = [ql for ql, _ in subseq_specs]
+        kv_lens = [kvl for _, kvl in subseq_specs]
+
+        is_decode = [ql < STRIDE for ql in q_lens]
+        prefill_indices = [i for i, d in enumerate(is_decode) if not d]
+
+        for route_mode in ["split", "multi"]:
+            if route_mode == "split" and len(prefill_indices) == 0:
+                continue
+
+            label = f'{route_mode}-route: "{desc}"'
+            print(f"{Colors.GREEN}Test post_proc decode+prefill ({label}) BLOCK_SIZE={BLOCK_SIZE} ... {Colors.END}")
+
+            if route_mode == "split":
+                meta_indices = prefill_indices
+            else:
+                meta_indices = list(range(len(q_lens)))
+
+            num_subseqs = len(meta_indices)
+
+            meta_rows = []
+            offset_mask = 0
+            offset_mask_wg = 0
+            max_merged_q_blocks = 0
+            per_subseq = []
+
+            for idx in meta_indices:
+                q = q_lens[idx]
+                k = kv_lens[idx]
+                q_stride_pad = q // STRIDE
+                q_block_valid = q_stride_pad // sum_per_token_in_block
+                q_block_pad = div_up(q, BLOCK_SIZE)
+                k_block_pad = div_up(k, BLOCK_SIZE)
+                merged_q_blocks = div_up(q_block_pad, MERGED_Q_NUM)
+                max_merged_q_blocks = max(max_merged_q_blocks, merged_q_blocks)
+
+                if q >= STRIDE:
+                    org = np.random.randint(low=0, high=2, size=[1, HQ, q_block_pad, k_block_pad], dtype=np.int8)
+                    if q_block_valid != q_block_pad:
+                        org[:, :, -1, :] = 1
+                else:
+                    org = np.ones([1, HQ, q_block_pad, k_block_pad], dtype=np.int8)
+
+                per_subseq.append({
+                    'org': org,
+                    'q_stride_pad': q_stride_pad,
+                    'q_block_pad': q_block_pad,
+                    'k_block_pad': k_block_pad,
+                    'q_block_valid': q_block_valid,
+                    'merged_q_blocks': merged_q_blocks,
+                    'orig_idx': idx,
+                })
+
+                meta_rows.append([
+                    0,              # [0]
+                    q,              # [1] SUBSEQ_Q_LEN
+                    0,              # [2] M
+                    0,              # [3] N
+                    q_stride_pad,   # [4] Q_STRIDE_PAD
+                    0,              # [5]
+                    q_block_pad,    # [6] Q_BLOCK_PAD
+                    k_block_pad,    # [7] K_BLOCK_PAD
+                    0,              # [8]
+                    0,              # [9]
+                    0,              # [10]
+                    0,              # [11]
+                    offset_mask,    # [12] BUF_OFF_MASK
+                    offset_mask_wg, # [13] BUF_OFF_MASK_WG
+                    0,              # [14]
+                    0,              # [15]
+                ])
+
+                offset_mask += HQ * q_block_pad * k_block_pad
+                offset_mask_wg += HQ * merged_q_blocks * k_block_pad
+
+            meta_np = np.array(meta_rows, dtype=np.int32)
+            t_meta = cl.tensor(meta_np)
+
+            if max_merged_q_blocks == 0:
+                print(f'{Colors.GREEN}  {label}: no work — passed{Colors.END}')
+                continue
+
+            # Build wg_map for decode+prefill post_proc
+            wg_map_data = []
+            for i, s in enumerate(per_subseq):
+                for m_merged in range(s['merged_q_blocks']):
+                    wg_map_data.extend([i, m_merged])  # subseq_id=i, merged_q_block_idx=m_merged
+            t_wg_map = cl.tensor(np.array(wg_map_data, dtype=np.int32))
+
+            combined_mask = np.zeros(offset_mask, dtype=np.int8)
+            for i, s in enumerate(per_subseq):
+                off = meta_rows[i][12]
+                flat = s['org'].reshape(-1)
+                combined_mask[off:off + flat.size] = flat
+
+            t_mask = cl.tensor(combined_mask)
+            t_merged_mask = cl.tensor(np.ones(offset_mask_wg, dtype=np.int8) * 100)
+
+            post_wg_count = len(wg_map_data) // 2
+            GWS = [post_wg_count, HQ, 1]
+            LWS = [1, 1, 1]
+
+            cl.finish()
+            kernels.enqueue("post_proc_mask", GWS, LWS, t_mask, t_merged_mask, t_meta, t_wg_map)
+            cl.finish()
+
+            merged_all = t_merged_mask.numpy()
+            for i, s in enumerate(per_subseq):
+                off_wg = meta_rows[i][13]
+                merged_q_blocks = s['merged_q_blocks']
+                k_block_pad = s['k_block_pad']
+                q_block_pad = s['q_block_pad']
+                q_block_valid = s['q_block_valid']
+                org = s['org']
+
+                merged_subseq = np.zeros([1, HQ, merged_q_blocks, k_block_pad], dtype=np.int8)
+                for h in range(HQ):
+                    start = off_wg + h * merged_q_blocks * k_block_pad
+                    merged_subseq[0, h] = merged_all[start:start + merged_q_blocks * k_block_pad].reshape(merged_q_blocks, k_block_pad)
+
+                if MERGED_Q_NUM == 2:
+                    if q_block_valid != q_block_pad:
+                        org_pad = np.ones([1, HQ, q_block_pad + 1, k_block_pad], dtype=np.int8)
+                        org_pad[:, :, :-1, :] = org
+                        ref = org_pad[:, :, 0::2, :] | org_pad[:, :, 1::2, :]
+                    else:
+                        ref = org[:, :, 0::2, :] | org[:, :, 1::2, :]
+                else:
+                    ref = org.copy()
+
+                assert np.all(ref == merged_subseq), f"decode+prefill post_proc failed for subseq {i} (orig {s['orig_idx']})"
+                print(f'{Colors.GREEN}  subseq[{i}] (orig {s["orig_idx"]}): post_proc passed{Colors.END}')
+
+            print(f'{Colors.GREEN}post_proc decode+prefill ({label}) passed{Colors.END}')
+
+
 def main():
+    # Default configuration
     test_post_proc(BLOCK_SIZE = 128)
     if xe_arch == 2:
         test_post_proc(BLOCK_SIZE = 256)
 
+    # phi-3-mini-128k-instruct (head_size=96, num_heads=4)
+    test_post_proc(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4 (head_ratio 16:1, num_heads=32)
+    test_post_proc(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc(HQ=32, BLOCK_SIZE=256)
+
+def main_multi():
+    # Default configuration
+    test_post_proc_multi_subseq(BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq(BLOCK_SIZE=256)
+
+    # phi-3-mini-128k-instruct
+    test_post_proc_multi_subseq(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4
+    test_post_proc_multi_subseq(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq(HQ=32, BLOCK_SIZE=256)
+
+def main_multi_with_decode():
+    # Default configuration
+    test_post_proc_multi_subseq_with_decode(BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq_with_decode(BLOCK_SIZE=256)
+
+    # phi-3-mini-128k-instruct
+    test_post_proc_multi_subseq_with_decode(HQ=4, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq_with_decode(HQ=4, BLOCK_SIZE=256)
+
+    # minicpm4
+    test_post_proc_multi_subseq_with_decode(HQ=32, BLOCK_SIZE=128)
+    if xe_arch == 2:
+        test_post_proc_multi_subseq_with_decode(HQ=32, BLOCK_SIZE=256)
+
 if __name__ == "__main__":
     torch.manual_seed(3)
     torch.set_printoptions(linewidth=1024)
-    
+
     cl.profiling(True)
-    
-    main()
+
+    import sys
+    if '--multi-subseq-decode' in sys.argv:
+        main_multi_with_decode()
+    elif '--multi-subseq' in sys.argv:
+        main_multi()
+    else:
+        main()
+        
+# Usage
+# python test_post_proc.py
+# python test_post_proc.py --multi-subseq
+# python test_post_proc.py --multi-subseq-decode

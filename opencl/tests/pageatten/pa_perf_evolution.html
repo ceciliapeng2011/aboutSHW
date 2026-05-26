@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PA Perf Evolution</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; color: #222; }
+    h1, h2 { margin-bottom: 0.2em; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f5f5f5; }
+    code { background: #f3f3f3; padding: 2px 4px; border-radius: 3px; }
+    .section { margin-bottom: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Page Attention Performance Evolution</h1>
+
+  <div class="section">
+    <h2>Smoke Perf Matrix Summary from test_pa.perf.single_seq.log (LNL)</h2>
+    <p><strong>Source log:</strong> <code>test_pa.perf.single_seq.log</code> from <code>python test_pa.py</code></p>
+    <p><strong>Platform:</strong> LNL</p>
+    <p><strong>Branch:</strong> <code>main</code></p>
+    <p><strong>Commit:</strong> <code>72618ca4</code></p>
+    <p><strong>Common setup:</strong> seq_len=32768, block_sz=256, heads=32/8, densities={1.00, 0.99, 0.66, 0.33, 0.11}</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>compressed_kvcache</th>
+          <th>sub_block_sz</th>
+          <th>blocks_per_trunk</th>
+          <th>num_trunks</th>
+          <th>SB=1 observed density</th>
+          <th>SB=1 avg(ms)</th>
+          <th>SB=1 meet</th>
+          <th>SB=256 observed density @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=256 avg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=256 meet @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 observed density @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 avg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 meet @ req 1.00/0.99/0.66/0.33/0.11</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>smoke_perf_test()</td>
+          <td>BY_TOKEN (1)</td>
+          <td>default</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>487.121</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>507.536, 491.699, 319.912, 165.179, 58.114</td>
+          <td>0.58, 0.60, 0.61, 0.59, 0.56</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>526.137, 522.467, 404.805, 269.875, 134.642</td>
+          <td>0.56, 0.56, 0.48, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(16)</td>
+          <td>BY_TOKEN (1)</td>
+          <td>default</td>
+          <td>16</td>
+          <td>8</td>
+          <td>1.00</td>
+          <td>491.541</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>510.820, 492.530, 319.991, 166.239, 59.632</td>
+          <td>0.58, 0.59, 0.61, 0.59, 0.55</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>533.421, 529.026, 403.617, 269.562, 137.199</td>
+          <td>0.55, 0.55, 0.48, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=NONE)</td>
+          <td>NONE (0)</td>
+          <td>n/a</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>483.407</td>
+          <td>0.61</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>490.560, 486.970, 324.347, 156.356, 51.837</td>
+          <td>0.60, 0.60, 0.60, 0.62, 0.63</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>485.241, 485.370, 361.436, 220.073, 141.149</td>
+          <td>0.61, 0.60, 0.54, 0.44, 0.23</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)</td>
+          <td>BY_CHANNEL (2)</td>
+          <td>DEFAULT_SUB_BLOCK_SIZE</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>489.582</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>511.200, 496.729, 330.073, 169.237, 59.483</td>
+          <td>0.58, 0.59, 0.59, 0.58, 0.55</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>516.589, 510.961, 402.840, 268.342, 132.798</td>
+          <td>0.57, 0.57, 0.48, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=32)</td>
+          <td>BY_CHANNEL (2)</td>
+          <td>32</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>490.778</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>521.954, 505.766, 332.185, 170.900, 60.073</td>
+          <td>0.57, 0.58, 0.59, 0.57, 0.54</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>528.675, 525.002, 414.797, 274.631, 135.696</td>
+          <td>0.56, 0.56, 0.47, 0.35, 0.24</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>Quick read:</strong> The <code>test_pa.perf.single_seq.log</code> run shows the same overall trend: SB=256 benefits from lower density, while SB=128 drops sharply in meet at 0.33 and 0.11 across all compression modes.</p>
+  </div>
+
+  <div class="section">
+    <h2>Smoke Perf Matrix Summary from test_pa.perf.multi_seq.log (LNL)</h2>
+    <p><strong>Source log:</strong> <code>test_pa.perf.multi_seq.log</code> from <code>python test_pa.py</code></p>
+    <p><strong>Platform:</strong> LNL</p>
+    <p><strong>Branch:</strong> <code>cecilia/pa/multi_seq</code></p>
+    <p><strong>Commit:</strong> <code>69f08ee2</code></p>
+    <p><strong>Common setup:</strong> seq_len=32768, block_sz=256, heads=32/8, densities={1.00, 0.99, 0.66, 0.33, 0.11}</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>compressed_kvcache</th>
+          <th>sub_block_sz</th>
+          <th>blocks_per_trunk</th>
+          <th>num_trunks</th>
+          <th>SB=1 observed density</th>
+          <th>SB=1 avg(ms)</th>
+          <th>SB=1 meet</th>
+          <th>SB=256 observed density @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=256 avg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=256 meet @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 observed density @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 avg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 meet @ req 1.00/0.99/0.66/0.33/0.11</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>smoke_perf_test()</td>
+          <td>BY_TOKEN (1)</td>
+          <td>default</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>491.381</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>521.674, 503.518, 331.216, 170.239, 59.477</td>
+          <td>0.57, 0.58, 0.59, 0.57, 0.55</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>523.913, 518.047, 401.470, 266.346, 133.166</td>
+          <td>0.56, 0.56, 0.48, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(16)</td>
+          <td>BY_TOKEN (1)</td>
+          <td>default</td>
+          <td>16</td>
+          <td>8</td>
+          <td>1.00</td>
+          <td>491.624</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>524.757, 506.958, 329.834, 171.658, 61.012</td>
+          <td>0.56, 0.58, 0.59, 0.57, 0.53</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>526.638, 520.576, 398.273, 268.123, 135.896</td>
+          <td>0.56, 0.56, 0.49, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=NONE)</td>
+          <td>NONE (0)</td>
+          <td>n/a</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>481.898</td>
+          <td>0.61</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>485.808, 482.724, 322.637, 155.171, 50.908</td>
+          <td>0.61, 0.61, 0.60, 0.63, 0.64</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>483.457, 484.769, 393.649, 229.020, 142.682</td>
+          <td>0.61, 0.60, 0.49, 0.42, 0.23</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)</td>
+          <td>BY_CHANNEL (2)</td>
+          <td>DEFAULT_SUB_BLOCK_SIZE</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>499.443</td>
+          <td>0.59</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>517.174, 501.835, 334.553, 171.530, 59.900</td>
+          <td>0.57, 0.58, 0.58, 0.57, 0.54</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>511.339, 507.421, 401.454, 268.021, 132.967</td>
+          <td>0.58, 0.57, 0.48, 0.36, 0.24</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=32)</td>
+          <td>BY_CHANNEL (2)</td>
+          <td>32</td>
+          <td>128</td>
+          <td>1</td>
+          <td>1.00</td>
+          <td>488.524</td>
+          <td>0.60</td>
+          <td>1.01, 1.00, 0.67, 0.33, 0.11</td>
+          <td>511.301, 495.637, 328.682, 168.987, 59.183</td>
+          <td>0.58, 0.59, 0.59, 0.58, 0.55</td>
+          <td>1.00, 0.99, 0.66, 0.33, 0.11</td>
+          <td>520.747, 515.482, 406.512, 269.006, 133.514</td>
+          <td>0.57, 0.57, 0.48, 0.36, 0.24</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Difference vs test_pa.perf.single_seq.log</h3>
+    <p><strong>Definition:</strong> delta = <code>test_pa.perf.multi_seq.log</code> - <code>test_pa.perf.single_seq.log</code>. Negative avg(ms) means <code>test_pa.perf.multi_seq.log</code> is faster.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>SB=1 Δavg(ms)</th>
+          <th>SB=1 Δmeet</th>
+          <th>SB=256 Δavg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=256 Δmeet @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 Δavg(ms) @ req 1.00/0.99/0.66/0.33/0.11</th>
+          <th>SB=128 Δmeet @ req 1.00/0.99/0.66/0.33/0.11</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>smoke_perf_test()</td>
+          <td>+4.260</td>
+          <td>+0.00</td>
+          <td>+14.138, +11.819, +11.304, +5.060, +1.363</td>
+          <td>-0.01, -0.02, -0.02, -0.02, -0.01</td>
+          <td>-2.224, -4.420, -3.335, -3.529, -1.476</td>
+          <td>+0.00, +0.00, +0.00, +0.00, +0.00</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(16)</td>
+          <td>+0.083</td>
+          <td>+0.00</td>
+          <td>+13.937, +14.428, +9.843, +5.419, +1.380</td>
+          <td>-0.02, -0.01, -0.02, -0.02, -0.02</td>
+          <td>-6.783, -8.450, -5.344, -1.439, -1.303</td>
+          <td>+0.01, +0.01, +0.01, +0.00, +0.00</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=NONE)</td>
+          <td>-1.509</td>
+          <td>+0.00</td>
+          <td>-4.752, -4.246, -1.710, -1.185, -0.929</td>
+          <td>+0.01, +0.01, +0.00, +0.01, +0.01</td>
+          <td>-1.784, -0.601, +32.213, +8.947, +1.533</td>
+          <td>+0.00, +0.00, -0.05, -0.02, +0.00</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)</td>
+          <td>+9.861</td>
+          <td>-0.01</td>
+          <td>+5.974, +5.106, +4.480, +2.293, +0.417</td>
+          <td>-0.01, -0.01, -0.01, -0.01, -0.01</td>
+          <td>-5.250, -3.540, -1.386, -0.321, +0.169</td>
+          <td>+0.01, +0.00, +0.00, +0.00, +0.00</td>
+        </tr>
+        <tr>
+          <td>smoke_perf_test(compressed_kvcache=BY_CHANNEL, sub_block_sz=32)</td>
+          <td>-2.254</td>
+          <td>+0.00</td>
+          <td>-10.653, -10.129, -3.503, -1.913, -0.890</td>
+          <td>+0.01, +0.01, +0.00, +0.01, +0.01</td>
+          <td>-7.928, -9.520, -8.285, -5.625, -2.182</td>
+          <td>+0.01, +0.01, +0.01, +0.01, +0.00</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>Quick read:</strong> Compared to <code>test_pa.perf.single_seq.log</code>, <code>test_pa.perf.multi_seq.log</code> is slower on most SB=256 BY_TOKEN points, but faster on many SB=128 points; FP16 and BY_CHANNEL show mixed behavior depending on density and sub-block setting.</p>
+  </div>
+</body>
+</html>

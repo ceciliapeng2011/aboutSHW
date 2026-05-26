@@ -3,3 +3,4 @@ pybind11
 numpy
 torch
 transformers
+pytest
