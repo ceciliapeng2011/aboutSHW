@@ -94,7 +94,14 @@ class page_atten_cm:
 
         wg_size = 16
         q_step = CM_GRF_WIDTH // 32
-        self.wg_seq_len = wg_size * q_step
+        # head_size == 256 uses 4-worker partition (4 teams * 4 workers per WG), so each
+        # WG covers only `num_worker * q_step` queries. Other head sizes have one worker
+        # per team (16 lanes -> 16 q-slices per WG).
+        if head_size == 256:
+            num_worker = 4
+            self.wg_seq_len = num_worker * q_step
+        else:
+            self.wg_seq_len = wg_size * q_step
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
