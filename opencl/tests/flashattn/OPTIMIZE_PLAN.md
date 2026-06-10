@@ -168,18 +168,88 @@ a branch per iteration and prevents the compiler from fully scheduling the PV1 p
 
 ---
 
-## Priority and dependency
+## GRF occupancy analysis (post items 1–5)
 
-| # | Change | Files | Expected impact | Dependency |
-|---|--------|-------|----------------|------------|
-| 1 | Mapping array replaces `need_wg_mapping` | kernel + Python | Low–medium (dispatch) | none |
-| 2 | V prefetch moved to K phase | kernel | Medium (V latency) | — |
-| 3 | Load/DPAS double-buffer | kernel | Medium (L1 stall) | — |
-| 4 | Pre-loop warm-up | kernel | Small (cold-start only) | 2 |
-| 5 | Peel kv_pos=0 | kernel | Small (branch) | — |
+After items 1–5, the kernel uses **163 GRFs/thread** with 256 available.
+Since `floor(256/163) = 1`, only **1 thread context per EU** can be live —
+the EU stalls completely on any load or DPAS latency with no other work to hide it.
+Reducing to ≤128 GRF would allow 2 contexts; ≤85 GRF allows 3 contexts.
 
-Items 2, 3, 4 target the same root cause (load latency not fully hidden) and should
-be implemented together. Item 1 is independent. Item 5 is a clean-up that
-aids compiler scheduling for 2+3.
+GRF budget breakdown:
+- `rO`: `float[padded_head_size/REG_N * num_P_tiles * REG_M * REG_N]`
+  = `float[4 × 2 × 8 × 16]` = 4096 bytes = **128 GRFs** (FP32, persistent across kv loop)
+- `rQ`: `half[padded_head_size/REG_K × REG_K × REG_N]`
+  = `half[4 × 16 × 16]` = 2048 bytes = **64 GRFs** (FP16, loaded once, held all loop)
+- Everything else (cur_max, cur_sum, St, P, Kmat, Vmat, descriptors): ~22 GRFs
 
-Suggested order: **1 → 5 → 4+2+3**
+---
+
+### 6. Split head dimension — process head in 2 passes (halve rQ + rO)
+
+**Problem:** `rO` (128 GRF) + `rQ` (64 GRF) dominate. Both scale with `head_size`.
+
+**Fix:** Run the kv loop **twice**, each time covering only `head_size/2 = 32` output
+channels (`d_start = 0` then `d_start = head_size/2`). Each pass uses:
+- `rO`: 64 GRF (half the head channels)
+- `rQ`: 32 GRF (half the head chunks)
+- Total: ~83 GRF → **3 thread contexts per EU**
+
+Cost: 2× kv loop body executions, but KV data accessed in pass 1 stays in L1/L2 for
+pass 2 (3840 × 64 × 2 × 2 = 0.96 MB per WG-head, fits L2 on Xe3).
+Net expected win: 2–3× if currently latency-bound, less if already BW-bound.
+
+`rO` precision stays FP32 throughout.
+
+**Implementation sketch:**
+```cpp
+for (int d_start = 0; d_start < head_size; d_start += head_size/2) {
+    // reset rO, cur_max, cur_sum
+    // load rQ for [d_start .. d_start+head_size/2]
+    // kv loop over [d_start .. d_start+head_size/2] channels
+    // store output for [d_start .. d_start+head_size/2]
+}
+```
+Requires passing `d_start` offset into all block_2d_desc base addresses for K, V, Q, O.
+
+**Files:** `cm_sdpa_common.hpp` (`sdpa_kernel_lsc_prefetch`), no Python changes needed.
+
+---
+
+### 7. Reload rQ on-demand, drop persistent rQ registers
+
+**Problem:** `rQ` (64 GRF) is loaded once before the loop and held across all kv
+iterations. It occupies 64 GRFs that could otherwise be used for a second thread context.
+
+**Fix:** Eliminate the persistent `rQ` matrix. Inside each kv iteration's K inner loop,
+reload the Q chunk needed for DPAS `ri` from L1 (Q was already loaded into L1 during
+the initial load; re-accessing it is an L1 hit, ~20 cycles latency vs the 64 GRF saved).
+
+Combined with no other change: 163 − 64 = **99 GRF** — still > 128, not enough alone.
+Combined with item 6 (head split): already addressed.
+Combined with reducing rO (not desired) — not pursued per constraints.
+
+**Net verdict:** Only useful if combined with another reduction to cross the 128 GRF
+threshold. Most likely useful as a follow-on after item 6.
+
+**Files:** `cm_sdpa_common.hpp` (`sdpa_kernel_lsc_prefetch`).
+
+---
+
+## Status and priority
+
+| # | Change | Status | Result |
+|---|--------|--------|--------|
+| 1 | Mapping array replaces `need_wg_mapping` | Done | ~0% GPU perf, cleaner code |
+| 2 | V prefetch moved to K phase | Done | −1.7% to −6.2% |
+| 3 | Load/DPAS double-buffer (K) | Tried, reverted | Regression — compiler already schedules well for d=64 |
+| 4 | Pre-loop warm-up prefetch | Done (with 2) | Included in items 2+4+5 result |
+| 5 | Peel kv_pos=0 / unified PV path | Done (with 2) | Included in items 2+4+5 result |
+| 6 | Split head dimension (2 passes, halve rO+rQ) | **Next** | Target: 2–3× occupancy |
+| 7 | Reload rQ on-demand | After 6 if needed | Only useful combined with 6 |
+
+Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe):
+- Compute peak: ~20 TFLOPS FP16 XMX
+- Actual: ~10.6 TFLOPS (53% of peak)
+- Memory: 3.77 GB at 68 GB/s → 56 ms BW-bound vs 85 ms actual
+- Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
+- **Conclusion: slightly memory-bound, but 47% of compute peak lost to EU stalls (low occupancy)**
