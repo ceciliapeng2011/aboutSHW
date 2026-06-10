@@ -14,7 +14,7 @@
  * limitations under the License.
  *******************************************************************************/
 #include "cm_attention_common.hpp"
-
+#define CM_HAS_LSC_UNTYPED_2D 1
 #ifdef CM_HAS_LSC_UNTYPED_2D
 //@prefetch_u8 would have duplicated decompress perf issue. comments out for now.
 // template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused, int wg_local_size>
@@ -480,19 +480,33 @@ void sdpa_kernel_lsc_prefetch(
 
     int causal_left = q_start;
 
+    // Warm up first K and V tiles before the loop so kv_pos=0 finds them in cache.
+    prefetch_K.set_block_y(wg_local_id);
+    prefetch_V.set_block_y(wg_local_id);
+    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
+    #pragma unroll
+    for(int ri = 1; ri < padded_head_size/REG_K; ri++) {
+        cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
+        cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri*REG_N));
+    }
+
     for(int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step,
             k_base += kv_step * kv_pitch,
             v_base += kv_step * kv_pitch) {
         //# St = k @ Qt
-        matrix<float, kv_step, q_step> St; // = ugemm_KQ(slm_K, rQ, slm_offset);
+        matrix<float, kv_step, q_step> St;
         {
             constexpr int num_K = kv_step/REG_M;
             auto St2 = St.format<float, num_K, REG_M*REG_N>();
 
             matrix<half, num_K, REG_M * REG_K> Kmat;
-            //cm_slm_block_read(slm_K, GENX_NONE, slm_offset, Kmat.format<half>());
+            // Prefetch K for next iter and V for current iter together in the K phase,
+            // giving V the full K-DPAS + softmax + transpose as lead time.
             prefetch_K.set_block_y(wg_local_id + kv_pos + kv_step);
+            prefetch_V.set_block_y(wg_local_id + kv_pos);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
 
             b2dK.set_block_y(kv_pos);
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
@@ -505,8 +519,8 @@ void sdpa_kernel_lsc_prefetch(
 
             #pragma unroll
             for(int ri = 1; ri < padded_head_size/REG_K; ri++) {
-                //cm_slm_block_read(slm_K, GENX_NONE, slm_offset + ri * Kmat.n_elems() * sizeof(half), Kmat.format<half>());
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri*REG_N));
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
                 #pragma unroll
                 for(int k = 0; k < num_K; k++) {
@@ -531,43 +545,21 @@ void sdpa_kernel_lsc_prefetch(
             for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         }
 
-        //show(St);
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
         Transpose2DMatrix(St, P);
 
+        // Unified PV path: for kv_pos=0, cur_max was -3e38 so max_comp=exp(-inf)=0,
+        // which zeroes rO before DPAS — identical to the explicit acc=0 of PV0.
+        // No branch, no V prefetch here (already issued in K phase above).
         b2dV.set_block_y(kv_pos);
-        prefetch_V.set_block_y(wg_local_id +kv_pos + kv_step);
-        if (kv_pos == 0) {
-            // ugemm_PV0(slm_V, P, rO, slm_offset);
+        {
             auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
             #pragma unroll
             for(int k = 0, ri = 0; k < padded_head_size; k += REG_N, ri += num_P_tiles) {
                 matrix<half, REG_K/2, REG_N*2> Vmat;
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
                 cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-                #pragma unroll
-                for(int p = 0; p < num_P_tiles; p++) {
-                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
-                                    0,
-                                    Vmat.format<int32_t>(),
-                                    P2.row(p).format<int32_t>());
-                }
-            }
-        }
-        else {
-            //ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
-            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
-            #pragma unroll
-            for(int k = 0, ri=0; k < padded_head_size; k += REG_N, ri += num_P_tiles) {
-                matrix<half, REG_K/2, REG_N*2> Vmat;
-
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(k));
-                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-
-                //# compensate cur_O
-                //  matrix <float, head_size/REG_K*2, REG_M*REG_N> rO;
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     auto cO = rO[ri + p].format<float, REG_M, REG_N>();
@@ -575,7 +567,6 @@ void sdpa_kernel_lsc_prefetch(
                     for(int r = 0; r < REG_M; r++)
                         cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
                 }
-
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(

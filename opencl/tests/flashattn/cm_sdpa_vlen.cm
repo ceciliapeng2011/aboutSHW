@@ -39,7 +39,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     SurfaceIndex output [[type("buffer_t")]],
 #endif
     int* cu_seqlens [[type("svmptr_t")]],
-    int  need_wg_mapping,
+    int* wg_mapping [[type("svmptr_t")]],
     // Element-count offsets for in-place crop (TransposeSplitMatcher axis=1 pattern).
     // When the upstream Reshape propagates dynamic padding from a Split(axis=1) crop,
     // the SVM base pointer still points to the start of the packed QKV buffer.
@@ -72,48 +72,16 @@ _GENX_MAIN_ void KERNEL_NAME(
 
     auto wg_id = cm_group_id(1); // each work-group handles a sequence
 
-    int q_start, kv_start, kv_seq_len, q_len;
-    if (need_wg_mapping) {
-        // multiple work-groups are required to split a sequence,
-        // need to figure out which part of query-tokens to process
-        auto wg_count = cm_group_count(1);
-        int wg_seq_len = local_size * q_step;
-        int seq_id = 0;
-        auto seq_start = cu_seqlens[seq_id];
-        int seq_end;
-        int wg_base = 0;
-        int wg_num;
-        while(wg_base < wg_count) {
-            seq_end = cu_seqlens[seq_id + 1];
-            // seq_start ~ seq_end
-            auto sel_len = seq_end - seq_start;
-            wg_num = (sel_len + wg_seq_len - 1) / wg_seq_len;
-            if (wg_id < wg_base + wg_num) {
-                // found the sequence to process
-                break;
-            }
-            wg_base += wg_num;
-            seq_start = seq_end;
-            seq_id ++;
-        }
-        if (wg_base > wg_id) return;
-
-        kv_start = seq_start;
-        kv_seq_len = seq_end - seq_start;
-        q_start = seq_start + (wg_id - wg_base) * wg_seq_len + wg_local_id * q_step;
-        q_len = q_step;
-        if (q_start + q_len > seq_end) {
-            q_len = seq_end - q_start;
-        }
-    } else {
-        q_start = cu_seqlens[wg_id] + wg_local_id * q_step;
-        q_len = q_step;
-        if (q_start + q_len > cu_seqlens[wg_id + 1]) {
-            q_len = cu_seqlens[wg_id + 1] - q_start;
-        }
-        kv_start = cu_seqlens[wg_id];
-        kv_seq_len = cu_seqlens[wg_id + 1] - kv_start;
-    }
+    int block_start_pos = wg_mapping[wg_id * 2];
+    int seq_id          = wg_mapping[wg_id * 2 + 1];
+    int kv_start        = cu_seqlens[seq_id];
+    int seq_end         = cu_seqlens[seq_id + 1];
+    int kv_seq_len      = seq_end - kv_start;
+    int q_start         = block_start_pos + wg_local_id * q_step;
+    int q_len           = q_step;
+    if (q_start + q_len > seq_end)
+        q_len = seq_end - q_start;
+    if (q_len < 0) q_len = 0;
     // qo_offset / kv_offset: element index into the slice buffer.
     // token_offset_q / token_offset_kv are added to advance the SVM base pointer
     // past the slice padding set by the in-place crop optimization.
