@@ -168,70 +168,38 @@ a branch per iteration and prevents the compiler from fully scheduling the PV1 p
 
 ---
 
-## GRF occupancy analysis (post items 1–5)
+## GRF occupancy analysis (corrected)
 
-After items 1–5, the kernel uses **163 GRFs/thread** with 256 available.
-Since `floor(256/163) = 1`, only **1 thread context per EU** can be live —
-the EU stalls completely on any load or DPAS latency with no other work to hide it.
-Reducing to ≤128 GRF would allow 2 contexts; ≤85 GRF allows 3 contexts.
+The kernel uses ~163 GRFs/thread in large GRF mode (256 GRF bank per thread).
 
-GRF budget breakdown:
-- `rO`: `float[padded_head_size/REG_N * num_P_tiles * REG_M * REG_N]`
-  = `float[4 × 2 × 8 × 16]` = 4096 bytes = **128 GRFs** (FP32, persistent across kv loop)
-- `rQ`: `half[padded_head_size/REG_K × REG_K × REG_N]`
-  = `half[4 × 16 × 16]` = 2048 bytes = **64 GRFs** (FP16, loaded once, held all loop)
-- Everything else (cur_max, cur_sum, St, P, Kmat, Vmat, descriptors): ~22 GRFs
+**Correction:** On Xe2/Xe3, each EU has 64 KB register file divided into **4 fixed
+16 KB banks** (one per thread context). In large GRF mode each thread always occupies
+exactly one 16 KB bank regardless of how many of the 256 GRFs it actually uses.
+The hardware always runs **4 thread contexts per EU** — `floor(256/163)` does not apply.
+A thread using 163/256 GRFs wastes 93 GRFs within its bank but does not evict other
+thread contexts. **GRF reduction does not improve occupancy on this architecture.**
 
----
+GRF budget (informational):
+- `rO`: `float[4 × 2 × 8 × 16]` = 4096 bytes = **128 GRFs** (FP32)
+- `rQ`: `half[4 × 16 × 16]` = 2048 bytes = **64 GRFs** (FP16)
+- Other (cur_max, cur_sum, St, P, Kmat, Vmat, descriptors): ~22 GRFs
 
-### 6. Split head dimension — process head in 2 passes (halve rQ + rO)
-
-**Problem:** `rO` (128 GRF) + `rQ` (64 GRF) dominate. Both scale with `head_size`.
-
-**Fix:** Run the kv loop **twice**, each time covering only `head_size/2 = 32` output
-channels (`d_start = 0` then `d_start = head_size/2`). Each pass uses:
-- `rO`: 64 GRF (half the head channels)
-- `rQ`: 32 GRF (half the head chunks)
-- Total: ~83 GRF → **3 thread contexts per EU**
-
-Cost: 2× kv loop body executions, but KV data accessed in pass 1 stays in L1/L2 for
-pass 2 (3840 × 64 × 2 × 2 = 0.96 MB per WG-head, fits L2 on Xe3).
-Net expected win: 2–3× if currently latency-bound, less if already BW-bound.
-
-`rO` precision stays FP32 throughout.
-
-**Implementation sketch:**
-```cpp
-for (int d_start = 0; d_start < head_size; d_start += head_size/2) {
-    // reset rO, cur_max, cur_sum
-    // load rQ for [d_start .. d_start+head_size/2]
-    // kv loop over [d_start .. d_start+head_size/2] channels
-    // store output for [d_start .. d_start+head_size/2]
-}
-```
-Requires passing `d_start` offset into all block_2d_desc base addresses for K, V, Q, O.
-
-**Files:** `cm_sdpa_common.hpp` (`sdpa_kernel_lsc_prefetch`), no Python changes needed.
+**Conclusion:** Items 6 and 7 (head-split, reload rQ) were based on a false occupancy
+model and are not expected to help. Item 6 was tried and reverted — it doubled the kv
+loop cost with no occupancy benefit, causing ~71% regression.
 
 ---
 
-### 7. Reload rQ on-demand, drop persistent rQ registers
+### ~~6. Split head dimension~~ (obsolete — false premise)
 
-**Problem:** `rQ` (64 GRF) is loaded once before the loop and held across all kv
-iterations. It occupies 64 GRFs that could otherwise be used for a second thread context.
+Tried and reverted. Doubled kv-loop cost, no occupancy benefit (EU always has 4 thread
+contexts in large GRF mode regardless of per-thread GRF usage).
 
-**Fix:** Eliminate the persistent `rQ` matrix. Inside each kv iteration's K inner loop,
-reload the Q chunk needed for DPAS `ri` from L1 (Q was already loaded into L1 during
-the initial load; re-accessing it is an L1 hit, ~20 cycles latency vs the 64 GRF saved).
+---
 
-Combined with no other change: 163 − 64 = **99 GRF** — still > 128, not enough alone.
-Combined with item 6 (head split): already addressed.
-Combined with reducing rO (not desired) — not pursued per constraints.
+### ~~7. Reload rQ on-demand~~ (obsolete — false premise)
 
-**Net verdict:** Only useful if combined with another reduction to cross the 128 GRF
-threshold. Most likely useful as a follow-on after item 6.
-
-**Files:** `cm_sdpa_common.hpp` (`sdpa_kernel_lsc_prefetch`).
+Dropped. Same reason as item 6.
 
 ---
 
@@ -244,12 +212,13 @@ threshold. Most likely useful as a follow-on after item 6.
 | 3 | Load/DPAS double-buffer (K) | Tried, reverted | Regression — compiler already schedules well for d=64 |
 | 4 | Pre-loop warm-up prefetch | Done (with 2) | Included in items 2+4+5 result |
 | 5 | Peel kv_pos=0 / unified PV path | Done (with 2) | Included in items 2+4+5 result |
-| 6 | Split head dimension (2 passes, halve rO+rQ) | **Next** | Target: 2–3× occupancy |
-| 7 | Reload rQ on-demand | After 6 if needed | Only useful combined with 6 |
+| 6 | Split head dimension (2 passes) | Tried, reverted | +71% regression — doubled kv cost, no occupancy benefit |
+| 7 | Reload rQ on-demand | Dropped | False premise (occupancy not the bottleneck) |
 
 Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe):
 - Compute peak: ~20 TFLOPS FP16 XMX
 - Actual: ~10.6 TFLOPS (53% of peak)
 - Memory: 3.77 GB at 68 GB/s → 56 ms BW-bound vs 85 ms actual
 - Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
-- **Conclusion: slightly memory-bound, but 47% of compute peak lost to EU stalls (low occupancy)**
+- EU always has 4 thread contexts (large GRF mode, hardware-fixed) — occupancy is not the bottleneck
+- **Conclusion: slightly memory-bound; remaining gap is likely L1-hit latency on K/V loads**
