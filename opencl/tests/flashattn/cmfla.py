@@ -26,13 +26,15 @@ class flash_attn_cm:
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.is_causal = is_causal
-        src1 = r'''#include "cm_sdpa_vlen.hpp"'''
+        src1 = r'''#include "cm_sdpa_vlen.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_heads=} {head_size=} ...")
 
         scale_factor = 1.0/(head_size**0.5)
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
+                      f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
+                      f" -DKERNEL_NAME=cm_sdpa_vlen"
                       f" -DCMFLA_NUM_HEADS={num_heads}"
                       f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
                       f" -DCMFLA_HEAD_SIZE={head_size}"
@@ -87,7 +89,7 @@ class flash_attn_cm:
             wg_count = 0
             wg_seq_len = wg_size * q_step
             for i in range(len(cu_seqlens) - 1):
-                wg_count += (cu_seqlens[i+1] - cu_seqlens[i] + wg_seq_len - 1) // wg_seq_len
+                wg_count += int((cu_seqlens[i+1] - cu_seqlens[i] + wg_seq_len - 1) // wg_seq_len)
         else:
             wg_count = (len(cu_seqlens) - 1)
         GWS = [self.num_heads, wg_count * wg_size]
@@ -95,7 +97,7 @@ class flash_attn_cm:
         print(f"calling {need_wg_mapping=} {q_step=} {max_seq_len=} {wg_count=} ...")
         print(f"{GWS=} {LWS=}")
         for _ in range(n_repeats):
-            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS, t_cu_seqlens, need_wg_mapping, t_q, t_k, t_v, t_out)
+            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS, t_q, t_k, t_v, t_out, t_cu_seqlens, need_wg_mapping, 0, 0)
         attn_output = torch.from_numpy(t_out.numpy()).to(old_dtype)
         return attn_output
 
@@ -184,6 +186,7 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     func = flash_attn_cm.create_instance(num_heads, num_kv_heads, head_size, False)
     out = func(q, k, v, cu_seqlens)
     check_close(ref, out)
+    cl.finish()
 
     out = func(q, k, v, cu_seqlens, 100)
     latency = cl.finish()
@@ -221,17 +224,20 @@ def test_flash_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, he
     #assert 0
 
 if __name__ == "__main__":
-    test_flash_attn_causal_batch1(seq_len=8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    # test_flash_attn_causal_batch1(seq_len=8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
     # for seqlen in range(1025, 1055, 1):
     #     test_flash_attn_causal_batch1(seqlen, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    # test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
-    test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    test_flash_attn_cm(8192, 8192)
-    test_flash_attn_cm(8192, 1024)
-    test_flash_attn_cm(8192, 64)
-    test_flash_attn_cm(8190, 64)
-    test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    # test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    # test_flash_attn_cm(8192, 8192)
+    # test_flash_attn_cm(8192, 1024)
+    # test_flash_attn_cm(8192, 64)
+    # test_flash_attn_cm(8190, 64)
+    # test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    
     # for seqlen in range(1, 1055, 1):
     #     for sub_seq_len in range(1, 64, 1):
     #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
+    
+    test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 64)
