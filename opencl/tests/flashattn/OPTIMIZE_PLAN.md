@@ -225,31 +225,95 @@ Instruction profile in main loop body:
 - **66 mov** for `Transpose2DMatrix(St→P)` @ ~66 cy ALU (pipelined with math)
 - **16 mul** for rO rescaling @ ~16 cy ALU
 
-The MATH pipe (exp) and XMX are balanced; neither is clearly dominant.
-**Root bottleneck**: both exp and DPAS are at capacity — to gain, we must amortize
-the per-kv overhead (softmax + transpose = ~130 cy) over more DPAS work.
+The MATH pipe (exp) and XMX are roughly balanced at ~40–50 cy each.
 
-**Why wg_size=32 doesn't help**: `kv_step/wg_local_size = 16/32 = 0` → invalid prefetch descriptor. And total thread count is unchanged regardless.
+**Why wg_size=32 doesn't help**: `kv_step/wg_local_size = 16/32 = 0` → invalid prefetch descriptor. Total thread count is unchanged regardless.
 
-## Item 9: increase q_step to 32 (double Q-rows per thread)
+---
 
-**Idea**: process 2 rows of Q per thread per kv iteration instead of 1. The softmax
-overhead (exp, max, sum, transpose) is per-kv-iter, not per-Q-row — it stays constant
-while DPAS work doubles. This improves the ratio of compute to softmax overhead.
+## Why "amortize softmax" doesn't work — corrected analysis
 
-**Cost**:
-- `rO` doubles: `float[8 × 2 × 8 × 16]` = 8192 bytes = 256 GRF (uses full bank)
-- `rQ` doubles: `half[8 × 16 × 16]` = 4096 bytes = 128 GRF
-- Compiler may need `-Qxcm_register_file_size=256` relaxation or spill
-- wg dispatch: `q_step = CM_GRF_WIDTH//32 = 16` in Python — must be overridden
+Items 9 (2 Q-rows) and the batch-2-kv idea were premised on softmax being a
+*fixed* per-kv-iter cost. That is wrong.
 
-**Alternative**: process 2 kv tiles per softmax call (batch-2 kv), keeping q_step=16.
-Same ratio improvement with no rO/rQ change. Harder to implement correctly.
+`online_softmax_update(St[rows=kv_step, cols=q_step], ...)` runs `kv_step` exp
+instructions on SIMD-`q_step` vectors. The exp count is `kv_step × q_step` elements
+regardless of how the work is tiled:
 
-Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe):
+| Scheme | DPAS ops/iter | exp instr/iter | ratio |
+|--------|---------------|----------------|-------|
+| baseline (q_step=16) | 12 × SIMD16 | 17 × SIMD16 | 1.0 |
+| 2 Q-rows (q_step→32) | 24 × SIMD16 | 34 × SIMD16 | 1.0 |
+| batch-2-kv | 24 × SIMD16 | 34 × SIMD16 | 1.0 |
+
+The ratio is unchanged — there is **no amortization**. Both exp and DPAS scale
+linearly together. Item 9 regressed (+14%) purely from register spill;
+batch-2-kv would have the same ratio with cleaner GRF but still no gain.
+
+**`-Qxcm_register_file_size=512` does not help**: the hardware bank is 256 GRF
+(16 KB). Setting 512 just causes all excess GRFs to spill — worse than item 9's
+128-GRF overflow.
+
+---
+
+## True bottleneck and remaining opportunities
+
+Per kv-iter the kernel runs:
+- **MATH**: 17 exp × SIMD16 FP32 — costs 1 instruction per SIMD16 exp on the math pipe
+- **XMX**: 12 dpas — hidden by 4-context overlap
+- **ALU**: 66 mov (transpose) + 16 mul (rescale) — pipelined with math
+
+To improve, the only levers that change the ratio are:
+
+### 10. FP16 softmax (halve exp instruction count)
+
+`cm_exp` on SIMD16 FP32 = 1 math instruction covering 16 Q positions.
+If softmax runs in FP16, `cm_exp` on SIMD32 FP16 = 1 math instruction covering
+32 Q positions — **half the math instructions** for the same work.
+
+`online_softmax_update` currently uses FP32 for numerical stability.
+FP16 range is ±65504 — more than enough for softmax with `scale_factor = 1/8`.
+
+**Change**: template `online_softmax_update` to accept FP16 St and accumulate in
+FP16; convert `cur_max`/`cur_sum` to FP16 or keep FP32 and only exp in FP16.
+
+**Risk**: accuracy — softmax intermediate values can underflow/overflow in FP16
+if logits are large. Test with `check_close` after change.
+
+**File**: `cm_attention_common.hpp` (`online_softmax_update`), `cm_sdpa_common.hpp`.
+
+---
+
+### 11. Eliminate explicit St→P transpose (remove 66 mov/iter)
+
+`Transpose2DMatrix(St, P)` converts `float[16,16] St` → `half[16,16] P` (transpose
++ fp32→fp16), generating ~66 mov. This is needed because the V-DPAS uses P as the
+A (src1) matrix in `[q, kv]` layout, but St comes out of K-DPAS in `[kv, q]` layout.
+
+**Option A — swap K-DPAS operands**: compute K phase as
+`St[q, kv] = Qt[q, :] × K[:, kv]` by putting Qt as B (VNNI) and K as A (src1).
+Output is naturally in `[q, kv]` layout — no transpose needed. Requires Qt to be
+stored in VNNI format (needs format change in Q load).
+
+**Option B — absorb into existing FP16 conversion**: during the existing
+fp32→fp16 downcast, write directly in transposed order using GRF select patterns —
+saves a separate transpose pass but still costs the select movs.
+
+**Note**: `Transpose_16x16` uses 4 passes of `select<2,1,8,2>`. On Xe2/Xe3 the
+ALU can pipeline this with MATH, so the *wall-clock* cost may be lower than the
+raw 66-mov count suggests. Profile before assuming it's on the critical path.
+
+**File**: `cm_sdpa_common.hpp`, `cm_attention_common.hpp`.
+
+---
+
+## Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe)
+
 - Compute peak: ~20 TFLOPS FP16 XMX
 - Actual: ~10.6 TFLOPS (53% of peak)
 - Memory: 3.77 GB at 68 GB/s → 56 ms BW-bound vs 85 ms actual
 - Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
 - EU always has 4 thread contexts (large GRF mode, hardware-fixed)
-- **Conclusion: math-pipe-bound on exp; amortize per-kv softmax cost over more DPAS work**
+- **Current ceiling**: math-pipe exp and XMX DPAS both at ~40–50 cy/iter;
+  the only way to reduce wall-clock is to reduce exp instruction count (item 10)
+  or remove the 66-mov transpose (item 11)
