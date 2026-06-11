@@ -31,6 +31,7 @@ class flash_attn_cm:
         print(f"compiling {cwd} {num_heads=} {head_size=} ...")
 
         scale_factor = 1.0/(head_size**0.5)
+        kv_blk = int(os.environ.get("CMFLA_KV_BLK", "2"))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
@@ -40,6 +41,7 @@ class flash_attn_cm:
                       f" -DCMFLA_HEAD_SIZE={head_size}"
                       f" -DCMFLA_SCALE_FACTOR={scale_factor}"
                       f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
+                      f" -DCMFLA_KV_BLK={kv_blk}"
                       f" -mdump_asm -g2")
                      )
 
