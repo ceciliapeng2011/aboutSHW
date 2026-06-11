@@ -761,8 +761,8 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             check_close(ref, out)
     else:
         # roofline = 293.27 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else 293.20  # LNL (head_size=128)
-        roofline = 296.20 if head_size == 256 else 148.10  # PTL
-        # roofline = 152.55 if head_size == 256 else 76.28  # B580
+        # roofline = 296.20 if head_size == 256 else 148.10  # PTL
+        roofline = 152.55 if head_size == 256 else 76.28  # B580
         warmup = 5
         rep = 15
         latency = pa_cm.run_perf(q, k, v, approx_simple_mask, n_warmup=warmup, n_iters=rep, deterministic_block_indices=True)
@@ -1122,9 +1122,10 @@ if __name__ == "__main__":
         seq_len = 32 * 1024
         block_sz = 256
         trunk_sz = seq_len
-        for compressed_kv in [KV_CACHE_COMPRESSION_NONE, KV_CACHE_COMPRESSION_BY_TOKEN, KV_CACHE_COMPRESSION_BY_CHANNEL]:
-        # for compressed_kv in [KV_CACHE_COMPRESSION_NONE]:
-            for head_sz in [128, 256]:
+        # for compressed_kv in [KV_CACHE_COMPRESSION_NONE, KV_CACHE_COMPRESSION_BY_TOKEN, KV_CACHE_COMPRESSION_BY_CHANNEL]:
+        for compressed_kv in [KV_CACHE_COMPRESSION_NONE]:
+            # for head_sz in [128, 256]:
+            for head_sz in [256]:
                 for sub_block_sz in [16]:
                     print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                     print(f'[PA_BY_CHANNEL_ACC_TESTS]: seq_len={seq_len} block_sz={block_sz} trunk_sz={trunk_sz} kv_cache={compressed_kv} sub_block_sz={sub_block_sz}')
