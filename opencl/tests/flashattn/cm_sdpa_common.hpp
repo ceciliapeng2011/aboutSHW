@@ -500,7 +500,11 @@ void sdpa_kernel_lsc_prefetch(
             constexpr int num_K = kv_step/REG_M;
             auto St2 = St.format<float, num_K, REG_M*REG_N>();
 
-            matrix<half, num_K, REG_M * REG_K> Kmat;
+            constexpr int num_K_chunks = padded_head_size/REG_K;
+            // Batch all K-tile loads up front (independent loads -> memory-level
+            // parallelism) so the DPAS chain consumes register-resident tiles
+            // instead of stalling on each load->use. Spends free GRF headroom.
+            matrix<half, num_K_chunks * num_K, REG_M * REG_K> Kall;
             // Prefetch K for next iter and V for current iter together in the K phase,
             // giving V the full K-DPAS + softmax + transpose as lead time.
             prefetch_K.set_block_y(wg_local_id + kv_pos + kv_step);
@@ -509,25 +513,29 @@ void sdpa_kernel_lsc_prefetch(
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
 
             b2dK.set_block_y(kv_pos);
-            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            #pragma unroll
+            for(int ri = 0; ri < num_K_chunks; ri++) {
+                cm_load<lsc::Normal>(Kall.select<num_K, 1, REG_M*REG_K, 1>(ri*num_K, 0).format<half>(),
+                                     b2dK.set_block_x(ri*REG_K));
+                if (ri >= 1) {
+                    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
+                    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri*REG_N));
+                }
+            }
             #pragma unroll
             for(int k = 0; k < num_K; k++)
                 St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
                                 0,
                                 rQ[0].format<int32_t>(),
-                                Kmat[k].format<int32_t>());
-
+                                Kall[k].format<int32_t>());
             #pragma unroll
-            for(int ri = 1; ri < padded_head_size/REG_K; ri++) {
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri*REG_K));
-                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri*REG_N));
-                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
+            for(int ri = 1; ri < num_K_chunks; ri++) {
                 #pragma unroll
                 for(int k = 0; k < num_K; k++) {
                     St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
                         St2.row(k),
                         rQ[ri].format<int32_t>(),
-                        Kmat[k].format<int32_t>());
+                        Kall[ri*num_K + k].format<int32_t>());
                 }
             }
         }
