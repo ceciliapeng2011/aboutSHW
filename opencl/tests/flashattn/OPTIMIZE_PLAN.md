@@ -223,7 +223,7 @@ Dropped. Same reason as item 6.
 | 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried ×2, reverted | +16% regression — same with 256 GRF (spill) or 512 GRF (no spill, 2 ctx/EU); exp scales linearly with Q rows, no amortization |
 | 10 | kv_step=32 | Dropped | Same math ratio — exp scales with kv_step too; loop overhead saving is ALU-pipelined and invisible |
 | 11 | FP16 softmax | Rejected | Accuracy loss not acceptable |
-| 12 | Eliminate St→P transpose (~66 mov/iter) | **Next** | Only remaining item that changes per-iter ALU cost without touching the math ratio |
+| 12 | Eliminate St→P transpose (~66 mov/iter) | Upper-bound measured | −14% potential on 2-seq; transpose IS on critical path; full elimination blocked by softmax reduction layout; faster transpose variant **Next** |
 
 ## ASM analysis (per kv iteration, d=64)
 
@@ -313,23 +313,38 @@ workloads; accuracy loss is not acceptable.
 ### 12. Eliminate explicit St→P transpose (remove ~66 mov/iter)
 
 `Transpose2DMatrix(St, P)` converts `float[16,16] St` → `half[16,16] P` (transpose
-+ fp32→fp16), generating ~66 mov. This is needed because the V-DPAS uses P as the
-A (src1) matrix in `[q, kv]` layout, but St comes out of K-DPAS in `[kv, q]` layout.
++ fp32→fp16 conversion), generating ~66 SIMD16 mov instructions per kv iteration.
+This sits strictly after `online_softmax_update` returns (not pipelined with exp),
+adding serial ALU latency on the critical path.
 
-**Option A — swap K-DPAS operands**: compute K phase as
-`St[q, kv] = Qt[q, :] × K[:, kv]` by putting Qt as B (VNNI) and K as A (src1).
-Output is naturally in `[q, kv]` layout — no transpose needed. Requires Qt to be
-stored in VNNI format (needs format change in Q load).
+**Upper-bound probe (measured)**: replacing `Transpose2DMatrix` with a direct
+float→half cast (wrong results, perf only) gives:
 
-**Option B — absorb into existing FP16 conversion**: during the existing
-fp32→fp16 downcast, write directly in transposed order using GRF select patterns —
-saves a separate transpose pass but still costs the select movs.
+| Config | Baseline | Skip-transpose | Δ |
+|--------|----------|----------------|---|
+| 2 seqs × 3432 | 9.389 ms | 8.084 ms | **−14%** |
+| 16 seqs × 512 | 1.801 ms | 1.605 ms | −11% |
+| 128 seqs × 64 | 0.715 ms | 0.708 ms | −1% |
+| 15 seqs × 3840 | 85.403 ms | 74.134 ms | **−13%** |
 
-**Note**: `Transpose_16x16` uses 4 passes of `select<2,1,8,2>`. On Xe2/Xe3 the
-ALU can pipeline this with MATH, so the *wall-clock* cost may be lower than the
-raw 66-mov count suggests. Profile before assuming it's on the critical path.
+The transpose IS on the critical path (not hidden by 4-context overlap — ALU and
+MATH compete on the same thread when exp and movs run sequentially).
 
-**File**: `cm_sdpa_common.hpp`, `cm_attention_common.hpp`.
+**Why it can't be trivially eliminated**: the existing `online_softmax_update`
+reduces along the kv dimension as SIMD16 row-operations on `St[kv=16, q=16]`.
+Reordering K-DPAS to produce `St_new[q=16, kv=16]` directly would require
+*column-wise* reduction per q-row — 16 scalar chains of length 16, far worse than
+16 SIMD16 row-ops. Swapping DPAS operands trades 66 ALU movs for 16× longer
+softmax exp chains; net is likely a regression.
+
+**Remaining viable approach**: find a faster transpose implementation. `Transpose_16x16`
+uses 4 passes × 16 SIMD16 movs = 64 movs. The theoretical minimum for a 16×16
+float→half transpose is also ~16–32 movs if the right GRF select patterns exist.
+Investigate whether the XMX pipe or a different select pattern can reduce the mov
+count below 32 while keeping the float→half downcast.
+
+**File**: `cm_sdpa_common.hpp` (`Transpose2DMatrix` call), `cm_attention_common.hpp`
+(`Transpose_16x16` implementation).
 
 ---
 

@@ -549,7 +549,6 @@ void sdpa_kernel_lsc_prefetch(
 
         matrix<half, REG_N, REG_K> P;
         Transpose2DMatrix(St, P);
-
         // Unified PV path: for kv_pos=0, cur_max was -3e38 so max_comp=exp(-inf)=0,
         // which zeroes rO before DPAS — identical to the explicit acc=0 of PV0.
         // No branch, no V prefetch here (already issued in K phase above).
