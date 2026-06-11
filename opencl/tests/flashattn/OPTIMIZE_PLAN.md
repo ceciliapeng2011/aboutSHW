@@ -209,16 +209,47 @@ Dropped. Same reason as item 6.
 |---|--------|--------|--------|
 | 1 | Mapping array replaces `need_wg_mapping` | Done | ~0% GPU perf, cleaner code |
 | 2 | V prefetch moved to K phase | Done | −1.7% to −6.2% |
-| 3 | Load/DPAS double-buffer (K) | Tried, reverted | Regression — compiler already schedules well for d=64 |
+| 3 | Load/DPAS double-buffer (K) | Tried ×2, reverted | Regression both times — 4 thread contexts already hide L1 stalls |
 | 4 | Pre-loop warm-up prefetch | Done (with 2) | Included in items 2+4+5 result |
 | 5 | Peel kv_pos=0 / unified PV path | Done (with 2) | Included in items 2+4+5 result |
 | 6 | Split head dimension (2 passes) | Tried, reverted | +71% regression — doubled kv cost, no occupancy benefit |
 | 7 | Reload rQ on-demand | Dropped | False premise (occupancy not the bottleneck) |
+| 8 | 2-step-ahead K prefetch + extra warm-up tile | Tried, reverted | ~0% — not prefetch-limited |
+| 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried, reverted | +14% regression on 2-seq — register spill (~128 GRF) costs more than softmax amortization saves |
+
+## ASM analysis (per kv iteration, d=64)
+
+Instruction profile in main loop body:
+- **12 dpas** (8 K-phase + 4 V-phase) @ ~32 cy XMX-pipe (hidden by 4 contexts)
+- **17 exp** (SIMD16 serial chain in `online_softmax_update`) @ ~43 cy MATH-pipe
+- **66 mov** for `Transpose2DMatrix(St→P)` @ ~66 cy ALU (pipelined with math)
+- **16 mul** for rO rescaling @ ~16 cy ALU
+
+The MATH pipe (exp) and XMX are balanced; neither is clearly dominant.
+**Root bottleneck**: both exp and DPAS are at capacity — to gain, we must amortize
+the per-kv overhead (softmax + transpose = ~130 cy) over more DPAS work.
+
+**Why wg_size=32 doesn't help**: `kv_step/wg_local_size = 16/32 = 0` → invalid prefetch descriptor. And total thread count is unchanged regardless.
+
+## Item 9: increase q_step to 32 (double Q-rows per thread)
+
+**Idea**: process 2 rows of Q per thread per kv iteration instead of 1. The softmax
+overhead (exp, max, sum, transpose) is per-kv-iter, not per-Q-row — it stays constant
+while DPAS work doubles. This improves the ratio of compute to softmax overhead.
+
+**Cost**:
+- `rO` doubles: `float[8 × 2 × 8 × 16]` = 8192 bytes = 256 GRF (uses full bank)
+- `rQ` doubles: `half[8 × 16 × 16]` = 4096 bytes = 128 GRF
+- Compiler may need `-Qxcm_register_file_size=256` relaxation or spill
+- wg dispatch: `q_step = CM_GRF_WIDTH//32 = 16` in Python — must be overridden
+
+**Alternative**: process 2 kv tiles per softmax call (batch-2 kv), keeping q_step=16.
+Same ratio improvement with no rO/rQ change. Harder to implement correctly.
 
 Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe):
 - Compute peak: ~20 TFLOPS FP16 XMX
 - Actual: ~10.6 TFLOPS (53% of peak)
 - Memory: 3.77 GB at 68 GB/s → 56 ms BW-bound vs 85 ms actual
 - Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
-- EU always has 4 thread contexts (large GRF mode, hardware-fixed) — occupancy is not the bottleneck
-- **Conclusion: slightly memory-bound; remaining gap is likely L1-hit latency on K/V loads**
+- EU always has 4 thread contexts (large GRF mode, hardware-fixed)
+- **Conclusion: math-pipe-bound on exp; amortize per-kv softmax cost over more DPAS work**

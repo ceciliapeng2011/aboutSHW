@@ -24,6 +24,10 @@ namespace KERNEL_NAME {
 #else
 #define USE_LSC 0
 #endif
+// Item 9: set USE_Q2=1 to process 2 Q-rows per thread (halves softmax overhead per token)
+#ifndef USE_Q2
+#define USE_Q2 0
+#endif
 
 // extern "C" _GENX_MAIN_ void cm_sdpa_vlen(
 _GENX_MAIN_ void KERNEL_NAME(
@@ -77,8 +81,14 @@ _GENX_MAIN_ void KERNEL_NAME(
     int kv_start        = cu_seqlens[seq_id];
     int seq_end         = cu_seqlens[seq_id + 1];
     int kv_seq_len      = seq_end - kv_start;
+#if USE_Q2
+    // Each thread covers 2*q_step tokens
+    int q_start         = block_start_pos + wg_local_id * (2*q_step);
+    int q_len           = 2*q_step;
+#else
     int q_start         = block_start_pos + wg_local_id * q_step;
     int q_len           = q_step;
+#endif
     if (q_start + q_len > seq_end)
         q_len = seq_end - q_start;
     if (q_len < 0) q_len = 0;
@@ -90,6 +100,18 @@ _GENX_MAIN_ void KERNEL_NAME(
 
 #if USE_LSC == 1
 #if USE_LSC_PREFETCH
+#if USE_Q2
+    sdpa_kernel_lsc_prefetch_q2<false, num_heads, num_kv_heads, head_size, 0, 16>(
+                                wg_local_id,
+                                q_start,
+                                kv_seq_len,
+                                q_len,
+                                kv_seq_len,
+                                reinterpret_cast<svmptr_t>(query + qo_offset),
+                                reinterpret_cast<svmptr_t>(key + kv_offset),
+                                reinterpret_cast<svmptr_t>(value + kv_offset),
+                                reinterpret_cast<svmptr_t>(output + qo_offset));
+#else
     sdpa_kernel_lsc_prefetch<false, num_heads, num_kv_heads, head_size, 0, 16>(
                                 wg_local_id,
                                 q_start,
@@ -100,6 +122,7 @@ _GENX_MAIN_ void KERNEL_NAME(
                                 reinterpret_cast<svmptr_t>(key + kv_offset),
                                 reinterpret_cast<svmptr_t>(value + kv_offset),
                                 reinterpret_cast<svmptr_t>(output + qo_offset));
+#endif
 #else
     sdpa_kernel_lsc<false, num_heads, num_kv_heads, head_size>(
                                 slm_K,
