@@ -172,12 +172,17 @@ a branch per iteration and prevents the compiler from fully scheduling the PV1 p
 
 The kernel uses ~163 GRFs/thread in large GRF mode (256 GRF bank per thread).
 
-**Correction:** On Xe2/Xe3, each EU has 64 KB register file divided into **4 fixed
-16 KB banks** (one per thread context). In large GRF mode each thread always occupies
-exactly one 16 KB bank regardless of how many of the 256 GRFs it actually uses.
-The hardware always runs **4 thread contexts per EU** — `floor(256/163)` does not apply.
-A thread using 163/256 GRFs wastes 93 GRFs within its bank but does not evict other
-thread contexts. **GRF reduction does not improve occupancy on this architecture.**
+**Xe3 has two GRF modes** (confirmed experimentally):
+- `-Qxcm_register_file_size=256`: 4 thread contexts/EU, 256 GRF (16 KB) each → 64 KB total
+- `-Qxcm_register_file_size=512`: 2 thread contexts/EU, 512 GRF (32 KB) each → 64 KB total
+
+In 256-GRF mode each thread always occupies exactly one 16 KB bank regardless of
+actual GRF usage — `floor(256/163)` does not apply. A thread using 163/256 GRFs
+wastes 93 GRFs but does not evict other thread contexts.
+
+**Switching to 512-GRF mode alone (q1, same work/thread) is neutral**: measured
+9.390 ms vs 9.386 ms baseline. Halving context count exactly cancels any per-context
+benefit — as expected since the kernel is not latency-limited by context switching.
 
 GRF budget (informational):
 - `rO`: `float[4 × 2 × 8 × 16]` = 4096 bytes = **128 GRFs** (FP32)
@@ -215,7 +220,7 @@ Dropped. Same reason as item 6.
 | 6 | Split head dimension (2 passes) | Tried, reverted | +71% regression — doubled kv cost, no occupancy benefit |
 | 7 | Reload rQ on-demand | Dropped | False premise (occupancy not the bottleneck) |
 | 8 | 2-step-ahead K prefetch + extra warm-up tile | Tried, reverted | ~0% — not prefetch-limited |
-| 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried, reverted | +14% regression on 2-seq — register spill (~128 GRF) costs more than softmax amortization saves |
+| 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried ×2, reverted | +16% regression — same with 256 GRF (spill) or 512 GRF (no spill, 2 ctx/EU); exp scales linearly with Q rows, no amortization |
 
 ## ASM analysis (per kv iteration, d=64)
 
@@ -250,9 +255,12 @@ The ratio is unchanged — there is **no amortization**. Both exp and DPAS scale
 linearly together. Item 9 regressed (+14%) purely from register spill;
 batch-2-kv would have the same ratio with cleaner GRF but still no gain.
 
-**`-Qxcm_register_file_size=512` does not help**: the hardware bank is 256 GRF
-(16 KB). Setting 512 just causes all excess GRFs to spill — worse than item 9's
-128-GRF overflow.
+**`-Qxcm_register_file_size=512` + item 9 confirmed no help** (measured):
+512-GRF mode is real on Xe3 (2 contexts/EU, 32 KB/thread), so item 9 compiles
+without spill. Result: 10.890 ms vs 9.386 ms baseline (+16%) — identical to the
+256-GRF spill result (10.873 ms). The regression is not from spill; it is from
+the math ratio being unchanged. Halving the context count from 4→2 provides no
+latency-hiding benefit because the kernel is math-pipe-bound, not memory-latency-bound.
 
 ---
 
