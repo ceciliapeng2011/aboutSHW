@@ -94,12 +94,12 @@ class page_atten_cm:
 
         wg_size = 16
         q_step = CM_GRF_WIDTH // 32
-        # head_size==256 partitions head_size across 4 workers per team (4 teams *
-        # 4 workers = 16 lanes per WG). Each team handles one q_step-sized q-slice,
+        # head_size==256 partitions head_size across 2 workers per team (8 teams *
+        # 2 workers = 16 lanes per WG). Each team handles one q_step-sized q-slice,
         # so wg_seq_len = num_team * q_step. For head_size!=256, num_team=wg_size and
         # num_worker=1, which is equivalent to wg_size * q_step.
         if head_size == 256:
-            num_team = 4
+            num_team = 8
             self.wg_seq_len = num_team * q_step
         else:
             self.wg_seq_len = wg_size * q_step
