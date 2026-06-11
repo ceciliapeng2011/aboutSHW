@@ -221,6 +221,9 @@ Dropped. Same reason as item 6.
 | 7 | Reload rQ on-demand | Dropped | False premise (occupancy not the bottleneck) |
 | 8 | 2-step-ahead K prefetch + extra warm-up tile | Tried, reverted | ~0% — not prefetch-limited |
 | 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried ×2, reverted | +16% regression — same with 256 GRF (spill) or 512 GRF (no spill, 2 ctx/EU); exp scales linearly with Q rows, no amortization |
+| 10 | kv_step=32 | Dropped | Same math ratio — exp scales with kv_step too; loop overhead saving is ALU-pipelined and invisible |
+| 11 | FP16 softmax | Rejected | Accuracy loss not acceptable |
+| 12 | Eliminate St→P transpose (~66 mov/iter) | **Next** | Only remaining item that changes per-iter ALU cost without touching the math ratio |
 
 ## ASM analysis (per kv iteration, d=64)
 
@@ -273,26 +276,41 @@ Per kv-iter the kernel runs:
 
 To improve, the only levers that change the ratio are:
 
-### 10. FP16 softmax (halve exp instruction count)
+### ~~10. kv_step=32~~ (not worth trying — same math ratio)
 
-`cm_exp` on SIMD16 FP32 = 1 math instruction covering 16 Q positions.
-If softmax runs in FP16, `cm_exp` on SIMD32 FP16 = 1 math instruction covering
-32 Q positions — **half the math instructions** for the same work.
+**Idea**: double the KV tile size so the main loop runs half as many iterations,
+amortizing per-iteration loop overhead over more DPAS work.
 
-`online_softmax_update` currently uses FP32 for numerical stability.
-FP16 range is ±65504 — more than enough for softmax with `scale_factor = 1/8`.
+**Why it won't help**: `online_softmax_update(St[rows=kv_step, cols=q_step])` runs
+`kv_step` exp calls on SIMD-`q_step` vectors. **Exp scales linearly with kv_step**:
 
-**Change**: template `online_softmax_update` to accept FP16 St and accumulate in
-FP16; convert `cur_max`/`cur_sum` to FP16 or keep FP32 and only exp in FP16.
+| kv_step | exp/iter | loop iters (seq=3432) | exp total/seq |
+|---------|----------|-----------------------|---------------|
+| 16 | 17 | 215 | 3655 |
+| 32 | 33 | 108 | 3564 |
 
-**Risk**: accuracy — softmax intermediate values can underflow/overflow in FP16
-if logits are large. Test with `check_close` after change.
+Per-KV-token ratio unchanged — same dead end as items 9 and batch-2-kv. The only
+saving is ~107 fewer iterations × ~25 ALU instructions (descriptor setup, counter,
+branch), but ALU pipelines with MATH on the 4-context model so this is invisible.
 
-**File**: `cm_attention_common.hpp` (`online_softmax_update`), `cm_sdpa_common.hpp`.
+**Register cost**: `St` grows from 16→32 GRF, `Kmat` doubles 4→8 GRF (~+20 GRF
+total, fits within 256). Implementation is also non-trivial: `kv_step` must be
+decoupled from `REG_K`, the transpose needs a new `[32×16]→[16×32]` overload, and
+the V-phase P matrix `[16,32]` must be split into two `[16,16]` DPAS tiles.
+
+**Conclusion**: dropped without experiment — the math ratio analysis is definitive.
 
 ---
 
-### 11. Eliminate explicit St→P transpose (remove 66 mov/iter)
+### ~~11. FP16 softmax~~ (rejected — accuracy loss not acceptable)
+
+Would halve exp instruction count (SIMD32 FP16 vs SIMD16 FP32 per instruction).
+Rejected: FP16 softmax intermediate values can underflow/overflow in production
+workloads; accuracy loss is not acceptable.
+
+---
+
+### 12. Eliminate explicit St→P transpose (remove ~66 mov/iter)
 
 `Transpose2DMatrix(St, P)` converts `float[16,16] St` → `half[16,16] P` (transpose
 + fp32→fp16), generating ~66 mov. This is needed because the V-DPAS uses P as the
@@ -323,5 +341,6 @@ raw 66-mov count suggests. Profile before assuming it's on the critical path.
 - Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
 - EU always has 4 thread contexts (large GRF mode, hardware-fixed)
 - **Current ceiling**: math-pipe exp and XMX DPAS both at ~40–50 cy/iter;
-  the only way to reduce wall-clock is to reduce exp instruction count (item 10)
-  or remove the 66-mov transpose (item 11)
+  exp count cannot be reduced without accuracy loss (FP16 rejected) or algorithmic
+  change (all batching strategies scale linearly); remaining candidate is
+  removing the ~66-mov St→P transpose (item 12)
