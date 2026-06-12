@@ -223,7 +223,12 @@ Dropped. Same reason as item 6.
 | 9 | Increase q_step to 32 (2 Q-rows per thread) | Tried ×2, reverted | +16% regression — same with 256 GRF (spill) or 512 GRF (no spill, 2 ctx/EU); exp scales linearly with Q rows, no amortization |
 | 10 | kv_step=32 | Dropped | Same math ratio — exp scales with kv_step too; loop overhead saving is ALU-pipelined and invisible |
 | 11 | FP16 softmax | Rejected | Accuracy loss not acceptable |
-| 12 | Eliminate St→P transpose (~66 mov/iter) | Upper-bound measured | −14% potential on 2-seq; transpose IS on critical path; full elimination blocked by softmax reduction layout; faster transpose variant **Next** |
+| 12 | Eliminate St→P transpose (~66 mov/iter) | Upper-bound measured | −14% potential on 2-seq; transpose IS on critical path; full elimination blocked by softmax reduction layout |
+| 13 | Fold log2e into Q pre-scale (`qscale = scale_factor * log2e`) | Done | Removes 16 mul/tile from softmax critical path; St lands in log2 domain so cm_exp needs no per-element ×log2e |
+| 14 | KV blocking (`KV_BLK=2`): amortize rO rescale over 2 tiles | Done | rO rescale (64 mul) runs once per 2 kv tiles instead of once per tile; unlike Q-row or kv_step doubling, exp count is unchanged (still per token) |
+| 15 | Tree reduction in `online_softmax_update_tree` | Done | Max/sum reduction depth log₂(BLK_ROWS)=5 vs linear chain depth 31 for BLK_ROWS=32; shorter loop-carried dependency chain |
+| 16 | `transpose_St_to_P_half`: narrow float→half before shuffling | Done | Cast float→half first, then run 4-pass GRF shuffle on 16-bit data; halves the data-path width of each select mov (~32 effective data-movement ops vs ~64) |
+| 13–16 combined | Items 13–16 (commit 0621405) | **Done — 9.25 ms → 7.654 ms (−17%)** | 2-seq × 3432 target; best improvement so far |
 
 ## ASM analysis (per kv iteration, d=64)
 
@@ -348,6 +353,83 @@ count below 32 while keeping the float→half downcast.
 
 ---
 
+### 13. Fold log2e into Q pre-scale
+
+**Problem:** `online_softmax_update` computes `St[r] = cm_exp((St[r] - new_max) * log2e)`.
+The `* log2e` is 16 SIMD16 FP32 multiplies per kv row, serialized on the ALU after
+the subtract, on the softmax critical path.
+
+**Fix:** Pre-multiply Q at load time by `qscale = scale_factor * log2e` (a compile-time
+constant). `St = K @ Q^T` then already represents log2-scaled dot products. The softmax
+reduces to `cm_exp(St[r] - new_max)` with no per-element multiply. The math is
+identical — only the constant folded into Q changes.
+
+**Savings:** 16 mul/tile removed from the softmax critical path (once per kv tile, not
+amortized — a true reduction in work).
+
+**File:** `cm_sdpa_common.hpp` (`sdpa_kernel_lsc_prefetch`, Q load section).
+
+---
+
+### 14. KV blocking (`KV_BLK=2`): amortize rO rescale over multiple tiles
+
+**Problem:** The rO rescale (`rO[t] *= max_comp`) runs once per kv tile — 8 (tiles) ×
+8 (REG_M rows) = 64 SIMD16 multiplies per tile, serialized on the ALU.
+
+**Why this works when items 9/10 didn't:** Items 9 and 10 tried to amortize by
+increasing Q-rows or kv_step. Both cause exp count to scale linearly with the tile
+size — no ratio improvement. Here, `BLK_ROWS = KV_BLK × kv_step` increases the exp
+count proportionally (32 exp rows per block vs 16), but the rO rescale is done
+**once per block** regardless of KV_BLK. The rO rescale is *not* a per-KV-token cost
+— it is a per-online-softmax-update cost. Doubling block size doubles the KV tokens
+per rescale, halving the amortized rescale cost per token.
+
+**Savings:** 64 mul per 2 tiles → 32 amortized mul/tile. 32 mul/tile saved, off the
+serial ALU path.
+
+**File:** `cm_sdpa_common.hpp` (outer loop restructured to `kv_base += BLK_ROWS`).
+
+---
+
+### 15. Tree reduction in `online_softmax_update_tree`
+
+**Problem:** With `BLK_ROWS=32`, the max/sum reduction in `online_softmax_update`
+runs a linear chain of 32 `cm_max`/`cm_add` calls. Dependency depth = 31 — each
+instruction waits for the previous result.
+
+**Fix:** `online_softmax_update_tree` folds pairs into a scratch buffer and reduces
+with a balanced binary tree: depth = log₂(32) = 5. The compiler can schedule
+instructions within each independent pair freely.
+
+**Constraint:** Requires `rows` to be a power of two (enforced by `static_assert`).
+`BLK_ROWS = KV_BLK × kv_step` with `KV_BLK` a power of two satisfies this for
+all practical values (KV_BLK=1,2,4).
+
+**File:** `cm_sdpa_common.hpp` (new function `online_softmax_update_tree`).
+
+---
+
+### 16. `transpose_St_to_P_half`: narrow float→half before GRF shuffle
+
+**Problem:** The generic `Transpose_16x16<float,half>` runs the 4-pass `select<2,1,8,2>`
+shuffle on 32-bit float data. Each select moves 16 elements × 4 bytes = 512 bytes/row,
+so the ALU data-path works at full 32-bit width throughout all 4 passes (64 SIMD16 movs
+total), then converts to half in the final assignment.
+
+**Fix:** `transpose_St_to_P_half` casts float→half first (16 SIMD16 narrow-converts,
+~16 cycles), then calls `Transpose_16x16<half,half>`. Each select now moves
+16 elements × 2 bytes = 256 bytes/row — half the data-path pressure. Total cost:
+~16 (cast) + 64 (half-width shuffle) ≈ 80 half-width-equivalent ops vs 64
+full-width ops — roughly neutral in instruction count but narrower data movement
+may reduce ALU stall time depending on GRF bank conflicts.
+
+**Note:** The net benefit of this item alone is uncertain without measurement; it
+is included in commit 0621405 together with items 13–15.
+
+**File:** `cm_sdpa_common.hpp` (new function `transpose_St_to_P_half`).
+
+---
+
 ## Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe)
 
 - Compute peak: ~20 TFLOPS FP16 XMX
@@ -355,7 +437,5 @@ count below 32 while keeping the float→half downcast.
 - Memory: 3.77 GB at 68 GB/s → 56 ms BW-bound vs 85 ms actual
 - Arithmetic intensity: 240 FLOP/byte; ridge point: ~295 FLOP/byte
 - EU always has 4 thread contexts (large GRF mode, hardware-fixed)
-- **Current ceiling**: math-pipe exp and XMX DPAS both at ~40–50 cy/iter;
-  exp count cannot be reduced without accuracy loss (FP16 rejected) or algorithmic
-  change (all batching strategies scale linearly); remaining candidate is
-  removing the ~66-mov St→P transpose (item 12)
+- **After items 13–16** (commit 0621405): 9.25 ms → **7.654 ms (−17%)** on 2-seq × 3432;
+  best single-commit improvement in this optimization campaign

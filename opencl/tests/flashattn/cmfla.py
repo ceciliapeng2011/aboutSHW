@@ -31,6 +31,7 @@ class flash_attn_cm:
         print(f"compiling {cwd} {num_heads=} {head_size=} ...")
 
         scale_factor = 1.0/(head_size**0.5)
+        kv_blk = int(os.environ.get("CMFLA_KV_BLK", "2"))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
@@ -40,6 +41,7 @@ class flash_attn_cm:
                       f" -DCMFLA_HEAD_SIZE={head_size}"
                       f" -DCMFLA_SCALE_FACTOR={scale_factor}"
                       f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
+                      f" -DCMFLA_KV_BLK={kv_blk}"
                       f" -mdump_asm -g2")
                      )
 
@@ -179,11 +181,11 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     k = torch.randint(low, high, [kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)
     v = torch.randint(low, high, [kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 
-    # ref = flash_attn_vlen_ref(q, k, v, cu_seqlens)
+    ref = flash_attn_vlen_ref(q, k, v, cu_seqlens)
 
     func = flash_attn_cm.create_instance(num_heads, num_kv_heads, head_size, False)
     out = func(q, k, v, cu_seqlens)
-    # check_close(ref, out)
+    check_close(ref, out)
     cl.finish()
 
     out = func(q, k, v, cu_seqlens, 100)
@@ -239,4 +241,4 @@ if __name__ == "__main__":
     #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
     
     test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 64)
-    test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64)
+    # test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64)

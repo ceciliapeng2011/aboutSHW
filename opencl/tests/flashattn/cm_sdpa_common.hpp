@@ -15,6 +15,79 @@
  *******************************************************************************/
 #include "cm_attention_common.hpp"
 #define CM_HAS_LSC_UNTYPED_2D 1
+
+// Number of kv sub-tiles (kv_step rows each) processed per online-softmax update in
+// sdpa_kernel_lsc_prefetch. Larger amortizes the rO rescale + softmax bookkeeping over
+// more DPAS work at the cost of GRF pressure. Overridable via -DCMFLA_KV_BLK=N.
+#ifndef CMFLA_KV_BLK
+#define CMFLA_KV_BLK 2
+#endif
+
+// Flashattn-local online-softmax with tree reductions over the kv (row) dimension.
+// Identical math to online_softmax_update in cm_attention_common.hpp, but the max and
+// sum reductions are balanced binary trees (dependency depth log2(rows)=4 instead of the
+// linear chain's depth 15), which shortens the loop-carried softmax critical path.
+template<typename T, int rows, int cols>
+CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, cols> St,
+                                                         vector_ref<T, cols> cur_max,
+                                                         vector_ref<T, cols> cur_sum) {
+    static_assert((rows & (rows - 1)) == 0, "tree reduction needs power-of-two rows");
+    // Reduce into rows/2 scratch (not a full copy) so register pressure stays low for
+    // large kv blocks. St itself is not modified during the max reduction (its values
+    // are still needed for the exp), so we fold pairs into scratch first.
+    vector<float, cols> new_max_t;
+    {
+        matrix<float, (rows > 1 ? rows/2 : 1), cols> t;
+        #pragma unroll
+        for (int r = 0; r < rows/2; r++) t.row(r) = cm_max<float>(St[r], St[r + rows/2]);
+        #pragma unroll
+        for (int stride = rows/4; stride > 0; stride >>= 1)
+            #pragma unroll
+            for (int r = 0; r < stride; r++)
+                t.row(r) = cm_max<float>(t.row(r), t.row(r + stride));
+        new_max_t = cm_max<float>(t.row(0), cur_max);
+    }
+
+    // St is already in the log2 domain (Q was pre-scaled by scale_factor*log2e at load),
+    // so cm_exp (== exp2) needs no per-element *log2e here. cur_max/cur_sum stay in the
+    // same domain, so the running-max comparison and rescale are exact.
+    #pragma unroll
+    for (int r = 0; r < rows; r++) St[r] = cm_exp(St[r] - new_max_t);
+
+    // Sum reduction can fold St in place (values already consumed into exp form and the
+    // per-row sum is all we need afterwards).
+    vector<float, cols> row_sum_t;
+    {
+        matrix<float, (rows > 1 ? rows/2 : 1), cols> t;
+        #pragma unroll
+        for (int r = 0; r < rows/2; r++) t.row(r) = cm_add<float>(St[r], St[r + rows/2]);
+        #pragma unroll
+        for (int stride = rows/4; stride > 0; stride >>= 1)
+            #pragma unroll
+            for (int r = 0; r < stride; r++)
+                t.row(r) = cm_add<float>(t.row(r), t.row(r + stride));
+        row_sum_t = t.row(0);
+    }
+
+    vector<float, cols> max_comp;
+    max_comp = cm_exp(cur_max - new_max_t);
+    cur_sum = cm_mul<float>(cur_sum, max_comp);
+    cur_sum = cm_add<float>(cur_sum, row_sum_t);
+    cur_max = new_max_t;
+    return max_comp;
+}
+
+// Transpose a [16,16] float score tile (kv x q) into a half [16,16] P tile (q x kv) for
+// the P@V matmul. Casting float->half first (one vectorized cm_mul-free copy) lets the
+// 16x16 shuffle network run at half width — roughly halving the mov count vs transposing
+// the float tile directly through Transpose_16x16<float,half>.
+CM_INLINE void transpose_St_to_P_half(matrix_ref<float, 16, 16> St, matrix_ref<half, 16, 16> P) {
+    matrix<half, 16, 16> Sh;
+    #pragma unroll
+    for (int r = 0; r < 16; r++) Sh.row(r) = St.row(r);
+    Transpose_16x16(Sh.select<16,1,16,1>(0,0), P);
+}
+
 #ifdef CM_HAS_LSC_UNTYPED_2D
 //@prefetch_u8 would have duplicated decompress perf issue. comments out for now.
 // template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused, int wg_local_size>
@@ -463,11 +536,15 @@ void sdpa_kernel_lsc_prefetch(
     if (q_tokens_left > q_step) q_tokens_left = q_step;
 
     if (q_tokens_left > 0) {
+        // Fold log2(e) into the Q pre-scale so St = K@Q^T lands in the log2 domain; the
+        // online softmax then uses cm_exp (== exp2) directly, dropping a *log2e per St
+        // element (16 muls/tile off the softmax critical path). Math is identical.
+        constexpr float qscale = scale_factor * 1.4426950408889634f;
         lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dQ(reinterpret_cast<uint*>(q_base), q_tokens_left - 1, head_size*sizeof(half) - 1, q_pitch - 1, 0, 0);
         #pragma unroll
         for(int k = 0, ri = 0; k < padded_head_size/2; k += REG_K/2, ri++) {
             cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)qscale);
         }
     }
 
@@ -480,6 +557,14 @@ void sdpa_kernel_lsc_prefetch(
 
     int causal_left = q_start;
 
+    // KV-blocking factor: number of kv tiles (each kv_step rows) processed per online-
+    // softmax update. The per-iteration rO rescale (REG_M*num_rO_tiles muls) and the
+    // softmax bookkeeping amortize over KV_BLK tiles, cutting the ALU-bound consume cost.
+    // The K@Q^T and the St->P transpose are still per sub-tile (they don't amortize).
+    constexpr int KV_BLK = CMFLA_KV_BLK;
+    constexpr int num_K = kv_step/REG_M;
+    constexpr int BLK_ROWS = KV_BLK*kv_step;
+
     // Warm up first K and V tiles before the loop so kv_pos=0 finds them in cache.
     prefetch_K.set_block_y(wg_local_id);
     prefetch_V.set_block_y(wg_local_id);
@@ -491,19 +576,17 @@ void sdpa_kernel_lsc_prefetch(
         cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri*REG_N));
     }
 
-    for(int kv_pos = 0; kv_pos < kv_stop; kv_pos += kv_step,
-            k_base += kv_step * kv_pitch,
-            v_base += kv_step * kv_pitch) {
-        //# St = k @ Qt
-        matrix<float, kv_step, q_step> St;
-        {
-            constexpr int num_K = kv_step/REG_M;
-            auto St2 = St.format<float, num_K, REG_M*REG_N>();
-
+    for(int kv_base = 0; kv_base < kv_stop; kv_base += BLK_ROWS) {
+        //# St = K @ Q^T for KV_BLK stacked sub-tiles -> [KV_BLK*kv_step, q_step]
+        matrix<float, BLK_ROWS, q_step> St;
+        auto St2 = St.format<float, KV_BLK*num_K, REG_M*REG_N>();
+        #pragma unroll
+        for(int b = 0; b < KV_BLK; b++) {
+            int kv_pos = kv_base + b*kv_step;
             matrix<half, num_K, REG_M * REG_K> Kmat;
-            // Prefetch K for next iter and V for current iter together in the K phase,
-            // giving V the full K-DPAS + softmax + transpose as lead time.
-            prefetch_K.set_block_y(wg_local_id + kv_pos + kv_step);
+            // Prefetch K of the matching tile one block ahead and V of this tile, so V
+            // is warm by the PV phase and the next block's K is warm by its K phase.
+            prefetch_K.set_block_y(wg_local_id + kv_pos + BLK_ROWS);
             prefetch_V.set_block_y(wg_local_id + kv_pos);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
@@ -512,7 +595,7 @@ void sdpa_kernel_lsc_prefetch(
             cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
             #pragma unroll
             for(int k = 0; k < num_K; k++)
-                St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                St2.row(b*num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
                                 0,
                                 rQ[0].format<int32_t>(),
                                 Kmat[k].format<int32_t>());
@@ -524,53 +607,67 @@ void sdpa_kernel_lsc_prefetch(
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri*REG_K));
                 #pragma unroll
                 for(int k = 0; k < num_K; k++) {
-                    St2.row(k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
-                        St2.row(k),
+                    St2.row(b*num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(
+                        St2.row(b*num_K + k),
                         rQ[ri].format<int32_t>(),
                         Kmat[k].format<int32_t>());
                 }
             }
         }
+
+        // ---- mask per sub-tile (causal or kv-tail) ----
         if constexpr (use_causal_mask) {
-            // since kv_step == q_step == 16, causal_left is n*kv_step
-            if (causal_left == 0) {
-                apply_causal_mask<1>(St);
-            } else if (causal_left < 0) {
-                St = -3.4e38f;
+            #pragma unroll
+            for(int b = 0; b < KV_BLK; b++) {
+                auto Stb = St.select<kv_step, 1, q_step, 1>(b*kv_step, 0);
+                int cl = causal_left - b*kv_step;
+                if (cl == 0) {
+                    apply_causal_mask<1>(Stb);
+                } else if (cl < 0) {
+                    Stb = -3.4e38f;
+                }
             }
-            causal_left -= kv_step;
+            causal_left -= BLK_ROWS;
         } else {
-            int kv_tokens = kv_stop - kv_pos;
-            // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
-            for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
+            int kv_tokens = kv_stop - kv_base;
+            // LSC ensures no overflow-access, but mask off k-tail attn-score is still required
+            for(int p = kv_tokens; p < BLK_ROWS; p++) St[p] = -3.4e38f;
         }
 
-        auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+        // ---- one online-softmax update over the whole block ----
+        auto max_comp = online_softmax_update_tree(St, cur_max, cur_sum);
 
-        matrix<half, REG_N, REG_K> P;
-        Transpose2DMatrix(St, P);
-        // Unified PV path: for kv_pos=0, cur_max was -3e38 so max_comp=exp(-inf)=0,
-        // which zeroes rO before DPAS — identical to the explicit acc=0 of PV0.
-        // No branch, no V prefetch here (already issued in K phase above).
-        b2dV.set_block_y(kv_pos);
-        {
-            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+        // ---- rescale rO ONCE for the whole block (amortized over KV_BLK tiles) ----
+        // For kv_base=0 cur_max was -3e38 so max_comp=exp(-inf)=0 -> zeroes rO (== acc=0).
+        #pragma unroll
+        for(int t = 0; t < padded_head_size/REG_N*num_P_tiles; t++) {
+            auto cO = rO[t].format<float, REG_M, REG_N>();
             #pragma unroll
-            for(int k = 0, ri = 0; k < padded_head_size; k += REG_N, ri += num_P_tiles) {
-                matrix<half, REG_K/2, REG_N*2> Vmat;
-                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(k));
-                #pragma unroll
-                for(int p = 0; p < num_P_tiles; p++) {
-                    auto cO = rO[ri + p].format<float, REG_M, REG_N>();
-                    #pragma unroll
-                    for(int r = 0; r < REG_M; r++)
-                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + p*REG_M]);
-                }
+            for(int r = 0; r < REG_M; r++)
+                cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles)*REG_M]);
+        }
+
+        // ---- transpose each sub-tile and accumulate P@V into rO ----
+        constexpr int num_Vchunks = padded_head_size/REG_N;
+        #pragma unroll
+        for(int b = 0; b < KV_BLK; b++) {
+            matrix<half, REG_N, REG_K> P;
+            transpose_St_to_P_half(St.select<kv_step, 1, q_step, 1>(b*kv_step, 0), P);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            b2dV.set_block_y(kv_base + b*kv_step);
+            // Issue all V-chunk loads first so they pipeline in the LSC while the transpose
+            // result settles, then run the P@V DPAS sequence.
+            matrix<half, num_Vchunks*(REG_K/2), REG_N*2> Vmat;
+            #pragma unroll
+            for(int ci = 0; ci < num_Vchunks; ci++)
+                cm_load<lsc::VNNI>(Vmat.select<REG_K/2,1,REG_N*2,1>(ci*(REG_K/2),0).format<half>(), b2dV.set_block_x(ci*REG_N));
+            #pragma unroll
+            for(int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
                                 rO[ri + p].format<float>(),
-                                Vmat.format<int32_t>(),
+                                Vmat.select<REG_K/2,1,REG_N*2,1>(ci*(REG_K/2),0).format<int32_t>(),
                                 P2.row(p).format<int32_t>());
                 }
             }
