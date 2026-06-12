@@ -105,7 +105,7 @@ void pa_lsc_u8(
         #pragma unroll
         for (int k = 0, ri = 0; k < head_size / 2; k += REG_K / 2, ri++) {
             cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_scale_factor);
         }
     }
 
@@ -654,7 +654,7 @@ void pa_kernel_lsc_prefetch_f16(
     #pragma unroll
     for(int k = 0, ri = 0; k < head_size/2; k += REG_K/2, ri++) {
         cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-        rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+        rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_scale_factor);
     }
 
     lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(half) - 1, k_pitch - 1, 0, 0);

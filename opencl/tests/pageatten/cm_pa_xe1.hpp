@@ -87,7 +87,7 @@ void pa_lsc_u8(
                                     CacheHint::Cached,
                                     CacheHint::Cached>(q_gather, gather_offsets, gather_pred);
             rQ[ri].format<uint>()  = gathered;
-            rQ[ri].format<half>()  = cm_mul<half>(rQ[ri].format<half>(), (half)scale_factor);
+            rQ[ri].format<half>()  = cm_mul<half>(rQ[ri].format<half>(), (half)q_scale_factor);
         }
     }
 #if KV_CACHE_COMPRESSION == 1

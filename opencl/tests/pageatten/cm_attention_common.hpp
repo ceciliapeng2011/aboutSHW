@@ -24,6 +24,8 @@ static_assert(__cplusplus >= 201703L);
 #define q_step   REG_N
 
 constexpr float scale_factor = CMFLA_SCALE_FACTOR;
+constexpr float log2e = 1.4426950408889634f;
+constexpr float q_scale_factor = scale_factor * log2e;
 
 static_assert(q_step == 16 || q_step == 8);
 static_assert(kv_step == 16);
@@ -300,12 +302,10 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     for(int r = 2; r < St.n_rows(); r++) new_max_t = cm_max<float>(new_max_t, St[r]);
     new_max_t = cm_max<float>(new_max_t, cur_max);
 
-    // Pt = torch.exp(St - new_max)
-    constexpr float log2e = 1.4426950408889634f;
 #ifdef ABLATE_NO_EXP
-    for(int r = 0; r < St.n_rows(); r++) St[r] = (St[r] - new_max_t)*log2e;
+    for(int r = 0; r < St.n_rows(); r++) St[r] = (St[r] - new_max_t);
 #else
-    for(int r = 0; r < St.n_rows(); r++) St[r] = cm_exp((St[r] - new_max_t)*log2e);
+    for(int r = 0; r < St.n_rows(); r++) St[r] = cm_exp(St[r] - new_max_t);
 #endif
 
     vector<float, cols> row_sum_t;
@@ -313,7 +313,7 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     for(int r = 2; r < St.n_rows(); r++) row_sum_t = cm_add<float>(row_sum_t, St[r]);
 
     vector<float, cols> max_comp;
-    max_comp = cm_exp((cur_max - new_max_t)*log2e);
+    max_comp = cm_exp(cur_max - new_max_t);
     cur_sum = cm_mul<float>(cur_sum, max_comp);
     cur_sum = cm_add<float>(cur_sum, row_sum_t);
     cur_max = new_max_t;

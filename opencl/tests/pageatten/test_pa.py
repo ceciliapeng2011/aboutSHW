@@ -98,7 +98,7 @@ class page_atten_cm:
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
-        print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=} {self.compressed_kvcache}...")
+        print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=} {self.compressed_kvcache=}...")
 
         scale_factor = 1.0/(head_size**0.5)
         self.kernels = cl.kernels(src1,
