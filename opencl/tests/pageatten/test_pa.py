@@ -1156,7 +1156,7 @@ if __name__ == "__main__":
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
+        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
 
         for sparse_block_sz in sparse_block_sizes:
             for density in densities:
@@ -1171,7 +1171,21 @@ if __name__ == "__main__":
         # Keep runtime bounded for CI/timeout runs (e.g. `timeout 120s python test_pa.py`).
         smoke_perf_test(
             blocks_per_trunk=16,
+            compressed_kvcache=KV_CACHE_COMPRESSION_NONE,
+            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+            sparse_block_sizes=(256,),
+            densities=(1.0, 0.33),
+        )
+        smoke_perf_test(
+            blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
+            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+            sparse_block_sizes=(256,),
+            densities=(1.0, 0.33),
+        )
+        smoke_perf_test(
+            blocks_per_trunk=16,
+            compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
             sparse_block_sizes=(256,),
             densities=(1.0, 0.33),
