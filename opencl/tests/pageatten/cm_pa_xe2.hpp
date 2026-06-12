@@ -345,7 +345,7 @@ void pa_lsc_u8(
                     auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
                     matrix<half, REG_N, REG_K> P;
-                    Transpose2DMatrix(St, P);
+                    transpose_St_to_P_half(St, P);
 
                     if (first_active) {
                         ugemm_PV0(slm_V, P, rO, slm_offset);
@@ -531,7 +531,7 @@ void pa_lsc_u8(
             auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
             matrix<half, REG_N, REG_K> P;
-            Transpose2DMatrix(St, P);
+            transpose_St_to_P_half(St, P);
 
             if (first_active) {
                 ugemm_PV0(slm_V, P, rO, slm_offset);
@@ -747,7 +747,7 @@ void pa_kernel_lsc_prefetch_f16(
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
-        Transpose2DMatrix(St, P);
+        transpose_St_to_P_half(St, P);
 
         prefetch_V.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+prefetch_block_id*blk_stride));
         prefetch_V.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);
@@ -888,7 +888,7 @@ void pa_kernel_lsc_prefetch_f16(
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
-        Transpose2DMatrix(St, P);
+        transpose_St_to_P_half(St, P);
 
         prefetch_V.set_base_ptr((reinterpret_cast<half*>(v_cache_base)+prefetch_block_id*blk_stride));
         prefetch_V.set_block_y((prefetch_kv_pos + wg_local_id) % CMPA_BLOCK_SZ);

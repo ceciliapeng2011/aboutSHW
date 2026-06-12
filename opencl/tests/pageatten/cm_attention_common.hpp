@@ -428,3 +428,14 @@ inline void prepackAsVNNIWidth2(matrix_ref<T1, K, N> input, matrix_ref<T2, K/2, 
         out.row(r).select<N, 2>(1) = input.row(r*2+1);
     }
 }
+
+// Transpose a [16,16] float score tile (kv x q) into a half [16,16] P tile (q x kv) for
+// the P@V matmul. Casting float->half first (one vectorized cm_mul-free copy) lets the
+// 16x16 shuffle network run at half width — roughly halving the mov count vs transposing
+// the float tile directly through Transpose_16x16<float,half>.
+CM_INLINE void transpose_St_to_P_half(matrix_ref<float, 16, 16> St, matrix_ref<half, 16, 16> P) {
+    matrix<half, 16, 16> Sh;
+    #pragma unroll
+    for (int r = 0; r < 16; r++) Sh.row(r) = St.row(r);
+    Transpose_16x16(Sh.select<16,1,16,1>(0,0), P);
+}

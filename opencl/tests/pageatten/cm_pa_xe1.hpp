@@ -293,7 +293,7 @@ void pa_lsc_u8(
             auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
             matrix<half, REG_N, REG_K> P;
-            Transpose2DMatrix(St, P);
+            transpose_St_to_P_half(St, P);
 
             if (first_active) {
                 ugemm_PV0(slm_V, P, rO, slm_offset);
@@ -517,7 +517,7 @@ void pa_kernel_lsc_prefetch_f16(
         auto max_comp = online_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
-        Transpose2DMatrix(St, P);
+        transpose_St_to_P_half(St, P);
 
         auto P_vec = P.format<half, REG_M, REG_K>();
         matrix<half, REG_K/2, REG_N*2*VALUE_TILE_NUM> Vmat;

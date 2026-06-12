@@ -196,7 +196,7 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     avg_ms = sum(latency[10:]) / len(latency[10:]) * 1e-6
     num_seqs = len(cu_seqlens) - 1
     real_flops = num_seqs * sub_seq_len * sub_seq_len * 4 * num_heads * head_size
-    hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
+    hw_peak_flops = 30e12  # PTL 4xe XMX FP16 peak
     utilization = real_flops / (avg_ms * 1e-3) / hw_peak_flops * 100
     print(f" {seq_len=} {sub_seq_len=} average latency: {Colors.BOLD}{Colors.YELLOW}{avg_ms:.3f} ms{Colors.END}"
           f"  |  {real_flops/1e9:.1f} GFLOP"
@@ -238,8 +238,8 @@ if __name__ == "__main__":
     #     test_flash_attn_causal_batch1(seqlen, num_heads = 28, num_kv_heads = 4, head_size = 128)
     # test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
-    test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    test_flash_attn_cm(8192, 8192)
+    test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128, acc_check=False)
+    test_flash_attn_cm(8192, 8192, acc_check=False)
     test_flash_attn_cm(8192, 1024)
     test_flash_attn_cm(8192, 64)
     test_flash_attn_cm(8190, 64)

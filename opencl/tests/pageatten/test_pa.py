@@ -98,7 +98,7 @@ class page_atten_cm:
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
-        print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=}...")
+        print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=} {self.compressed_kvcache}...")
 
         scale_factor = 1.0/(head_size**0.5)
         self.kernels = cl.kernels(src1,
@@ -718,6 +718,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             # print(f"============ block_mask.shape={approx_simple_mask.shape}")
             # print(f"============ block_mask={approx_simple_mask}")
             effective_density = 1.0 - percentage / 100.0
+            effective_density = min(effective_density, 1.0)  # clamp to 1.0 in case the loaded mask is denser than requested
     else:
         approx_simple_mask, effective_density = None, 1.0
 
@@ -752,7 +753,6 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         else:
             check_close(ref, out)
     else:
-        roofline = 293.27 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else 293.20
         warmup = 5
         rep = 15
         latency = pa_cm.run_perf(q, k, v, approx_simple_mask, n_warmup=warmup, n_iters=rep, deterministic_block_indices=True)
@@ -780,14 +780,18 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             else:
                 total_min = total_max = total_avg = 0.0
             mfu = total_flops / (total_avg * 1e6) if total_avg > 0 else 0.0
-            meet = (roofline * effective_density / total_avg) if total_avg > 0 else 0.0
+            hw_peak_flops = 30e12  # PTL 4xe XMX FP16 peak
+            utilization = total_flops / (total_avg * 1e-3) / hw_peak_flops * 100 if total_avg > 0 else 0.0
             density_note = (
                 f"density req/eff {requested_density:.2f}/{effective_density:.2f}"
             )
             print(
                 f"[total]: PA_causal {sparse_block_sz=} {seq_len=} , {num_trunks=}, {density_note}, compressKVCache {compressed_kvcache}, "
-                f"MFU {mfu:,.0f} GFLOPS, latency(ms): min={total_min:.3f} avg={total_avg:.3f} max={total_max:.3f}, "
-                f"meet: {meet:.2f}"
+                f"MFU {Colors.BOLD}{Colors.GREEN}{mfu:,.0f}{Colors.END} GFLOPS, "
+                f"latency(ms): min={Colors.BOLD}{Colors.YELLOW}{total_min:.3f}{Colors.END} "
+                f"avg={Colors.BOLD}{Colors.YELLOW}{total_avg:.3f}{Colors.END} "
+                f"max={Colors.BOLD}{Colors.YELLOW}{total_max:.3f}{Colors.END}, "
+                f"{Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak"
             )
             # print(f'====================================================================================')
 
