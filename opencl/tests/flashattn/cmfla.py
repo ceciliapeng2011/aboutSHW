@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import functools
 
 from clops import cl
+from clops.utils import Colors
 import os
 
 import numpy as np
@@ -31,7 +32,8 @@ class flash_attn_cm:
         print(f"compiling {cwd} {num_heads=} {head_size=} ...")
 
         scale_factor = 1.0/(head_size**0.5)
-        kv_blk = int(os.environ.get("CMFLA_KV_BLK", "2"))
+        default_kv_blk = 2 if head_size <= 64 else 1
+        kv_blk = int(os.environ.get("CMFLA_KV_BLK", str(default_kv_blk)))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
@@ -164,7 +166,7 @@ def check_close(input, other, atol=1e-3, rtol=1e-3):
         print(f"    other_tensor: {other[not_close_indices]}")
         assert 0
 
-def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80):
+def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, acc_check = True):
     cl.profiling(True)
     torch.manual_seed(0)
     torch.set_printoptions(linewidth=1024)
@@ -172,7 +174,7 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     import numpy as np
     q_len = kv_len = seq_len
     cu_seqlens = torch.tensor([i for i in range(0, seq_len, sub_seq_len)] + [seq_len], dtype=torch.int32)
-    print(f'{cu_seqlens=}')
+    # print(f'{cu_seqlens=}')
 
     low = -1
     high = 2
@@ -181,17 +183,24 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     k = torch.randint(low, high, [kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)
     v = torch.randint(low, high, [kv_len, num_kv_heads, head_size]).to(dtype=act_dtype)/high
 
-    ref = flash_attn_vlen_ref(q, k, v, cu_seqlens)
-
     func = flash_attn_cm.create_instance(num_heads, num_kv_heads, head_size, False)
-    out = func(q, k, v, cu_seqlens)
-    check_close(ref, out)
+    out = func(q, k, v, cu_seqlens) # warmup
+    if acc_check:
+        ref = flash_attn_vlen_ref(q, k, v, cu_seqlens)
+        check_close(ref, out)
     cl.finish()
 
     out = func(q, k, v, cu_seqlens, 100)
     latency = cl.finish()
     # for i,ns in enumerate(latency): print(f"[{i}]  {ns*1e-6:.3f} ms")
-    print(f" {seq_len=} {sub_seq_len=} average latency: {sum(latency[10:])/len(latency[10:])*1e-6:.3f} ms")
+    avg_ms = sum(latency[10:]) / len(latency[10:]) * 1e-6
+    num_seqs = len(cu_seqlens) - 1
+    real_flops = num_seqs * sub_seq_len * sub_seq_len * 4 * num_heads * head_size
+    hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
+    utilization = real_flops / (avg_ms * 1e-3) / hw_peak_flops * 100
+    print(f" {seq_len=} {sub_seq_len=} average latency: {Colors.BOLD}{Colors.YELLOW}{avg_ms:.3f} ms{Colors.END}"
+          f"  |  {real_flops/1e9:.1f} GFLOP"
+          f"  |  {Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak")
 
 
 def test_flash_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80):
@@ -229,16 +238,17 @@ if __name__ == "__main__":
     #     test_flash_attn_causal_batch1(seqlen, num_heads = 28, num_kv_heads = 4, head_size = 128)
     # test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
-    # test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    # test_flash_attn_cm(8192, 8192)
-    # test_flash_attn_cm(8192, 1024)
-    # test_flash_attn_cm(8192, 64)
-    # test_flash_attn_cm(8190, 64)
+    test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    test_flash_attn_cm(8192, 8192)
+    test_flash_attn_cm(8192, 1024)
+    test_flash_attn_cm(8192, 64)
+    test_flash_attn_cm(8190, 64)
     # test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
     
     # for seqlen in range(1, 1055, 1):
     #     for sub_seq_len in range(1, 64, 1):
     #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
     
+    test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 72)
     test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 64)
-    # test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64)
+    test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64, acc_check=False)

@@ -655,19 +655,15 @@ void sdpa_kernel_lsc_prefetch(
             transpose_St_to_P_half(St.select<kv_step, 1, q_step, 1>(b*kv_step, 0), P);
             auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
             b2dV.set_block_y(kv_base + b*kv_step);
-            // Issue all V-chunk loads first so they pipeline in the LSC while the transpose
-            // result settles, then run the P@V DPAS sequence.
-            matrix<half, num_Vchunks*(REG_K/2), REG_N*2> Vmat;
-            #pragma unroll
-            for(int ci = 0; ci < num_Vchunks; ci++)
-                cm_load<lsc::VNNI>(Vmat.select<REG_K/2,1,REG_N*2,1>(ci*(REG_K/2),0).format<half>(), b2dV.set_block_x(ci*REG_N));
             #pragma unroll
             for(int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
+                matrix<half, REG_K/2, REG_N*2> Vmat;
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci*REG_N));
                 #pragma unroll
                 for(int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(
                                 rO[ri + p].format<float>(),
-                                Vmat.select<REG_K/2,1,REG_N*2,1>(ci*(REG_K/2),0).format<int32_t>(),
+                                Vmat.format<int32_t>(),
                                 P2.row(p).format<int32_t>());
                 }
             }
