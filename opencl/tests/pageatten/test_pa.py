@@ -1119,7 +1119,7 @@ if __name__ == "__main__":
                             test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 256, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
                             test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 256, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
 
-    if 1:
+    if 0:
         seq_len = 32 * 1024
         block_sz = 256
         trunk_sz = seq_len
@@ -1145,7 +1145,7 @@ if __name__ == "__main__":
                                     print(f'[XATTENION_ACC_TETS]:seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache={"U8" if compressed_kvcache else "F16"} {sparse_block_sz=} {density=}')
                                     print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                                     test_page_attn_causal_batch1(seq_len, num_heads = 4, num_kv_heads = 2, head_size = head_size, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=True)
-    if 0:
+    if 1:
         def smoke_accuracy_test(blocks_per_trunk = 128, compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE):
             seq_len, block_sz = 32*1024, 256
             trunk_sz = blocks_per_trunk*block_sz
