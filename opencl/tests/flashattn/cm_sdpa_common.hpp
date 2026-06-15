@@ -516,6 +516,7 @@ void sdpa_kernel_lsc_prefetch(
     constexpr int num_P_tiles = REG_N / REG_M;
     matrix<half, padded_head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, padded_head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
+    rO = 0.0f;
 
     auto q_tokens_left = q_len;// - q_start;
     static_assert(q_step == REG_N);

@@ -74,7 +74,7 @@ class flash_attn_cm:
         t_q = cl.tensor(q.to(torch.float16).detach().numpy())
         t_k = cl.tensor(k.to(torch.float16).detach().numpy())
         t_v = cl.tensor(v.to(torch.float16).detach().numpy())
-        t_cu_seqlens = cl.tensor(np.array(cu_seqlens, dtype=np.int32))
+        t_cu_seqlens = cl.tensor(cu_seqlens.numpy().astype(np.int32))
         t_out = cl.tensor([q.shape[0], self.num_heads, self.head_size], np.dtype(np.float16))
 
         q_step = CM_GRF_WIDTH // 32
@@ -154,8 +154,12 @@ def flash_attn(q, k, v, cu_seqlens):
 
 def check_close(input, other, atol=1e-3, rtol=1e-3):
     print(f"[check_close] {input.shape}{input.dtype} vs {other.shape}{other.dtype}")
-    rtol_max = (((input - other).abs() - 1e-5)/other.abs())[other != 0].max()
-    atol_max = (((input - other).abs()) - 1e-5*other.abs()).max()
+    diff = (input - other).abs()
+    # Clamp denominator at atol so near-zero values don't inflate the relative metric.
+    # When both tensors are tiny (< atol), absolute error is the meaningful measure anyway.
+    scale = torch.maximum(input.abs(), other.abs()).clamp(min=atol)
+    rtol_max = (diff / scale).max()
+    atol_max = diff.max()
     print(f"[check_close] rtol_max: {rtol_max}")
     print(f"[check_close] atol_max: {atol_max}")
     if not torch.allclose(input, other, atol=atol, rtol=rtol):
@@ -243,7 +247,7 @@ if __name__ == "__main__":
     test_flash_attn_cm(8192, 1024)
     test_flash_attn_cm(8192, 64)
     test_flash_attn_cm(8190, 64)
-    # test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
     
     # for seqlen in range(1, 1055, 1):
     #     for sub_seq_len in range(1, 64, 1):
