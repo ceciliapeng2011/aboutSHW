@@ -690,6 +690,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
     if sparse_block_sz > 1:
         if seq_len != 32768 or num_heads != 32 or sparse_block_sz != 256 or USE_RANDOM_MASK_BY_FORCE == True:
             approx_simple_mask, effective_density = generate_block_mask_with_ratio(num_heads, seq_len, trunk_sz, sparse_block_sz, requested_density, is_causal)
+            effective_density = min(effective_density, 1.0)
         else:
             assert seq_len == 32768 and num_heads == 32 and sparse_block_sz == 256, "only support 32k prompt!"
             block_mask_tmp = load_ov_model_block_mask('/home/ceciliapeng/toolbox/linux/xattn_thresh0.99/dump_xattn_mask_bs256', sparse_block_sz, seq_len, 4096, 36, num_heads)
@@ -780,7 +781,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             else:
                 total_min = total_max = total_avg = 0.0
             mfu = total_flops / (total_avg * 1e6) if total_avg > 0 else 0.0
-            hw_peak_flops = 30e12  # PTL 4xe XMX FP16 peak
+            hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
             utilization = total_flops / (total_avg * 1e-3) / hw_peak_flops * 100 if total_avg > 0 else 0.0
             density_note = (
                 f"density req/eff {requested_density:.2f}/{effective_density:.2f}"
@@ -1153,7 +1154,7 @@ if __name__ == "__main__":
         sparse_block_sizes=(256, 128),
         densities=(1.0, 0.99, 0.66, 0.33, 0.11),
     ):
-        seq_len, block_sz = 32*1024, 256
+        seq_len, block_sz = 2558, 256
         trunk_sz = blocks_per_trunk*block_sz
 
         # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
