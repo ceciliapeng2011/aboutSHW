@@ -320,6 +320,50 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     return max_comp;
 }
 
+// Tree-reduction variant: max/sum reductions use a balanced binary tree (depth log2(rows))
+// instead of a linear chain (depth rows-1), shortening the loop-carried dependency chain.
+// Requires rows to be a power of two; the PA kv_step=16 and KV_BLK*kv_step satisfy this.
+template<typename T, int rows, int cols>
+CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, cols> St,
+                                                         vector_ref<T, cols> cur_max,
+                                                         vector_ref<T, cols> cur_sum) {
+    static_assert((rows & (rows - 1)) == 0, "tree reduction needs power-of-two rows");
+    vector<float, cols> new_max_t;
+    {
+        matrix<float, (rows > 1 ? rows/2 : 1), cols> t;
+        #pragma unroll
+        for (int r = 0; r < rows/2; r++) t.row(r) = cm_max<float>(St[r], St[r + rows/2]);
+        #pragma unroll
+        for (int stride = rows/4; stride > 0; stride >>= 1)
+            #pragma unroll
+            for (int r = 0; r < stride; r++)
+                t.row(r) = cm_max<float>(t.row(r), t.row(r + stride));
+        new_max_t = cm_max<float>(t.row(0), cur_max);
+    }
+    #pragma unroll
+    for (int r = 0; r < rows; r++) St[r] = cm_exp(St[r] - new_max_t);
+
+    vector<float, cols> row_sum_t;
+    {
+        matrix<float, (rows > 1 ? rows/2 : 1), cols> t;
+        #pragma unroll
+        for (int r = 0; r < rows/2; r++) t.row(r) = cm_add<float>(St[r], St[r + rows/2]);
+        #pragma unroll
+        for (int stride = rows/4; stride > 0; stride >>= 1)
+            #pragma unroll
+            for (int r = 0; r < stride; r++)
+                t.row(r) = cm_add<float>(t.row(r), t.row(r + stride));
+        row_sum_t = t.row(0);
+    }
+
+    vector<float, cols> max_comp;
+    max_comp = cm_exp(cur_max - new_max_t);
+    cur_sum = cm_mul<float>(cur_sum, max_comp);
+    cur_sum = cm_add<float>(cur_sum, row_sum_t);
+    cur_max = new_max_t;
+    return max_comp;
+}
+
 #ifdef CM_HAS_LSC_UNTYPED_2D
     #define cm_load_normal cm_load<lsc::Normal>
     #define cm_load_transpose cm_load<lsc::Transpose>
