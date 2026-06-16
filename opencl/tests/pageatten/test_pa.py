@@ -1204,21 +1204,21 @@ if __name__ == "__main__":
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_NONE,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256,),
+            sparse_block_sizes=(256, 1,),
             densities=(1.0, 0.33),
         )
         smoke_perf_test(
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256,),
+            sparse_block_sizes=(256, 1,),
             densities=(1.0, 0.33),
         )
         smoke_perf_test(
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256,),
+            sparse_block_sizes=(256, 1,),
             densities=(1.0, 0.33),
         )
     else:
