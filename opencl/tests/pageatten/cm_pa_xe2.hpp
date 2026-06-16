@@ -10,6 +10,18 @@
 #define CMPA_WG_SEQ_LEN 0
 #endif
 
+// Item 15: use balanced binary-tree reduction in online_softmax_update (log2 depth vs linear).
+// Set to 0 to disable (use linear chain), 1 to enable.
+#ifndef CMPA_USE_TREE_SOFTMAX
+#define CMPA_USE_TREE_SOFTMAX 1
+#endif
+
+#if CMPA_USE_TREE_SOFTMAX
+#define pa_softmax_update(St, cur_max, cur_sum) online_softmax_update_tree(St, cur_max, cur_sum)
+#else
+#define pa_softmax_update(St, cur_max, cur_sum) online_softmax_update(St, cur_max, cur_sum)
+#endif
+
 #ifndef SPARSE_BLOCK_SIZE
 #error "SPARSE_BLOCK_SIZE must be defined"
 #endif
@@ -342,7 +354,7 @@ void pa_lsc_u8(
                     }
                     int kv_tokens = kv_stop - kv_pos;
                     for (int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
-                    auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+                    auto max_comp = pa_softmax_update(St, cur_max, cur_sum);
 
                     matrix<half, REG_N, REG_K> P;
                     transpose_St_to_P_half(St, P);
@@ -528,7 +540,7 @@ void pa_lsc_u8(
             }
             int kv_tokens = kv_stop - kv_pos;
             for (int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
-            auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+            auto max_comp = pa_softmax_update(St, cur_max, cur_sum);
 
             matrix<half, REG_N, REG_K> P;
             transpose_St_to_P_half(St, P);
@@ -744,7 +756,7 @@ void pa_kernel_lsc_prefetch_f16(
         // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
         for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         //show(St);
-        auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+        auto max_comp = pa_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
         transpose_St_to_P_half(St, P);
@@ -885,7 +897,7 @@ void pa_kernel_lsc_prefetch_f16(
         // LSC ensures no overflow-access, but mask off k-tails attn-score is still required
         for(int p = kv_tokens; p < kv_step; p++) St[p] = -3.4e38f;
         //show(St);
-        auto max_comp = online_softmax_update(St, cur_max, cur_sum);
+        auto max_comp = pa_softmax_update(St, cur_max, cur_sum);
 
         matrix<half, REG_N, REG_K> P;
         transpose_St_to_P_half(St, P);

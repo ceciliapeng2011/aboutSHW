@@ -430,6 +430,43 @@ is included in commit 0621405 together with items 13–15.
 
 ---
 
+---
+
+## Item 15 applied to PageAttention (`cm_pa_xe2.hpp`)
+
+Item 15 (`online_softmax_update_tree`) was ported to the PA kernel and measured on
+PTL 4xe (`seq_len=2558, num_heads=32, num_kv_heads=8, head_size=128, sparse_block_sz=256`).
+Control: `PA_AB=1 python test_pa.py`. Results are avg latency (ms) with delta vs base (linear softmax).
+
+| KV cache | density req/eff | base (ms) | tree (ms) | delta |
+|----------|-----------------|-----------|-----------|-------|
+| FP16     | 1.00 / 1.00     | 4.065     | 4.447     | **+9.4% regression** |
+| FP16     | 0.33 / 0.47     | 1.793     | 1.932     | **+7.8% regression** |
+| U8 by-token   | 1.00 / 1.00 | 6.142  | 6.042     | **−1.6% win** |
+| U8 by-token   | 0.33 / 0.47 | 2.335  | 2.305     | **−1.3% win** |
+| U8 by-channel | 1.00 / 1.00 | 6.314  | 6.009     | **−4.8% win** |
+| U8 by-channel | 0.33 / 0.47 | 2.414  | 2.334     | **−3.3% win** |
+
+**Why tree softmax hurts FP16 but helps INT8:**
+
+- **FP16 baseline is already optimized** with `first_active`/`ugemm_PV0`: the very first
+  KV tile skips the rO rescale entirely (DPAS with `acc=0`). The tree reduction adds a
+  scratch `matrix<float, rows/2, cols>` into the register file, increasing register
+  pressure in a kernel that is already at the GRF limit. This spills or tightens
+  scheduling, causing ~9% regression.
+
+- **INT8 baseline has dequantization overhead** (per-row `uint8→half` unpack + scale/zp
+  multiply for every K and V tile). This raises total arithmetic cost, so the fixed cost
+  of the tree scratch becomes a smaller fraction of per-tile work. Meanwhile, the shorter
+  dependency chain (depth log₂(16)=4 vs linear depth 15) helps latency-hide the remaining
+  softmax ops behind the dequant memory loads, yielding a 1–5% win.
+
+**Default in `test_pa.py`:** linear softmax (`CMPA_USE_TREE_SOFTMAX=0`) for FP16,
+tree softmax (`CMPA_USE_TREE_SOFTMAX=1`) for INT8 (by-token and by-channel).
+Override via environment variable `CMPA_USE_TREE_SOFTMAX=0|1`.
+
+---
+
 ## Roofline (15 seqs × 3840, d=64, 16h, PTL 4xe)
 
 - Compute peak: ~20 TFLOPS FP16 XMX

@@ -101,6 +101,10 @@ class page_atten_cm:
         print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=} {self.compressed_kvcache=}...")
 
         scale_factor = 1.0/(head_size**0.5)
+        # Default: linear softmax for FP16 (tree adds register pressure, regresses ~9%),
+        #          tree softmax for INT8 (dequant cost masks scratch overhead, gains ~1-5%).
+        default_tree = "0" if self.compressed_kvcache == KV_CACHE_COMPRESSION_NONE else "1"
+        use_tree = int(os.environ.get("CMPA_USE_TREE_SOFTMAX", default_tree))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -DKERNEL_NAME=cm_page_attention'
@@ -114,6 +118,7 @@ class page_atten_cm:
                       f" -DCMPA_WG_SEQ_LEN={int(self.wg_seq_len)}"
                       f" -DKV_CACHE_COMPRESSION={self.compressed_kvcache}"
                       f" -DSUB_BLOCK_SIZE={self.sub_block_sz}"
+                      f" -DCMPA_USE_TREE_SOFTMAX={use_tree}"
                       f" -mdump_asm -g2")
                      )
 
@@ -1168,7 +1173,32 @@ if __name__ == "__main__":
                 test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
     pa_perf_mode = os.getenv("PA_PERF", "0") == "1"
-    if pa_perf_mode:
+    pa_ab_mode   = os.getenv("PA_AB",   "0") == "1"
+    if pa_ab_mode:
+        # A/B comparison: item15 (tree softmax) on vs off.
+        # Forces recompile for each config by clearing the functools.cache.
+        import functools
+        ab_configs = [
+            (0, "base     (linear softmax)"),
+            (1, "item15   (tree softmax)  "),
+        ]
+        for use_tree, label in ab_configs:
+            os.environ["CMPA_USE_TREE_SOFTMAX"] = str(use_tree)
+            page_atten_cm.create_instance.cache_clear()
+            print(f"\n{'='*70}")
+            print(f"A/B config: {label}")
+            print(f"{'='*70}")
+            for compressed_kvcache in (KV_CACHE_COMPRESSION_NONE,
+                                       KV_CACHE_COMPRESSION_BY_TOKEN,
+                                       KV_CACHE_COMPRESSION_BY_CHANNEL):
+                smoke_perf_test(
+                    blocks_per_trunk=16,
+                    compressed_kvcache=compressed_kvcache,
+                    sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+                    sparse_block_sizes=(256,),
+                    densities=(1.0, 0.33),
+                )
+    elif pa_perf_mode:
         # Keep runtime bounded for CI/timeout runs (e.g. `timeout 120s python test_pa.py`).
         smoke_perf_test(
             blocks_per_trunk=16,
