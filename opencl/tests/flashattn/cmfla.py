@@ -81,25 +81,23 @@ class flash_attn_cm:
         max_seq_len = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
         wg_size = min(16, (max_seq_len + q_step - 1) // q_step)
         wg_seq_len = wg_size * q_step
+        need_wg_mapping = 0
+        if wg_size == 16 and max_seq_len > wg_seq_len:
+            need_wg_mapping = 1
 
-        # Build flat mapping array: [block_start_pos, seq_id, block_start_pos, seq_id, ...]
-        # Each entry corresponds to one workgroup; O(1) dispatch inside the kernel.
-        mapping = []
-        for i in range(len(cu_seqlens) - 1):
-            seq_start = int(cu_seqlens[i])
-            seq_end   = int(cu_seqlens[i + 1])
-            seq_len   = seq_end - seq_start
-            for k_blk in range((seq_len + wg_seq_len - 1) // wg_seq_len):
-                mapping.append(seq_start + k_blk * wg_seq_len)
-                mapping.append(i)
-        wg_count = len(mapping) // 2
-        t_mapping = cl.tensor(np.array(mapping, dtype=np.int32))
+        if need_wg_mapping:
+            wg_count = 0
+            for i in range(len(cu_seqlens) - 1):
+                seq_len = int(cu_seqlens[i + 1]) - int(cu_seqlens[i])
+                wg_count += (seq_len + wg_seq_len - 1) // wg_seq_len
+        else:
+            wg_count = len(cu_seqlens) - 1
 
         GWS = [self.num_heads, wg_count * wg_size]
         LWS = [1, wg_size]
-        print(f"calling {q_step=} {wg_count=} {GWS=} {LWS=}")
+        print(f"calling {q_step=} {need_wg_mapping=} {wg_count=} {GWS=} {LWS=}")
         for _ in range(n_repeats):
-            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS, t_q, t_k, t_v, t_out, t_cu_seqlens, t_mapping, 0, 0)
+            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS, t_q, t_k, t_v, t_out, t_cu_seqlens, need_wg_mapping, 0, 0)
         attn_output = torch.from_numpy(t_out.numpy()).to(old_dtype)
         return attn_output
 
@@ -174,7 +172,7 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     cl.profiling(True)
     torch.manual_seed(0)
     torch.set_printoptions(linewidth=1024)
-    
+
     import numpy as np
     q_len = kv_len = seq_len
     cu_seqlens = torch.tensor([i for i in range(0, seq_len, sub_seq_len)] + [seq_len], dtype=torch.int32)
@@ -248,11 +246,11 @@ if __name__ == "__main__":
     test_flash_attn_cm(8192, 64)
     test_flash_attn_cm(8190, 64)
     test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    
+
     # for seqlen in range(1, 1055, 1):
     #     for sub_seq_len in range(1, 64, 1):
     #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
-    
+
     test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 72)
     test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 64)
     test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64, acc_check=False)

@@ -43,14 +43,14 @@ this to 1× bandwidth, but 16× LSC load instruction slots are consumed.
 
 ## Optimization items
 
-### 1. Replace `need_wg_mapping` with a precomputed mapping array
+### 1. WG dispatch: precomputed mapping array vs in-kernel `need_wg_mapping` while-loop
 
 **Problem:** The `need_wg_mapping=1` branch runs a while-loop over `cu_seqlens` inside
-every thread of every WG — O(num_sequences) work, redundantly, with SVM reads of
-`cu_seqlens` per iteration.
+every thread of every WG — O(num_sequences) SVM reads per thread, all redundant and
+with loop-carried branch dependencies.
 
-**Fix:** Adopt the `blocked_q_starts_and_subseq_mapping` pattern from
-`pa_multi_token.cm`. The host pre-computes a flat `int32[2 × wg_count]` array once:
+**Fix A — precomputed mapping (aboutSHW):** The host pre-computes a flat
+`int32[2 × wg_count]` array before each inference:
 
 ```python
 mapping = []
@@ -61,21 +61,65 @@ for i, (seq_start, seq_end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
 wg_count = len(mapping) // 2
 ```
 
-The kernel reads 2 scalars and derives everything in O(1) with no branch:
+The kernel reads 2 scalars at O(1) with no branch:
 
 ```cpp
-int block_start_pos = mapping[wg_id * 2];
-int seq_id          = mapping[wg_id * 2 + 1];
+int block_start_pos = wg_mapping[wg_id * 2];
+int seq_id          = wg_mapping[wg_id * 2 + 1];
 int kv_start        = cu_seqlens[seq_id];
 int kv_seq_len      = cu_seqlens[seq_id + 1] - kv_start;
 int q_start         = block_start_pos + wg_local_id * q_step;
 ```
 
-This also eliminates the `need_wg_mapping` kernel argument, the dead-code guard
-(`wg_base > wg_id` can never be true), and the `wg_count` tensor-arithmetic bug in
-Python.
+Also eliminates the dead-code guard (`wg_base > wg_id` can never be true) and the
+`wg_count` tensor-arithmetic bug in Python.
 
-**Files:** `cm_sdpa_vlen.cm` (kernel dispatch block), `cmfla.py` (`__call__` method).
+**Fix B — `mem_lock` + while-loop (OV):** The original OV host code called
+`stream.finish()` + blocking `copy_to` to read `cu_seqlens` onto the CPU
+(in `get_mask_seqlens_from_memory`). On PC, `cu_seqlens` is a user-provided
+`usm_host` tensor; `mem_lock` returns a direct CPU pointer with zero GPU sync and
+zero copy. Switching `dispatch_data_func` to use `mem_lock` (same as `read_i32_input`
+in `paged_attention.cpp`) eliminates the host–device sync barrier entirely. The
+while-loop in the kernel then costs at most a few iterations for typical PC workloads
+(≤8 sequences in VLM use), and requires no per-inference buffer upload.
+
+**A/B kernel measurement** (`SDPA_AB=1 python cmfla.py`, PTL 4xe):
+
+| Case | precomp (ms) | while-loop (ms) | delta |
+|------|-------------|-----------------|-------|
+| seq=8192 sub=8192 h=128 (1 seq)   | 58.727 | 58.585 | +0.2% (tie)    |
+| seq=8192 sub=8192 h=80  (1 seq)   | 26.657 | 26.185 | +1.8% (noise)  |
+| seq=8192 sub=1024 h=80  (8 seqs)  |  3.475 |  3.432 | +1.3% (noise)  |
+| seq=8192 sub=64   h=80  (128 seqs)|  0.831 |  2.008 | **−58.6% win** |
+| seq=6864 sub=3432 h=64  (2 seqs)  |  7.892 |  7.887 | +0.1% (tie)    |
+
+Kernel-level winner: precomputed mapping at 128 sequences (−58.6%); tie otherwise.
+
+**Tradeoffs:**
+
+| Factor | Precomputed (aboutSHW) | While-loop + mem_lock (OV) |
+|--------|----------------------|---------------------------|
+| Kernel dispatch cost | O(1), 2 reads | O(num_seqs), ≤8 iters on PC |
+| Per-inference CPU work | build mapping array | ~0 (just mem_lock ptr) |
+| Per-inference GPU upload | `wg_mapping` buffer | none |
+| Host–device sync barrier | none (in aboutSHW) | none (after mem_lock fix) |
+| Best for | many short seqs (≥16) | few seqs (≤8), PC VLM |
+
+**Decision: both repos use the while-loop.**
+
+The kernel-level win of the precomputed mapping (−58.6% at 128 sequences) is real but
+the target platform is PC VLM (≤8 sequences). With the host barrier eliminated via
+`mem_lock`, the while-loop path has zero overhead in both repos and avoids the extra
+per-inference `wg_mapping` buffer upload entirely.
+
+- **OV (`vl_sdpa_opt.cpp`):** `stream.finish()` + `copy_to` replaced by `mem_lock`
+  in `dispatch_data_func`. `VLSDPARuntimeParams`, `update_rt_params`,
+  `get_mask_seqlens_from_memory` deleted. `need_wg_mapping` scalar passed as before.
+- **aboutSHW (`cm_sdpa_vlen.cm` + `cmfla.py`):** aligned to OV. `wg_mapping` array
+  removed; `need_wg_mapping` scalar computed host-side and passed as 5th argument.
+
+**Files:** `cm_sdpa_vlen.cm`, `cmfla.py`, `vl_sdpa_opt.cpp`, `vl_sdpa.cpp`,
+`vl_sdpa_inst.h`.
 
 ---
 
@@ -212,7 +256,7 @@ Dropped. Same reason as item 6.
 
 | # | Change | Status | Result |
 |---|--------|--------|--------|
-| 1 | Mapping array replaces `need_wg_mapping` | Done | ~0% GPU perf, cleaner code |
+| 1 | Both repos: `need_wg_mapping` while-loop + `mem_lock` (no GPU sync) | Done | Kernel: while-loop costs ≤8 iters on PC VLM. OV: sync barrier removed. Precomputed mapping faster at 128+ seqs but not target workload |
 | 2 | V prefetch moved to K phase | Done | −1.7% to −6.2% |
 | 3 | Load/DPAS double-buffer (K) | Tried ×2, reverted | Regression both times — 4 thread contexts already hide L1 stalls |
 | 4 | Pre-loop warm-up prefetch | Done (with 2) | Included in items 2+4+5 result |
@@ -464,6 +508,59 @@ Control: `PA_AB=1 python test_pa.py`. Results are avg latency (ms) with delta vs
 **Default in `test_pa.py`:** linear softmax (`CMPA_USE_TREE_SOFTMAX=0`) for FP16,
 tree softmax (`CMPA_USE_TREE_SOFTMAX=1`) for INT8 (by-token and by-channel).
 Override via environment variable `CMPA_USE_TREE_SOFTMAX=0|1`.
+
+---
+
+## Item 1 A/B: precomputed `wg_mapping` vs OV-style in-kernel `while`-loop
+
+Measured on PTL 4xe with `SDPA_AB=1 python cmfla.py`.
+Control: `USE_PRECOMPUTED_MAPPING=1` (item-1, host-precomputed flat array) vs `=0` (OV-style
+while-loop scanning `cu_seqlens` per thread).
+
+| Case | precomp (ms) | while-loop (ms) | delta |
+|------|-------------|-----------------|-------|
+| seq=8192 sub=8192 h=128 (28h/4kvh) | 58.727 | 58.585 | +0.2% (tie) |
+| seq=8192 sub=8192 h=80  (16h/16kvh)| 26.657 | 26.185 | +1.8% (noise) |
+| seq=8192 sub=1024 h=80  (8 seqs)   |  3.475 |  3.432 | +1.3% (noise) |
+| seq=8192 sub=64   h=80  (128 seqs) |  0.831 |  2.008 | **−58.6% win** |
+| seq=6864 sub=3432 h=64  (2 seqs)   |  7.892 |  7.887 | +0.1% (tie) |
+
+**Why:** With 128 sequences every thread scans 128 `cu_seqlens` entries (128 SVM
+reads with branch-dependent loop-carried deps) before finding its WG's sequence.
+With precomputed mapping it reads exactly 2 scalars at a known offset. On single-
+or few-sequence workloads the while-loop terminates after 1–2 iterations and the
+difference is noise.
+
+**GPU-kernel conclusion:** precomputed mapping wins at the kernel level (−58.6% on
+128-sequence workloads). `cm_sdpa_vlen.cm` in aboutSHW keeps the precomputed path;
+`wg_mapping` is always present.
+
+**Host-overhead re-analysis for OV:** The original `get_mask_seqlens_from_memory`
+in OV called `stream.finish()` (full GPU sync stall) + `copy_to` (blocking D2H DMA)
+before every inference to read `cu_seqlens` onto the CPU. This makes the precomputed
+option worse in OV: it would add a CPU→GPU upload of the `wg_mapping` array on top
+of that barrier. The while-loop avoids the extra upload.
+
+**Root cause and fix (applied to OV):** The barrier existed because `copy_to` always
+does a blocking readback regardless of allocation type. Switching to `mem_lock`
+(already used by `read_i32_input` in `paged_attention.cpp`) eliminates the barrier
+on PC: `cu_seqlens` is a user-provided input tensor allocated as `usm_host`, so
+`mem_lock::lock()` returns `_buffer.get()` directly — zero GPU sync, zero copy.
+
+**OV decision: keep while-loop + use `mem_lock`.**
+- Target platform is PC with small num_seqs (≤8 in typical VLM use); while-loop
+  terminates in ≤8 iterations — negligible cost.
+- No per-inference buffer upload needed.
+- `stream.finish()` + `copy_to` removed from `vl_sdpa.cpp` (replaced by `mem_lock`
+  inline in `dispatch_data_func`). `VLSDPARuntimeParams`, `update_rt_params`, and
+  `get_mask_seqlens_from_memory` all deleted from `vl_sdpa_opt.cpp`/`vl_sdpa_inst.h`.
+
+**Final decision: both repos use while-loop + `mem_lock`.**
+PC VLM target has ≤8 sequences; while-loop terminates in ≤8 iterations and the
+`cu_seqlens` read via `mem_lock` on `usm_host` is free. Precomputed mapping wins
+−58.6% at 128 sequences but that is not the target workload, and the extra
+per-inference buffer upload cancels any kernel gain. `cm_sdpa_vlen.cm` in aboutSHW
+now uses the same `need_wg_mapping` while-loop as OV; `wg_mapping` array removed.
 
 ---
 
