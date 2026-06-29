@@ -1175,6 +1175,7 @@ if __name__ == "__main__":
 
     pa_perf_mode = os.getenv("PA_PERF", "0") == "1"
     pa_ab_mode   = os.getenv("PA_AB",   "0") == "1"
+    pa_omni_mode = os.getenv("PA_OMNI", "0") == "1"
     if pa_ab_mode:
         # A/B comparison: item15 (tree softmax) on vs off.
         # Forces recompile for each config by clearing the functools.cache.
@@ -1222,6 +1223,86 @@ if __name__ == "__main__":
             sparse_block_sizes=(256, 1,),
             densities=(1.0, 0.33),
         )
+    elif pa_omni_mode:
+        def run_omni_tests():
+            # --- Qwen3-Omni-4B / Thinker LM prefill: benchmark cases C1–C6 (PTL 4Xe) ---
+            # S (input tokens) from perf_analysis_omni_vs_vl.md §4.3b; Thinker: 32Q/8KV GQA, HD=128
+            # Full-square FLOP convention: 2 * Nq * S^2 * Hd * L  (matches §4.3 methodology)
+            OMNI_PA_CASES = [
+                ("C1: 448×448×2",        902),
+                ("C2: 512×384×2",        894),
+                ("C3: 1024×512×2",      1534),
+                ("C4: 1260×700×2",      2226),
+                ("C5: 1280×768×15",    14910),
+                ("C6: 1260×700×2 mt512", 2556),
+            ]
+            # PA kernel = full causal prefill; trunk_sz covers entire sequence in one pass
+            # Run all 3 KV cache compression types: NONE (FP16), BY_TOKEN (INT8), BY_CHANNEL (INT8)
+            OMNI_KV_CONFIGS = [
+                (KV_CACHE_COMPRESSION_NONE,       DEFAULT_SUB_BLOCK_SIZE, "FP16 (NONE)      "),
+                (KV_CACHE_COMPRESSION_BY_TOKEN,   DEFAULT_SUB_BLOCK_SIZE, "INT8 (BY_TOKEN)  "),
+                (KV_CACHE_COMPRESSION_BY_CHANNEL, DEFAULT_SUB_BLOCK_SIZE, "INT8 (BY_CHANNEL)"),
+            ]
+            block_sz = 256
+            blocks_per_trunk = 128
+            trunk_sz = blocks_per_trunk * block_sz
+
+            # results[kv_label] = list of (label, seq_len, avg_ms, utilization)
+            omni_all_results = {}
+            for kv_mode, sub_block_sz, kv_label in OMNI_KV_CONFIGS:
+                rows = []
+                for label, seq_len in OMNI_PA_CASES:
+                    result = test_page_attn_causal_batch1(
+                        seq_len, num_heads=32, num_kv_heads=8, head_size=128,
+                        block_sz=block_sz, trunk_sz=trunk_sz,
+                        compressed_kvcache=kv_mode, sub_block_sz=sub_block_sz,
+                        sparse_block_sz=1, density=1.0, check_acc=False,
+                    )
+                    if result is not None:
+                        avg_ms, utilization = result
+                    else:
+                        avg_ms, utilization = float("nan"), float("nan")
+                    rows.append((label, seq_len, avg_ms, utilization))
+                omni_all_results[kv_label] = rows
+
+            hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
+            # Reference analytical@100% from §4.3b (full-square, L=36 layers, Nq=32, Hd=128)
+            L, Nq, Hd = 36, 32, 128
+
+            # Print per-config tables
+            for _, _, kv_label in OMNI_KV_CONFIGS:
+                rows = omni_all_results[kv_label]
+                print()
+                print("=" * 90)
+                print(f"  Qwen3-Omni-4B Thinker LM Prefill — PA Kernel HW Utilization on PTL 4Xe")
+                print(f"  32Q/8KV GQA, HD=128, KV cache: {kv_label.strip()}  |  Peak: {hw_peak_flops/1e12:.2f} TFLOPS")
+                print("=" * 90)
+                print(f"  {'Case':<28}  {'S (tokens)':>10}  {'PA avg (ms)':>12}  {'Efficiency':>11}  {'PA / ref (ms)':>14}")
+                print("-" * 90)
+                for label, seq_len, avg_ms, utilization in rows:
+                    analytical_ms = 2 * Nq * seq_len * seq_len * Hd * L / hw_peak_flops * 1e3
+                    print(f"  {label:<28}  {seq_len:>10}  {avg_ms:>12.2f}  {utilization:>10.1f}%  {analytical_ms:>12.3f} ms @100%")
+                print("=" * 90)
+
+            # Side-by-side comparison table
+            kv_labels = [kv_label for _, _, kv_label in OMNI_KV_CONFIGS]
+            print()
+            print("=" * 120)
+            print("  Qwen3-Omni-4B — PA Kernel Comparison: FP16 vs INT8 BY_TOKEN vs INT8 BY_CHANNEL  (PTL 4Xe)")
+            print("=" * 120)
+            hdr = f"  {'Case':<28}  {'S':>6}"
+            for kv_label in kv_labels:
+                hdr += f"  {kv_label.strip()[:17]:>17} (ms)  {'eff':>6}"
+            print(hdr)
+            print("-" * 120)
+            for i, (label, seq_len, _, _) in enumerate(omni_all_results[kv_labels[0]]):
+                row = f"  {label:<28}  {seq_len:>6}"
+                for kv_label in kv_labels:
+                    avg_ms, utilization = omni_all_results[kv_label][i][2], omni_all_results[kv_label][i][3]
+                    row += f"  {avg_ms:>21.2f}  {utilization:>5.1f}%"
+                print(row)
+            print("=" * 120)
+        run_omni_tests()
     else:
         smoke_accuracy_test()
         smoke_accuracy_test(16)
@@ -1237,83 +1318,7 @@ if __name__ == "__main__":
 
     # test_ov()
 
-    # --- Qwen3-Omni-4B / Thinker LM prefill: benchmark cases C1–C6 (PTL 4Xe) ---
-    # S (input tokens) from perf_analysis_omni_vs_vl.md §4.3b; Thinker: 32Q/8KV GQA, HD=128
-    # Full-square FLOP convention: 2 * Nq * S^2 * Hd * L  (matches §4.3 methodology)
-    OMNI_PA_CASES = [
-        ("C1: 448×448×2",        902),
-        ("C2: 512×384×2",        894),
-        ("C3: 1024×512×2",      1534),
-        ("C4: 1260×700×2",      2226),
-        ("C5: 1280×768×15",    14910),
-        ("C6: 1260×700×2 mt512", 2556),
-    ]
-    # PA kernel = full causal prefill; trunk_sz covers entire sequence in one pass
-    # Run all 3 KV cache compression types: NONE (FP16), BY_TOKEN (INT8), BY_CHANNEL (INT8)
-    OMNI_KV_CONFIGS = [
-        (KV_CACHE_COMPRESSION_NONE,       DEFAULT_SUB_BLOCK_SIZE, "FP16 (NONE)      "),
-        (KV_CACHE_COMPRESSION_BY_TOKEN,   DEFAULT_SUB_BLOCK_SIZE, "INT8 (BY_TOKEN)  "),
-        (KV_CACHE_COMPRESSION_BY_CHANNEL, DEFAULT_SUB_BLOCK_SIZE, "INT8 (BY_CHANNEL)"),
-    ]
-    block_sz = 256
-    blocks_per_trunk = 128
-    trunk_sz = blocks_per_trunk * block_sz
 
-    # results[kv_label] = list of (label, seq_len, avg_ms, utilization)
-    omni_all_results = {}
-    for kv_mode, sub_block_sz, kv_label in OMNI_KV_CONFIGS:
-        rows = []
-        for label, seq_len in OMNI_PA_CASES:
-            result = test_page_attn_causal_batch1(
-                seq_len, num_heads=32, num_kv_heads=8, head_size=128,
-                block_sz=block_sz, trunk_sz=trunk_sz,
-                compressed_kvcache=kv_mode, sub_block_sz=sub_block_sz,
-                sparse_block_sz=1, density=1.0, check_acc=False,
-            )
-            if result is not None:
-                avg_ms, utilization = result
-            else:
-                avg_ms, utilization = float("nan"), float("nan")
-            rows.append((label, seq_len, avg_ms, utilization))
-        omni_all_results[kv_label] = rows
-
-    hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
-    # Reference analytical@100% from §4.3b (full-square, L=36 layers, Nq=32, Hd=128)
-    L, Nq, Hd = 36, 32, 128
-
-    # Print per-config tables
-    for _, _, kv_label in OMNI_KV_CONFIGS:
-        rows = omni_all_results[kv_label]
-        print()
-        print("=" * 90)
-        print(f"  Qwen3-Omni-4B Thinker LM Prefill — PA Kernel HW Utilization on PTL 4Xe")
-        print(f"  32Q/8KV GQA, HD=128, KV cache: {kv_label.strip()}  |  Peak: {hw_peak_flops/1e12:.2f} TFLOPS")
-        print("=" * 90)
-        print(f"  {'Case':<28}  {'S (tokens)':>10}  {'PA avg (ms)':>12}  {'Efficiency':>11}  {'PA / ref (ms)':>14}")
-        print("-" * 90)
-        for label, seq_len, avg_ms, utilization in rows:
-            analytical_ms = 2 * Nq * seq_len * seq_len * Hd * L / hw_peak_flops * 1e3
-            print(f"  {label:<28}  {seq_len:>10}  {avg_ms:>12.2f}  {utilization:>10.1f}%  {analytical_ms:>12.3f} ms @100%")
-        print("=" * 90)
-
-    # Side-by-side comparison table
-    kv_labels = [kv_label for _, _, kv_label in OMNI_KV_CONFIGS]
-    print()
-    print("=" * 120)
-    print("  Qwen3-Omni-4B — PA Kernel Comparison: FP16 vs INT8 BY_TOKEN vs INT8 BY_CHANNEL  (PTL 4Xe)")
-    print("=" * 120)
-    hdr = f"  {'Case':<28}  {'S':>6}"
-    for kv_label in kv_labels:
-        hdr += f"  {kv_label.strip()[:17]:>17} (ms)  {'eff':>6}"
-    print(hdr)
-    print("-" * 120)
-    for i, (label, seq_len, _, _) in enumerate(omni_all_results[kv_labels[0]]):
-        row = f"  {label:<28}  {seq_len:>6}"
-        for kv_label in kv_labels:
-            avg_ms, utilization = omni_all_results[kv_label][i][2], omni_all_results[kv_label][i][3]
-            row += f"  {avg_ms:>21.2f}  {utilization:>5.1f}%"
-        print(row)
-    print("=" * 120)
 
 # Usage:
 # PA_PERF=1 timeout 120s python test_pa.py
