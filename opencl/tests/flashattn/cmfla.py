@@ -203,6 +203,7 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     print(f" {seq_len=} {sub_seq_len=} average latency: {Colors.BOLD}{Colors.YELLOW}{avg_ms:.3f} ms{Colors.END}"
           f"  |  {real_flops/1e9:.1f} GFLOP"
           f"  |  {Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak")
+    return avg_ms, utilization
 
 
 def test_flash_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80):
@@ -240,17 +241,58 @@ if __name__ == "__main__":
     #     test_flash_attn_causal_batch1(seqlen, num_heads = 28, num_kv_heads = 4, head_size = 128)
     # test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
-    test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128, acc_check=False)
-    test_flash_attn_cm(8192, 8192, acc_check=False)
-    test_flash_attn_cm(8192, 1024)
-    test_flash_attn_cm(8192, 64)
-    test_flash_attn_cm(8190, 64)
-    test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    # test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128, acc_check=False)
+    # test_flash_attn_cm(8192, 8192, acc_check=False)
+    # test_flash_attn_cm(8192, 1024)
+    # test_flash_attn_cm(8192, 64)
+    # test_flash_attn_cm(8190, 64)
+    # test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
     # for seqlen in range(1, 1055, 1):
     #     for sub_seq_len in range(1, 64, 1):
     #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
 
-    test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 72)
-    test_flash_attn_cm(seq_len=6864, sub_seq_len=3432, num_heads = 16, num_kv_heads = 16, head_size = 64)
-    test_flash_attn_cm(seq_len=57600, sub_seq_len=3840, num_heads = 16, num_kv_heads = 16, head_size = 64, acc_check=False)
+    # Qwen3-Omni-4B vs Qwen3-VL-4B VLSDPA utilization sweep (PTL 4Xe)
+    # seq_len/sub_seq_len = M_v(total)/M-per-image from perf_analysis_omni_vs_vl.md §4.2b
+    CASES = [
+        ("C1: 448×448×2",   1568,  784),
+        ("C2: 512×384×2",   1536,  768),
+        ("C3: 1024×512×2",  4096,  2048),
+        ("C4: 1260×700×2",  6864,  3432),
+        ("C5: 1280×768×15", 57600, 3840),
+    ]
+    TARGET_EFF = 55.0  # % XMX utilization target
+
+    omni_results = []
+    for label, seq_len, sub_seq_len in CASES:
+        acc_check = seq_len < 50000
+        avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
+                                         num_heads=16, num_kv_heads=16, head_size=72,
+                                         acc_check=acc_check)
+        omni_results.append((label, sub_seq_len, avg_ms, eff))
+
+    vl_results = []
+    for label, seq_len, sub_seq_len in CASES:
+        acc_check = seq_len < 50000
+        avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
+                                         num_heads=16, num_kv_heads=16, head_size=64,
+                                         acc_check=acc_check)
+        vl_results.append((label, sub_seq_len, avg_ms, eff))
+
+    # Summary table matching §4.2c of perf_analysis_omni_vs_vl.md
+    print()
+    print("=" * 100)
+    print("  Qwen3-Omni-4B (HD=72, ViT) vs Qwen3-VL-4B (HD=64, Merger) — VLSDPA HW Utilization on PTL 4Xe")
+    print(f"  Target: {TARGET_EFF}% XMX FP16 efficiency  |  Peak: 20.07 TFLOPS")
+    print("=" * 100)
+    hdr = f"  {'Test':<22}  {'M/img':>6}  {'Omni ms':>9}  {'Omni Eff%':>10}  {'Omni vs55%':>11}  {'VL ms':>9}  {'VL Eff%':>8}  {'VL vs55%':>9}  {'Delta Eff':>10}"
+    print(hdr)
+    print("-" * 100)
+    for (label, m_img, omni_ms, omni_eff), (_, _, vl_ms, vl_eff) in zip(omni_results, vl_results):
+        omni_vs55 = omni_eff / TARGET_EFF * 100
+        vl_vs55   = vl_eff   / TARGET_EFF * 100
+        delta     = vl_eff - omni_eff
+        omni_pass = "✅" if omni_vs55 >= 100 else "❌"
+        vl_pass   = "✅" if vl_vs55   >= 100 else "❌"
+        print(f"  {label:<22}  {m_img:>6}  {omni_ms:>9.2f}  {omni_eff:>9.1f}%  {omni_vs55:>9.1f}% {omni_pass}  {vl_ms:>9.2f}  {vl_eff:>7.1f}%  {vl_vs55:>8.1f}% {vl_pass}  VL+{delta:>5.1f}pp")
+    print("=" * 100)
