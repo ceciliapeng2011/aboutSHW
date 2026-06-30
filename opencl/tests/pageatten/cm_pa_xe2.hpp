@@ -43,6 +43,18 @@
                                   )
 #endif
 
+// For the U8/INT8 KV-cache path, the block-granular OPTIMIZED_SPARSE_PIPELINE re-primes the SLM
+// pipeline (2 staged loads + slm_fence + sbarrier) and resets the ring at the start of EVERY
+// SPARSE_BLOCK_SIZE-token block. With many active blocks (e.g. seq_len=2558, trunk=4096) that
+// repeated prime/barrier overhead makes it slower than the legacy continuous-prime pipeline, which
+// already supports block-granular sparse skipping via skip_compute/skip_load. Measured on PTL 4Xe
+// (PA_PERF, SB=256): INT8 D=1.0 ~+16-19% faster, D=0.33 neutral/positive, FP16 unchanged.
+// So keep the optimized path for FP16 only; INT8 uses the legacy continuous pipeline.
+#if KV_CACHE_COMPRESSION
+#undef OPTIMIZED_SPARSE_PIPELINE
+#define OPTIMIZED_SPARSE_PIPELINE 0
+#endif
+
 #if OPTIMIZED_SPARSE_PIPELINE == 1
     static_assert(SPARSE_BLOCK_SIZE == CMPA_WG_SEQ_LEN,
         "This optimized pipeline requires SPARSE_BLOCK_SIZE to be the same as CMPA_WG_SEQ_LEN");
