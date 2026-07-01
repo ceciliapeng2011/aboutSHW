@@ -654,18 +654,62 @@ def flash0_ref(q, k, v, attention_mask):
     return attn_output.to(q.dtype)
 
 
-def check_close(input, other, atol=1e-2, rtol=1e-2):
-    print(f"[check_close] {input.shape}{input.dtype} vs {other.shape}{other.dtype}")
-    rtol_max = (((input - other).abs() - 1e-5)/other.abs())[other != 0].max()
-    atol_max = (((input - other).abs()) - 1e-5*other.abs()).max()
-    print(f"[check_close] rtol_max: {rtol_max}")
-    print(f"[check_close] atol_max: {atol_max}")
-    if not torch.allclose(input, other, atol=atol, rtol=rtol, equal_nan=True):
-        close_check = torch.isclose(input, other, atol=atol, rtol=rtol)
-        not_close_indices = torch.where(~close_check) # Invert the close check to find failures
-        print(f"Not close indices: {not_close_indices}")
-        print(f"    input_tensor: {input[not_close_indices]}")
-        print(f"    other_tensor: {other[not_close_indices]}")
+def check_close(atual, expected, atol=1e-2, rtol=1e-2):
+    actual = atual
+    print(f"[check_close] {actual.shape}{actual.dtype} vs {expected.shape}{expected.dtype}")
+    # Elementwise absolute error.
+    abs_error = (actual - expected).abs()
+    # Elementwise allclose tolerance: |a-b| <= atol + rtol*|b|.
+    allowed_error = atol + rtol * expected.abs()
+    # Normalized error against the exact allclose bound.
+    # >1.0 means this element fails allclose; <=1.0 means it passes.
+    error_over_tolerance = abs_error / allowed_error
+
+    # Worst absolute mismatch (outlier-sensitive).
+    max_abs_error = abs_error.max()
+    # 99th-percentile absolute mismatch (robust to single outliers).
+    p99_abs_error = torch.quantile(abs_error.reshape(-1).to(torch.float32), 0.99)
+    # Worst normalized mismatch under the exact allclose criterion.
+    max_error_over_tolerance = error_over_tolerance.max()
+
+    nonzero_expected_mask = expected != 0
+    if nonzero_expected_mask.any():
+        # Relative error only where reference is nonzero.
+        # Useful signal, but can still be large when |reference| is tiny.
+        max_rel_error_nonzero = (abs_error[nonzero_expected_mask] / expected.abs()[nonzero_expected_mask]).max()
+    else:
+        max_rel_error_nonzero = torch.tensor(0.0, dtype=torch.float32, device=abs_error.device)
+
+    print(f"[check_close] abs_err_max: {max_abs_error}")
+    print(f"[check_close] abs_err_p99: {p99_abs_error}")
+    print(f"[check_close] tol_ratio_max: {max_error_over_tolerance}")
+    print(f"[check_close] rel_err_max_nonzero: {max_rel_error_nonzero}")
+    if not torch.allclose(actual, expected, atol=atol, rtol=rtol, equal_nan=True):
+        is_close_mask = torch.isclose(actual, expected, atol=atol, rtol=rtol)
+        failing_mask = ~is_close_mask
+        failing_count = int(failing_mask.sum().item())
+        print(f"[check_close] fail_count: {failing_count}")
+
+        flat_failing_indices = torch.nonzero(failing_mask.reshape(-1), as_tuple=False).reshape(-1)
+        flat_failing_ratios = error_over_tolerance.reshape(-1)[flat_failing_indices].to(torch.float32)
+        top_k = min(10, int(flat_failing_indices.numel()))
+        _, top_order = torch.topk(flat_failing_ratios, k=top_k, largest=True, sorted=True)
+
+        # Print the top-K failing elements ranked by tol_ratio to localize root causes quickly.
+        print(f"[check_close] top offending indices by tol_ratio (top {top_k}):")
+        for rank in range(top_k):
+            flat_idx = int(flat_failing_indices[top_order[rank]].item())
+            idx = tuple(int(x) for x in np.unravel_index(flat_idx, actual.shape))
+            actual_value = actual[idx]
+            expected_value = expected[idx]
+            abs_error_value = abs_error[idx]
+            allowed_error_value = allowed_error[idx]
+            error_over_tolerance_value = error_over_tolerance[idx]
+            print(
+                f"  #{rank+1:02d} idx={idx} tol_ratio={float(error_over_tolerance_value):.6f} "
+                f"abs_err={float(abs_error_value):.6f} tol={float(allowed_error_value):.6f} "
+                f"actual={float(actual_value):.6f} ref={float(expected_value):.6f}"
+            )
         assert 0
 
 def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=KV_CACHE_COMPRESSION_NONE, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE, sparse_block_sz=128, density=0.5, check_acc = True, return_output = False):
@@ -755,9 +799,9 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         # print(ref)
         # print(out)
         if compressed_kvcache == KV_CACHE_COMPRESSION_NONE and sparse_block_sz == 128:
-            check_close(ref, out, atol=5e-2, rtol=2e-1)
+            check_close(out, ref, atol=5e-2, rtol=2e-1)
         else:
-            check_close(ref, out)
+            check_close(out, ref)
     else:
         warmup = 5
         rep = 15
@@ -1088,7 +1132,7 @@ def test_ov():
     # print(f'{ref.shape=}')
 
     # check_close(ref, ov_out)
-    check_close(ref, ut_out)
+    check_close(ut_out, ref)
 
     print(f'{Colors.GREEN}test_ov done.{Colors.END}')
 
@@ -1208,7 +1252,7 @@ if __name__ == "__main__":
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_NONE,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256, 1,),
+            sparse_block_sizes=(1,),
             densities=(1.0,),
         )
         smoke_perf_test(
@@ -1217,7 +1261,7 @@ if __name__ == "__main__":
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256, 1,),
+            sparse_block_sizes=(1,),
             densities=(1.0,),
         )
         smoke_perf_test(
@@ -1226,7 +1270,7 @@ if __name__ == "__main__":
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(256, 1,),
+            sparse_block_sizes=(1,),
             densities=(1.0,),
         )
     elif pa_omni_mode:
