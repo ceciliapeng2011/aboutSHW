@@ -1152,25 +1152,25 @@ if __name__ == "__main__":
         test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 256, density=0.33, check_acc=True)
         test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 128, density=0.33, check_acc=True)
 
-    # perf for sparse X attention, with QWen3 8K case
+    # perf for sparse X attention, default with QWen3-8B case
     def smoke_perf_test(
-        blocks_per_trunk = 128,
+        seq_len = 32*1024,
+        block_sz = 256,
+        blocks_per_trunk = 16,
         compressed_kvcache = KV_CACHE_COMPRESSION_BY_TOKEN,
         sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-        sparse_block_sizes=(256, 128),
+        sparse_block_sizes=(1, 256, 128),
         densities=(1.0, 0.99, 0.66, 0.33, 0.11),
     ):
-        seq_len, block_sz = 2558, 256
         trunk_sz = blocks_per_trunk*block_sz
-
-        # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
 
         for sparse_block_sz in sparse_block_sizes:
             for density in densities:
-            # for density in [1.0]:
-                # print("-----------------------------------------------------------------------------------------------------------------------------------------")
-                # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
-                # print("-----------------------------------------------------------------------------------------------------------------------------------------")
+                if sparse_block_sz == 1 and density != 1.0:
+                    continue  # skip invalid case
+                print("-----------------------------------------------------------------------------------------------------------------------------------------")
+                print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz} density={density}')
+                print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
     pa_perf_mode = os.getenv("PA_PERF", "0") == "1"
@@ -1203,25 +1203,31 @@ if __name__ == "__main__":
     elif pa_perf_mode:
         # Keep runtime bounded for CI/timeout runs (e.g. `timeout 120s python test_pa.py`).
         smoke_perf_test(
+            seq_len = 2558,
+            block_sz = 256,
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_NONE,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
             sparse_block_sizes=(256, 1,),
-            densities=(1.0, 0.33),
+            densities=(1.0,),
         )
         smoke_perf_test(
+            seq_len = 2558,
+            block_sz = 256,
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
             sparse_block_sizes=(256, 1,),
-            densities=(1.0, 0.33),
+            densities=(1.0,),
         )
         smoke_perf_test(
+            seq_len = 2558,
+            block_sz = 256,
             blocks_per_trunk=16,
             compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL,
             sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
             sparse_block_sizes=(256, 1,),
-            densities=(1.0, 0.33),
+            densities=(1.0,),
         )
     elif pa_omni_mode:
         def run_omni_tests():
@@ -1311,7 +1317,7 @@ if __name__ == "__main__":
         smoke_accuracy_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
 
         smoke_perf_test()
-        smoke_perf_test(16)
+        smoke_perf_test(block_sz=16)
         smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_NONE)
         smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=DEFAULT_SUB_BLOCK_SIZE)
         smoke_perf_test(compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL, sub_block_sz=32)
