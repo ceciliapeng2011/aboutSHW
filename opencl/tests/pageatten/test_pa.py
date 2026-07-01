@@ -1224,6 +1224,7 @@ if __name__ == "__main__":
         # A/B comparison: item15 (tree softmax) on vs off.
         # Forces recompile for each config by clearing the functools.cache.
         import functools
+        ab_seq_len = int(os.getenv("PA_AB_SEQ_LEN", "32768"))
         ab_configs = [
             (0, "base     (linear softmax)"),
             (1, "item15   (tree softmax)  "),
@@ -1238,6 +1239,7 @@ if __name__ == "__main__":
                                        KV_CACHE_COMPRESSION_BY_TOKEN,
                                        KV_CACHE_COMPRESSION_BY_CHANNEL):
                 smoke_perf_test(
+                    seq_len=ab_seq_len,
                     blocks_per_trunk=16,
                     compressed_kvcache=compressed_kvcache,
                     sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
@@ -1246,33 +1248,23 @@ if __name__ == "__main__":
                 )
     elif pa_perf_mode:
         # Keep runtime bounded for CI/timeout runs (e.g. `timeout 120s python test_pa.py`).
-        smoke_perf_test(
-            seq_len = 2558,
-            block_sz = 256,
-            blocks_per_trunk=16,
-            compressed_kvcache=KV_CACHE_COMPRESSION_NONE,
-            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(1,),
-            densities=(1.0,),
-        )
-        smoke_perf_test(
-            seq_len = 2558,
-            block_sz = 256,
-            blocks_per_trunk=16,
-            compressed_kvcache=KV_CACHE_COMPRESSION_BY_TOKEN,
-            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(1,),
-            densities=(1.0,),
-        )
-        smoke_perf_test(
-            seq_len = 2558,
-            block_sz = 256,
-            blocks_per_trunk=16,
-            compressed_kvcache=KV_CACHE_COMPRESSION_BY_CHANNEL,
-            sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
-            sparse_block_sizes=(1,),
-            densities=(1.0,),
-        )
+        perf_seq_len = int(os.getenv("PA_PERF_SEQ_LEN", "2558"))
+        perf_modes_raw = os.getenv("PA_PERF_COMPRESS_MODES", "0,1,2")
+        perf_modes = [
+            normalize_kv_cache_compression(int(mode.strip()))
+            for mode in perf_modes_raw.split(",") if mode.strip()
+        ]
+
+        for compressed_kvcache in perf_modes:
+            smoke_perf_test(
+                seq_len=perf_seq_len,
+                block_sz=256,
+                blocks_per_trunk=16,
+                compressed_kvcache=compressed_kvcache,
+                sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,
+                sparse_block_sizes=(1,),
+                densities=(1.0,),
+            )
     elif pa_omni_mode:
         def run_omni_tests():
             # --- Qwen3-Omni-4B / Thinker LM prefill: benchmark cases C1–C6 (PTL 4Xe) ---
