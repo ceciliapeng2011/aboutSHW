@@ -2,23 +2,34 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Stand-alone unit / micro-benchmark for the OpenVINO intel_gpu MVN (LayerNorm)
-# kernel (mvn_gpu_bfyx_opt.cl), reproducing the exact JIT constants and GWS/LWS
-# host dispatch that OV derives for the Qwen3-Omni-4B (C6) vision encoder shapes.
+# Stand-alone unit / micro-benchmark for the OpenVINO intel_gpu MVN (LayerNorm) kernel
+# (mvn_gpu_bfyx_opt.cl), reproducing EXACTLY what OV runs for the Qwen3-Omni-4B (C6)
+# vision-encoder shapes. No hypotheses — every JIT const / arg / flag is taken from the
+# verbose log + exec graph (see README "No-hypothesis rule").
 #
-# Cases (from C6.verbose.log, last iter):
-#   vit    : ViT block LayerNorm            [6864, 1152]   D=1152
-#   merger : patch-Merger LayerNorm         [1716, 4608]   D=4608
+# Verified from C6.verbose.log (kernel hash mvn_gpu_bfyx_opt_17508.../9551...) and
+# Model0_exec_graph.xml:
+#   - args (set_kernel_arg): shape_info(64B), input, output, gamma, beta -> 5 args
+#   - exec graph originalLayersNames = "MVN, Multiply(gamma), Add(beta)" -> fused affine
+#   - is_dynamic=1 ; tensors ":nopad"
+#   - normalized dim is STATIC (log `?x1152`) -> DATA_SET_SIZE is a compile constant
+#   - dispatch: gws=[LWS,rows,1] lws=[LWS,1,1]
+#   - mode ACROSS_CHANNELS, NORMALIZE_VARIANCE=1, EPS_INSIDE_SQRT
 #
-# MVN mode = ACROSS_CHANNELS, NORMALIZE_VARIANCE=1. The base kernel computes the
-# core normalization (x-mean)/sqrt(var+eps); gamma/beta are applied via OV
-# fused-ops in production and are intentionally out of scope here.
+# Cases (vision encoder):
+#   vit    : ViT block LayerNorm     [6864, 1152]   D=1152
+#   merger : patch-Merger LayerNorm  [1716, 4608]   D=4608
 #
-# Dispatch derivation mirrors:
-#   mvn_kernel_bfyx_opt.cpp :: SetDefault() / GetJitConstants()
+# Variants:
+#   ov     : exact OV config (dynamic, shape_info arg, fused gamma+beta, runtime LWS)
+#   static : same work, static-shape specialization
 #
-# Run inside the llm container (built_ov env):
-#   python test_omni_mvn.py
+# NOTE: the fused epilogue reproduces OV's affine functionally (out = norm*gamma + beta,
+# from the 5-arg layout + exec-graph Multiply/Add). OV auto-generates its FUSED_OPS macro
+# from the fusion; the generated macro body itself was not dumped, so its exact codegen
+# (e.g. any bounds guard) is not byte-reproduced — the math and I/O are identical.
+#
+# Run inside the llm container (built_ov env):  python test_omni_mvn.py
 
 import os
 import numpy as np
@@ -27,18 +38,41 @@ from clops import cl
 from clops.utils import kernel_cache
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MAX_LWS = 1024  # min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B) >> 1024) on PTL Xe
+MAX_LWS = 1024  # min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 
 
-def load_kernel(cl_name):
-    shim = open(os.path.join(HERE, "ov_norm_shim.cl")).read()
-    body = open(os.path.join(HERE, cl_name)).read()
-    body = "\n".join(l for l in body.splitlines()
+def _read(name):
+    return open(os.path.join(HERE, name)).read()
+
+
+def _body(cl_name):
+    return "\n".join(l for l in _read(cl_name).splitlines()
                      if not l.strip().startswith('#include "include/'))
-    return shim + "\n" + body
 
 
-MVN_SRC = load_kernel("mvn_gpu_bfyx_opt.cl")
+SHIM = _read("ov_norm_shim.cl")
+MVN_BODY = _body("mvn_gpu_bfyx_opt.cl")
+
+# Fused affine epilogue (OV: MVN, Multiply(gamma), Add(beta)). Drives the kernel's real
+# HAS_FUSED_OPS path; gamma/beta are the 2 extra kernel args (arg3/arg4). In
+# ACROSS_CHANNELS the feature index within a row is in_data_set_idx + iteration_offset.
+MVN_FUSED_DEFS = r"""
+#define HAS_FUSED_OPS 1
+#define HAS_FUSED_OPS_DECLS 1
+#define FUSED_OPS_DECLS const __global half* fused_gamma, const __global half* fused_beta
+#define FUSED_OPS ACTIVATION_TYPE _fo = result * TO_ACTIVATION_TYPE(fused_gamma[in_data_set_idx + iteration_in_data_set_offset]) + TO_ACTIVATION_TYPE(fused_beta[in_data_set_idx + iteration_in_data_set_offset]);
+#define FUSED_OPS_RESULT TO_OUTPUT_TYPE(_fo)
+"""
+
+# Dynamic (=OV): shape_info leading arg + runtime LWS. IS_DYNAMIC=1 drops the
+# reqd_work_group_size attribute. DATA_SET_SIZE stays a compile constant (normalized dim
+# static); shape_info is not read by the body.
+MVN_DYN_DEFS = r"""
+#undef OPTIONAL_SHAPE_INFO_ARG
+#define OPTIONAL_SHAPE_INFO_ARG const __global int* shape_info,
+#undef LWS
+#define LWS (get_local_size(0))
+"""
 
 
 def get_lws(data_set_size, max_lws=MAX_LWS):
@@ -50,59 +84,73 @@ def get_lws(data_set_size, max_lws=MAX_LWS):
     return items, lws
 
 
-def build_opts(D, eps):
+def build(D, eps, variant):
     items, lws = get_lws(D)
-    opts = (f"-DIS_DYNAMIC=0 -DNORMALIZE_VARIANCE=1 -DEPS_INSIDE_SQRT "
-            f"-DLWS={lws} -DDATA_SET_SIZE={D} -DDATA_SETS_COUNT=0 -DEPSILON={eps}")
-    # DATA_SETS_COUNT is unused by the kernel body (kept for parity); rows come via GWS.
-    return opts, lws, items
+    base = (f"-DNORMALIZE_VARIANCE=1 -DEPS_INSIDE_SQRT -DEPSILON={eps} "
+            f"-DDATA_SET_SIZE={D} -DDATA_SETS_COUNT=0")
+    if variant == "ov":
+        opts = base + " -DIS_DYNAMIC=1"
+        src = SHIM + "\n" + MVN_DYN_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
+    else:  # static specialization (same fused work)
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws}"
+        src = SHIM + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
+    return src, opts, lws, items
 
 
-def ref_mvn(x, eps):
+def ref_mvn(x, eps, gamma, beta):
     xf = torch.from_numpy(x).float()
     mean = xf.mean(-1, keepdim=True)
-    var = xf.var(-1, unbiased=False, keepdim=True)  # biased: /N, matches kernel
+    var = xf.var(-1, unbiased=False, keepdim=True)  # biased (/N), matches kernel
     out = (xf - mean) / torch.sqrt(var + eps)
+    out = out * torch.from_numpy(gamma).float() + torch.from_numpy(beta).float()
     return out.half().numpy()
 
 
-def run_case(name, rows, D, ov_ref_us, eps=1e-6, iters=30):
-    opts, lws, items = build_opts(D, eps)
-    kernels = kernel_cache(MVN_SRC, opts)
+def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
+    src, opts, lws, items = build(D, eps, variant)
+    kernels = kernel_cache(src, opts)
 
     np.random.seed(0)
     x = np.random.uniform(-2.0, 2.0, [rows, D]).astype(np.float16)
-    tx = cl.tensor(x)
-    to = cl.tensor(np.zeros_like(x))
+    gamma = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
+    beta = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
+    tx, to = cl.tensor(x), cl.tensor(np.zeros_like(x))
+    # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
+    # unused by the body but present to match OV's dynamic signature.
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
+    args = shape_info + [tx, to, cl.tensor(gamma), cl.tensor(beta)]
 
-    # correctness
-    kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], tx, to)
+    kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
     cl.finish()
     cur = to.numpy()
-    ref = ref_mvn(x, eps)
+    ref = ref_mvn(x, eps, gamma, beta)
     ok = np.allclose(cur, ref, atol=2e-2, rtol=2e-2)
     if not ok:
         bad = np.abs(cur.astype(np.float32) - ref.astype(np.float32))
-        print(f"  [{name}] MAX ABS ERR = {bad.max():.4f} at {np.unravel_index(bad.argmax(), bad.shape)}")
+        print(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
 
-    # timing
     for _ in range(iters):
-        kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], tx, to)
-    lat = cl.finish()
-    avg_us = sum(lat) / len(lat) / 1e3
+        kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    cl.finish()
+    for _ in range(iters):
+        kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    lat = sorted(cl.finish())
+    med_us = lat[len(lat) // 2] / 1e3
 
-    print(f"  {name:8s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
-          f"acc={'OK ' if ok else 'FAIL'} | {avg_us:7.3f} us/call  (OV C6 avg {ov_ref_us:.3f} us)")
+    print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
+          f"acc={'OK ' if ok else 'FAIL'} | {med_us:8.3f} us/call (median) (OV C6 {ov_ref_us:.0f} us)")
     return ok
 
 
 def main():
     cl.profiling(True)
     print("=== OV mvn_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 vision encoder ===")
+    print("    ov = exact OV config (fused gamma+beta); static = same work, static shapes")
     results = []
-    # ov_ref_us = per-call avg from C6 profiling (mvn_gpu_profile.md)
-    results.append(run_case("vit",    6864, 1152, ov_ref_us=833))
-    results.append(run_case("merger", 1716, 4608, ov_ref_us=910))
+    # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
+    for name, rows, D, ref in [("vit", 6864, 1152, 833), ("merger", 1716, 4608, 910)]:
+        results.append(run_case(name, rows, D, ref, "ov"))
+        results.append(run_case(name, rows, D, ref, "static"))
     assert all(results), "accuracy check failed"
     print("accuracy: all good")
 
