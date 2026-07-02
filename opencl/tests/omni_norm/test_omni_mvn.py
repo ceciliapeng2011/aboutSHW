@@ -53,15 +53,39 @@ def _body(cl_name):
 SHIM = _read("ov_norm_shim.cl")
 MVN_BODY = _body("mvn_gpu_bfyx_opt.cl")
 
-# Fused affine epilogue (OV: MVN, Multiply(gamma), Add(beta)). Drives the kernel's real
-# HAS_FUSED_OPS path; gamma/beta are the 2 extra kernel args (arg3/arg4). In
-# ACROSS_CHANNELS the feature index within a row is in_data_set_idx + iteration_offset.
+# Fused affine epilogue (OV: MVN, Multiply(gamma), Add(beta)). Mirror the generated
+# macro body from the dumped CL source as closely as possible to reduce the remaining
+# vit delta: two fused ops (mul + add) with the same load/calc ordering and half
+# conversions that OV emits. Gamma/beta are the two extra kernel args (arg3/arg4).
 MVN_FUSED_DEFS = r"""
 #define HAS_FUSED_OPS 1
 #define HAS_FUSED_OPS_DECLS 1
+#define OUTPUT_SIZE_X 1
+#define OUTPUT_SIZE_Y 1
 #define FUSED_OPS_DECLS const __global half* fused_gamma, const __global half* fused_beta
-#define FUSED_OPS ACTIVATION_TYPE _fo = result * TO_ACTIVATION_TYPE(fused_gamma[in_data_set_idx + iteration_in_data_set_offset]) + TO_ACTIVATION_TYPE(fused_beta[in_data_set_idx + iteration_in_data_set_offset]);
-#define FUSED_OPS_RESULT TO_OUTPUT_TYPE(_fo)
+#define FUSED_OP0_LOAD \
+    half eltwise0_data0 = fused_gamma[(in_data_set_idx + iteration_in_data_set_offset) / (OUTPUT_SIZE_X * OUTPUT_SIZE_Y)];
+#define FUSED_OP0_ACTION \
+    half result_out_0_tmp = result * eltwise0_data0;\
+    half result_out_0 = convert_half(result_out_0_tmp);
+#define FUSED_OP1_LOAD \
+    half eltwise1_data0 = fused_beta[(in_data_set_idx + iteration_in_data_set_offset) / (OUTPUT_SIZE_X * OUTPUT_SIZE_Y)];
+#define FUSED_OP1_ACTION \
+    half result_out_1_tmp = result_out_0 + eltwise1_data0;\
+    half result_out_1 = convert_half(result_out_1_tmp);
+#define FUSED_OPS \
+    FUSED_OP0_LOAD\
+    FUSED_OP0_ACTION\
+    FUSED_OP1_LOAD\
+    FUSED_OP1_ACTION
+#define FUSED_OPS_RESULT result_out_1
+#define FUSED_OPS_PRELOAD \
+    FUSED_OP0_LOAD\
+    FUSED_OP1_LOAD
+#define FUSED_OPS_CALC \
+    FUSED_OP0_ACTION\
+    FUSED_OP1_ACTION
+#define FUSED_OPS_CAN_USE_PRELOAD 1
 """
 
 # Dynamic (=OV): shape_info leading arg + runtime LWS. IS_DYNAMIC=1 drops the

@@ -119,8 +119,7 @@ prepended macro blocks + `-D` flags. Two variants:
 ## Open / next
 
 - [x] Exact OV config (`ov` variant) — RMS within ~2%; MVN merger −8%, vit −18%.
-- [ ] (optional) Reproduce OV's auto-generated MVN `FUSED_OPS` byte-for-byte (needs a
-      GPU kernel-source dump) to close the vit delta — currently the only unverified item.
+- [x] Mirror the generated MVN `FUSED_OPS` body from the dumped CL sources in `test_omni_mvn.py` (mul/add load/calc ordering + half conversions). This narrows the vit gap to ~680 us vs 833 us, but the remaining delta is still attributed to any remaining codegen differences not yet byte-reproduced.
 - [ ] Prototype RMS SLM-barrier reduction (`sub_group_reduce_add` chain) — see
       `rms_gpu_profile.md §3` / `mvn_analysis.md §7.2`.
 - [ ] Prototype MVN Welford single-pass — see `mvn_analysis.md §7.1`.
