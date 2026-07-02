@@ -574,14 +574,25 @@ void sdpa_kernel_lsc_prefetch(
         // ---- one online-softmax update over the whole block ----
         auto max_comp = online_softmax_update_tree(St, cur_max, cur_sum);
 
-        // ---- rescale rO ONCE for the whole block (amortized over KV_BLK tiles) ----
-        // For kv_base=0 cur_max was -3e38 so max_comp=exp(-inf)=0 -> zeroes rO (== acc=0).
-        #pragma unroll
-        for(int t = 0; t < padded_head_size/REG_N*num_P_tiles; t++) {
-            auto cO = rO[t].format<float, REG_M, REG_N>();
+        // ---- rescale rO (skip first iter where max_comp=0 on zero rO; gated for small heads) ----
+        if constexpr (head_size <= 64) {
+            if (kv_base > 0) {
+                #pragma unroll
+                for(int t = 0; t < padded_head_size/REG_N*num_P_tiles; t++) {
+                    auto cO = rO[t].format<float, REG_M, REG_N>();
+                    #pragma unroll
+                    for(int r = 0; r < REG_M; r++)
+                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles)*REG_M]);
+                }
+            }
+        } else {
             #pragma unroll
-            for(int r = 0; r < REG_M; r++)
-                cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles)*REG_M]);
+            for(int t = 0; t < padded_head_size/REG_N*num_P_tiles; t++) {
+                auto cO = rO[t].format<float, REG_M, REG_N>();
+                #pragma unroll
+                for(int r = 0; r < REG_M; r++)
+                    cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles)*REG_M]);
+            }
         }
 
         // ---- transpose each sub-tile and accumulate P@V into rO ----
