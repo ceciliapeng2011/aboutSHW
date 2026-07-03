@@ -18,6 +18,14 @@
 
 #define USE_BLOCK_WRITE 1
 
+#ifndef ONE_SUBGROUP_ROW
+#define ONE_SUBGROUP_ROW 0
+#endif
+
+#ifndef MULTI_SUBGROUP_ROW
+#define MULTI_SUBGROUP_ROW 0
+#endif
+
 REQD_SUB_GROUP_SIZE(SUB_GROUP_SIZE)
 KERNEL(rms_gpu_bfyx_opt)(
     OPTIONAL_SHAPE_INFO_ARG
@@ -69,7 +77,9 @@ KERNEL(rms_gpu_bfyx_opt)(
     ACCUMULATOR_TYPE data[STACK_SIZE];
     ACCUMULATOR_TYPE rms = ACCUMULATOR_VAL_ZERO;
 
+#if !ONE_SUBGROUP_ROW
     __local ACCUMULATOR_TYPE slm_buf[SLM_SIZE];
+#endif
 
     // ---- vectorized load cascade: block8 -> block4 -> block2 -> scalar ----
     uint i = 0;
@@ -105,6 +115,22 @@ KERNEL(rms_gpu_bfyx_opt)(
 
     rms = sub_group_reduce_add(rms);
 
+#if ONE_SUBGROUP_ROW
+    // Compile-time q/k path: one sub-group covers the whole row, so no SLM or barrier exists.
+    rms = native_rsqrt(rms / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
+#elif MULTI_SUBGROUP_ROW
+    // Compile-time hidden path: multiple sub-groups per row, one SLM reduction barrier.
+    if (get_sub_group_local_id() == 0)
+        slm_buf[get_sub_group_id()] = rms;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const uint nsg = LWS / SUB_GROUP_SIZE;
+    ACCUMULATOR_TYPE p = ACCUMULATOR_VAL_ZERO;
+    for (uint k = get_sub_group_local_id(); k < nsg; k += sgs)
+        p += slm_buf[k];
+    p = sub_group_reduce_add(p);
+    rms = native_rsqrt(p / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
+#else
     if (get_num_sub_groups() == 1) {
         // single sub-group covers the whole row: no SLM / no barrier needed.
         rms = native_rsqrt(rms / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
@@ -121,6 +147,7 @@ KERNEL(rms_gpu_bfyx_opt)(
         p = sub_group_reduce_add(p);
         rms = native_rsqrt(p / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
     }
+#endif
 
     #if HAS_FUSED_OPS
         uint b, f, z, y, x;

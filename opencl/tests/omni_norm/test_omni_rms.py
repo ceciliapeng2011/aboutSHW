@@ -23,6 +23,8 @@
 # Variants:
 #   ov     : exact OV config (dynamic, shape_info arg, runtime LWS)      -> matches OV us
 #   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS    -> step 1/3 probe
+#   qk_specialized : bucket + compile-time one-subgroup row path for D=128 q/k
+#   hidden_specialized : bucket + compile-time multi-subgroup row path for D=2560 hidden
 #   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
 #   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
 #
@@ -119,6 +121,18 @@ def build(D, rank, eps, variant):
         opts = base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
         disp = f"bucket sbs=8 stack={stack} LWS={lws}"
+    elif variant == "qk_specialized":
+        stack = (D + lws - 1) // lws
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+                f"-DSUBGROUP_BLOCK_SIZE=8 -DONE_SUBGROUP_ROW=1")
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        disp = f"qk one-sg stack={stack} LWS={lws}"
+    elif variant == "hidden_specialized":
+        stack = (D + lws - 1) // lws
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+                f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        disp = f"hidden multi-sg stack={stack} LWS={lws}"
     elif variant == "bucket_tuned":
         sbs = subgroup_block_size(items)
         stack = items + 1
@@ -159,7 +173,8 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     out_pool = [cl.tensor(zeros) for _ in range(pool)]
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket", "bucket_tuned") else []
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in (
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "bucket_tuned") else []
 
     def _args(i):
         return shape_info + [in_pool[i % pool], tg, out_pool[i % pool]]
@@ -200,6 +215,10 @@ def main():
                                      ("k_norm", 2556 * 8, 128, 4, 319)]:
         results.append(run_case(name, rows, D, rank, ref, "ov"))
         results.append(run_case(name, rows, D, rank, ref, "bucket"))
+        if D == 2560:
+            results.append(run_case(name, rows, D, rank, ref, "hidden_specialized"))
+        if D == 128:
+            results.append(run_case(name, rows, D, rank, ref, "qk_specialized"))
         results.append(run_case(name, rows, D, rank, ref, "bucket_tuned"))
         results.append(run_case(name, rows, D, rank, ref, "static"))
     assert all(results), "accuracy check failed"

@@ -21,6 +21,12 @@ verified is flagged as such — not guessed. (See README "No-hypothesis rule".)
 | Bucketed fixed-LWS dynamic-ABI prototype (`bucket`) | ✅ measured |
 | `static` same-work baseline for optimization | ✅ |
 
+## Progress tracking rule
+
+Validated-status sections are append-only snapshots. Do **not** overwrite an existing
+`## Current validated status (date, commit ...)` section when new measurements are taken;
+add a new section with the current commit and keep older sections for comparison.
+
 ## Current validated status (2026-07-03, commit c0bceb5)
 
 Run environment is the aboutSHW setup from `HOW_TO_RUN_aboutSHW.md`: `llm` docker
@@ -34,13 +40,13 @@ runtime LWS, static normalized dim, gamma-only affine, no residual/bias fused op
 The exact `ov` variant matches OV device time closely; `static` is the same work with
 compile-constant LWS and is mainly an optimization reference.
 
-Latest validated run after adding the step variants and rerunning `test_omni_rms.py`:
+Latest validated run after adding the first step variants and rerunning `test_omni_rms.py`:
 
 | case | `ov` median | `bucket` median | `bucket_tuned` median | `static` median | best step |
 |---|---:|---:|---:|---:|---|
-| hidden | 512 us | 356 us | 361 us | 356 us | fixed-LWS bucket, −30.5% vs `ov` |
-| q_norm | 704 us | 463 us | 825 us | 829 us | fixed-LWS bucket, −34.2% vs `ov` |
-| k_norm | 178 us | 117 us | 209 us | 209 us | fixed-LWS bucket, −34.0% vs `ov` |
+| hidden | 512 us | 356 us | 361 us | 356 us | fixed-LWS bucket, -30.5% vs `ov` |
+| q_norm | 704 us | 463 us | 825 us | 829 us | fixed-LWS bucket, -34.2% vs `ov` |
+| k_norm | 178 us | 117 us | 209 us | 209 us | fixed-LWS bucket, -34.0% vs `ov` |
 
 Notes:
 - RMS has no extra fused residual/bias operands in the verified C6 path. The gamma
@@ -49,9 +55,74 @@ Notes:
   for every row.
 - The current RMS script reports input/output physical DRAM bandwidth (`x.nbytes * 2`)
   and keeps gamma as one fixed tensor, so the table above follows that script output.
-- The fixed-LWS dynamic-ABI `bucket` variant is the best RMS step in this harness. It
+- The fixed-LWS dynamic-ABI `bucket` variant is the best RMS step in this snapshot. It
   keeps the shape-info arg but compiles literal `LWS`; that alone reaches hidden static
-  performance and beats current static-style constants for q/k.
+  performance and beats static-style constants for q/k.
+- `bucket_tuned`/`static` use `STACK_SIZE=items+1`; for q/k this is 9 instead of the
+  `bucket` value 8 and regresses heavily. Stack/subgroup tuning must be measured per
+  bucket rather than copied wholesale from the old static path.
+
+### MVN
+
+`test_omni_mvn.py` reproduces the C6 vision MVN path: dynamic shape-info arg,
+runtime LWS, static normalized dim, and fused affine epilogue
+`MVN -> Multiply(gamma) -> Add(beta)`. The generated `FUSED_OPS` macro body was
+mirrored from dumped CL sources as a two-op affine chain with OV-like load/calc
+ordering and `convert_half` steps.
+
+Latest validated run uses rotated input/output/gamma/beta buffers and reports
+**physical DRAM traffic**, not logical per-element fused traffic. The numerator is:
+`input read + output write + one gamma vector read + one beta vector read`.
+
+| case | `ov` median | `bucket` median | `static` median | best step |
+|---|---:|---:|---:|---|
+| vit | 594 us | 349 us | 349 us | fixed-LWS bucket, -41.2% vs `ov` |
+| merger | 761 us | 440 us | 439 us | fixed-LWS bucket, -42.2% vs `ov` |
+
+Notes:
+- Gamma/beta buffers are now rotated too, so cross-launch cache reuse is reduced for
+  fused operands.
+- Bandwidth utilization uses physical DRAM traffic. Counting gamma/beta as full
+  per-element unique traffic gives impossible-looking values above the 100 GB/s roof
+  because the gamma/beta vectors are reused across rows and are tiny versus the input.
+- The `bucket` MVN variant keeps the dynamic shape-info ABI but recovers static-level
+  performance, so the measured gap is fixed-LWS codegen/attribute loss rather than
+  missing math or shape-info argument overhead.
+
+## Current validated status (2026-07-03, commit d8d6e20)
+
+Run environment is the aboutSHW setup from `HOW_TO_RUN_aboutSHW.md`: `llm` docker
+container, `conda activate built_ov`, and
+`/ceciliapeng/VM/openvino/build_Release/install/setupvars.sh`.
+
+### RMS
+
+`test_omni_rms.py` reproduces the C6 Thinker RMS path: dynamic shape-info arg,
+runtime LWS, static normalized dim, gamma-only affine, no residual/bias fused op.
+The exact `ov` variant matches OV device time closely; `static` is the same work with
+compile-constant LWS and is mainly an optimization reference.
+
+Latest validated run after adding the aboutSHW RMS specialization steps and rerunning `test_omni_rms.py`:
+
+| case | `ov` | `bucket` | specialized | `bucket_tuned` | `static` | best kept step |
+|---|---:|---:|---:|---:|---:|---|
+| hidden | 513 us | 356 us | 341 us (`hidden_specialized`) | 356 us | 361 us | hidden multi-sg, −4.1% vs `bucket`, −33.5% vs `ov` |
+| q_norm | 704 us | 465 us | 404 us (`qk_specialized`) | 833 us | 829 us | q/k one-sg, −13.0% vs `bucket`, −42.6% vs `ov` |
+| k_norm | 178 us | 118 us | 100 us (`qk_specialized`) | 209 us | 210 us | q/k one-sg, −14.9% vs `bucket`, −43.6% vs `ov` |
+
+Notes:
+- RMS has no extra fused residual/bias operands in the verified C6 path. The gamma
+  vector is part of the kernel signature, but physical DRAM traffic is modeled as
+  input read + output write + one gamma vector read, not gamma reread as unique DRAM
+  for every row.
+- The current RMS script reports input/output physical DRAM bandwidth (`x.nbytes * 2`)
+  and keeps gamma as one fixed tensor, so the table above follows that script output.
+- The fixed-LWS dynamic-ABI `bucket` variant remains the baseline optimization. The new
+  aboutSHW-only compile-time branch specializations improve further on top of it.
+- `qk_specialized` compiles out SLM and the runtime `get_num_sub_groups()==1` branch for
+  D=128 q/k rows. This is kept.
+- `hidden_specialized` compiles out the runtime one-vs-many subgroup branch for D=2560
+  hidden rows and uses the known multi-subgroup SLM path. This is kept.
 - `bucket_tuned`/`static` use `STACK_SIZE=items+1`; for q/k this is 9 instead of the
   `bucket` value 8 and regresses heavily. Stack/subgroup tuning must be measured per
   bucket rather than copied wholesale from the old static path.
@@ -186,8 +257,77 @@ prepended macro blocks + `-D` flags. Variants:
   This implements ideas 1-3 in the standalone harness.
 - **`bucket_tuned`** — RMS-only probe: `bucket` plus static-style `STACK_SIZE` /
   `SUBGROUP_BLOCK_SIZE` constants. This implements idea 4 and currently regresses q/k.
+- **`qk_specialized`** — RMS-only kept variant for D=128 q/k: `bucket` plus
+  `ONE_SUBGROUP_ROW=1`, compiling out SLM and the runtime one-subgroup branch.
+- **`hidden_specialized`** — RMS-only kept variant for D=2560 hidden: `bucket` plus
+  `MULTI_SUBGROUP_ROW=1`, compiling directly to the known multi-subgroup SLM path.
 - **`static`** — same work, compile-constant `LWS` (shape specialization). Optimization
   target; **not** an OV reproduction. Compare the same variant before/after a change.
+
+## Concrete improvement ideas for aboutSHW (commit d8d6e20)
+
+This section is aboutSHW-only. Actual OpenVINO selector/JIT changes are paused until the
+standalone harness has a fully optimized and measured local winner.
+
+| step | idea | status | result |
+|---:|---|---|---|
+| 1 | RMS q/k compile-time one-subgroup specialization (`ONE_SUBGROUP_ROW=1`) | ✅ kept | q_norm `465 -> 404 us`; k_norm `118 -> 100 us` vs `bucket` |
+| 2 | RMS hidden compile-time multi-subgroup specialization (`MULTI_SUBGROUP_ROW=1`) | ✅ kept | hidden `356 -> 341 us` vs `bucket` |
+| 3 | RMS static-style stack/subgroup constants (`bucket_tuned`) | ❌ abandoned as-is | q/k regress to ~`833/209 us`; do not copy `STACK_SIZE=items+1` blindly |
+| 4 | MVN algorithmic kernel variant: one-pass sum/sumsq or Welford-style reduction | ⬜ not implemented | next MVN work item after RMS local variants settle |
+| 5 | RMS hidden deeper multi-subgroup tuning | ⬜ not implemented | possible next RMS work: tune SLM reduction shape after `hidden_specialized` |
+| 6 | Keep physical DRAM/cold-buffer reporting consistent | ✅ kept | MVN rotates input/output/gamma/beta; RMS currently rotates input/output and reports that model |
+
+### aboutSHW step 1: RMS q/k one-subgroup specialization
+
+Implementation:
+- Added `ONE_SUBGROUP_ROW` in `rms_gpu_bfyx_opt.cl`.
+- Added `qk_specialized` in `test_omni_rms.py` for D=128 q/k rows.
+- The specialized path removes `__local` SLM allocation from the compiled q/k kernel and
+  compiles directly to `sub_group_reduce_add -> native_rsqrt`, with no runtime
+  `get_num_sub_groups()==1` branch.
+
+Validation:
+- `python -m py_compile test_omni_rms.py` passed.
+- `python test_omni_rms.py` passed accuracy for all RMS cases.
+
+Measured result:
+
+| case | `bucket` | `qk_specialized` | status |
+|---|---:|---:|---|
+| q_norm | 465 us | 404 us | kept, −13.0% vs `bucket` |
+| k_norm | 118 us | 100 us | kept, −14.9% vs `bucket` |
+
+### aboutSHW step 2: RMS hidden multi-subgroup specialization
+
+Implementation:
+- Added `MULTI_SUBGROUP_ROW` in `rms_gpu_bfyx_opt.cl`.
+- Added `hidden_specialized` in `test_omni_rms.py` for D=2560 hidden rows.
+- The specialized path compiles directly to the known multi-subgroup SLM reduction and
+  replaces runtime `get_num_sub_groups()` with `LWS / SUB_GROUP_SIZE`.
+
+Validation:
+- Same RMS run as step 1; syntax and accuracy passed.
+
+Measured result:
+
+| case | `bucket` | `hidden_specialized` | status |
+|---|---:|---:|---|
+| hidden | 356 us | 341 us | kept, −4.1% vs `bucket` |
+
+### aboutSHW step 3: RMS static-style stack/subgroup constants
+
+Status: abandoned as-is.
+
+`bucket_tuned` reused static-style `STACK_SIZE=items+1`; for q/k this produces
+`STACK_SIZE=9` and regresses badly versus the dynamic bucket's `STACK_SIZE=8`.
+
+### aboutSHW next
+
+The next aboutSHW-only optimization should be MVN algorithmic work, because RMS now has
+two local branch-specialization wins on top of the fixed-LWS bucket. Start with an MVN
+one-pass sum/sumsq or Welford-style variant and compare against current MVN `bucket`:
+vit ~`349 us`, merger ~`440 us`.
 
 ## Concrete improvement ideas for dynamic OV (commit c0bceb5)
 
@@ -240,6 +380,24 @@ Implementation in the harness:
 - Row count remains runtime dispatch through `gws=[LWS, rows]`; only the normalized
   dim and selected LWS are bucket-specialized.
 
+Implementation in OpenVINO (`/home/intel/ceciliapeng/VM/openvino`, commit `8212005dfb`):
+- `mvn_kernel_bfyx_opt.cpp`: when tensors are dynamic but the reduction dim JIT string
+  is static, compute the same bucket LWS as the static path and emit literal `LWS`
+  instead of `get_local_size(0)`.
+- `mvn_gpu_bfyx_opt.cl`: keep `IS_DYNAMIC` for ABI/shape-info behavior, but allow
+  `reqd_work_group_size(LWS,1,1)` when `FIXED_LWS_DYNAMIC` is true.
+- `rms_kernel_bfyx_opt.cpp`: when the dynamic data-size JIT string is static, compute
+  bucket LWS and emit literal `LWS` while preserving the shape-info ABI and existing
+  dynamic stack/subgroup constants (`STACK_SIZE=ceil_div(D,LWS)`, `SUBGROUP_BLOCK_SIZE=8`).
+
+Build validation:
+- `cmake --build /ceciliapeng/VM/openvino/build_Release --target openvino_intel_gpu_plugin -j$(nproc)`
+  inside the `llm`/`built_ov` environment compiled the touched RMS/MVN objects and linked
+  the GPU kernel selector/graph libraries.
+- The aboutSHW RMS/MVN scripts still measure their local CL harness variants; they passed
+  `py_compile` and accuracy after this patch, but they are not an end-to-end validation of
+  the real OpenVINO selector change.
+
 Result: this is the main win.
 
 | kernel | case | `ov` | `bucket` | delta |
@@ -285,6 +443,17 @@ compatibility. The real target is avoiding runtime `LWS` and broad `IS_DYNAMIC` 
 No new algorithmic kernel changes were mixed into this pass. The bucket result should be
 treated as the first OV-facing optimization target; RMS barrier changes, MVN algorithmic
 rewrites, and `USE_BLOCK_WRITE` should be measured after fixed-LWS dynamic codegen.
+
+### Remaining validation for the OpenVINO patch
+
+- Re-run the original Qwen3-Omni C6 OpenVINO benchmark/log capture against the rebuilt
+  `/ceciliapeng/VM/openvino/build_Release/install` runtime and confirm verbose log / dumped
+  kernel JIT shows literal `LWS` for the dynamic static-reduction RMS/MVN buckets.
+- Compare the real C6 RMS/MVN hash timings before/after the selector patch. Expected
+  direction from the harness: dynamic RMS/MVN should move toward the `bucket` timings, but
+  exact model-level gain must be measured in the full OV graph.
+- If the real dumped MVN fused code still carries dynamic fused-op boundary checks, audit
+  whether they remain necessary for these static normalized-dim `:nopad` buckets.
 
 ## Open / next
 
