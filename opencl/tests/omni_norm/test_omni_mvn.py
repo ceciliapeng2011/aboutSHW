@@ -22,6 +22,7 @@
 #
 # Variants:
 #   ov     : exact OV config (dynamic, shape_info arg, fused gamma+beta, runtime LWS)
+#   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS + reqd_work_group_size
 #   static : same work, static-shape specialization
 #
 # NOTE: the fused epilogue reproduces OV's affine functionally (out = norm*gamma + beta,
@@ -110,6 +111,11 @@ MVN_DYN_DEFS = r"""
 #define LWS (get_local_size(0))
 """
 
+MVN_SHAPE_ARG_DEFS = r"""
+#undef OPTIONAL_SHAPE_INFO_ARG
+#define OPTIONAL_SHAPE_INFO_ARG const __global int* shape_info,
+"""
+
 
 def get_lws(data_set_size, max_lws=MAX_LWS):
     """Port of mvn_kernel_bfyx_opt.cpp::SetDefault LWS loop (f16: local_mem_per_wi=4)."""
@@ -127,6 +133,9 @@ def build(D, eps, variant):
     if variant == "ov":
         opts = base + " -DIS_DYNAMIC=1"
         src = SHIM + "\n" + MVN_DYN_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
+    elif variant == "bucket":
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws}"
+        src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
     else:  # static specialization (same fused work)
         opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws}"
         src = SHIM + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
@@ -161,7 +170,7 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     beta_pool = [cl.tensor(beta) for _ in range(pool)]
     # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
     # unused by the body but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket") else []
 
     def _args(i):
         slot = i % pool
@@ -200,6 +209,7 @@ def main():
     # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
     for name, rows, D, ref in [("vit", 6864, 1152, 833), ("merger", 1716, 4608, 910)]:
         results.append(run_case(name, rows, D, ref, "ov"))
+        results.append(run_case(name, rows, D, ref, "bucket"))
         results.append(run_case(name, rows, D, ref, "static"))
     assert all(results), "accuracy check failed"
     print("accuracy: all good")

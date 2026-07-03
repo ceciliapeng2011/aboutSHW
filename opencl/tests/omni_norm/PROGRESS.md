@@ -18,6 +18,7 @@ verified is flagged as such — not guessed. (See README "No-hypothesis rule".)
 | Accuracy vs torch (RMS hidden/q/k, MVN vit/merger) | ✅ all pass |
 | Steady-state timing (median, warm-up discarded) | ✅ |
 | **`ov` variant = exact OV** (args/flags/padding/fusion verified) → RMS ~2%, MVN physical-traffic run below | ✅ (this pass) |
+| Bucketed fixed-LWS dynamic-ABI prototype (`bucket`) | ✅ measured |
 | `static` same-work baseline for optimization | ✅ |
 
 ## Current validated status (2026-07-03, commit c0bceb5)
@@ -33,13 +34,13 @@ runtime LWS, static normalized dim, gamma-only affine, no residual/bias fused op
 The exact `ov` variant matches OV device time closely; `static` is the same work with
 compile-constant LWS and is mainly an optimization reference.
 
-Latest validated run after rerunning `test_omni_rms.py`:
+Latest validated run after adding the step variants and rerunning `test_omni_rms.py`:
 
-| case | `ov` median | OV C6 | `ov` DRAM BW | `static` median | `static` DRAM BW |
-|---|---:|---:|---:|---:|---:|
-| hidden | 512 us | 722 us | 51.1 GB/s | 356 us | 73.5 GB/s |
-| q_norm | 703 us | 1267 us | 59.6 GB/s | 832 us | 50.3 GB/s |
-| k_norm | 178 us | 319 us | 58.9 GB/s | 210 us | 49.9 GB/s |
+| case | `ov` median | `bucket` median | `bucket_tuned` median | `static` median | best step |
+|---|---:|---:|---:|---:|---|
+| hidden | 512 us | 356 us | 361 us | 356 us | fixed-LWS bucket, −30.5% vs `ov` |
+| q_norm | 704 us | 463 us | 825 us | 829 us | fixed-LWS bucket, −34.2% vs `ov` |
+| k_norm | 178 us | 117 us | 209 us | 209 us | fixed-LWS bucket, −34.0% vs `ov` |
 
 Notes:
 - RMS has no extra fused residual/bias operands in the verified C6 path. The gamma
@@ -48,8 +49,12 @@ Notes:
   for every row.
 - The current RMS script reports input/output physical DRAM bandwidth (`x.nbytes * 2`)
   and keeps gamma as one fixed tensor, so the table above follows that script output.
-- The hidden RMS dynamic penalty remains the clearest evidence that fixed-LWS codegen
-  is valuable when the normalized dim is already static.
+- The fixed-LWS dynamic-ABI `bucket` variant is the best RMS step in this harness. It
+  keeps the shape-info arg but compiles literal `LWS`; that alone reaches hidden static
+  performance and beats current static-style constants for q/k.
+- `bucket_tuned`/`static` use `STACK_SIZE=items+1`; for q/k this is 9 instead of the
+  `bucket` value 8 and regresses heavily. Stack/subgroup tuning must be measured per
+  bucket rather than copied wholesale from the old static path.
 
 ### MVN
 
@@ -59,14 +64,14 @@ runtime LWS, static normalized dim, and fused affine epilogue
 mirrored from dumped CL sources as a two-op affine chain with OV-like load/calc
 ordering and `convert_half` steps.
 
-Latest validated run uses rotated input/output/gamma/beta buffers and reports
+Latest validated run after adding the step variant uses rotated input/output/gamma/beta buffers and reports
 **physical DRAM traffic**, not logical per-element fused traffic. The numerator is:
 `input read + output write + one gamma vector read + one beta vector read`.
 
-| case | `ov` median | OV C6 | `ov` DRAM BW | `static` median | `static` DRAM BW |
-|---|---:|---:|---:|---:|---:|
-| vit | 594 us | 833 us | 53.3 GB/s | 348 us | 90.8 GB/s |
-| merger | 758 us | 910 us | 41.7 GB/s | 438 us | 72.2 GB/s |
+| case | `ov` median | `bucket` median | `static` median | best step |
+|---|---:|---:|---:|---|
+| vit | 594 us | 349 us | 349 us | fixed-LWS bucket, −41.2% vs `ov` |
+| merger | 761 us | 440 us | 439 us | fixed-LWS bucket, −42.2% vs `ov` |
 
 Notes:
 - Gamma/beta buffers are now rotated too, so cross-launch cache reuse is reduced for
@@ -74,8 +79,9 @@ Notes:
 - Bandwidth utilization uses physical DRAM traffic. Counting gamma/beta as full
   per-element unique traffic gives impossible-looking values above the 100 GB/s roof
   because the gamma/beta vectors are reused across rows and are tiny versus the input.
-- The `static` MVN baseline is much faster than dynamic, which points at dynamic-LWS
-  codegen overhead rather than missing math.
+- The `bucket` MVN variant keeps the dynamic shape-info ABI but recovers static-level
+  performance, so the measured gap is fixed-LWS codegen/attribute loss rather than
+  missing math or shape-info argument overhead.
 
 ## Issues found & causes
 
@@ -170,11 +176,16 @@ recover fixed-LWS specialization without losing dynamic row dispatch.
 ## Variants (how each test runs)
 
 Kernels stay **verbatim**; the tests drive OV's real dynamic / `HAS_FUSED_OPS` paths via
-prepended macro blocks + `-D` flags. Two variants:
+prepended macro blocks + `-D` flags. Variants:
 
 - **`ov`** — exact reproduction of what OV compiles (see the I3 arg/flag list): dynamic,
   `shape_info` arg, `HAS_PADDING=0`, runtime `LWS`, RMS gamma-only / MVN fused gamma+beta.
   Compare against OV's absolute us.
+- **`bucket`** — keeps the dynamic shape-info ABI but makes `LWS` compile-time literal,
+  so the kernel gets fixed work-group metadata while row count remains runtime dispatch.
+  This implements ideas 1-3 in the standalone harness.
+- **`bucket_tuned`** — RMS-only probe: `bucket` plus static-style `STACK_SIZE` /
+  `SUBGROUP_BLOCK_SIZE` constants. This implements idea 4 and currently regresses q/k.
 - **`static`** — same work, compile-constant `LWS` (shape specialization). Optimization
   target; **not** an OV reproduction. Compare the same variant before/after a change.
 
@@ -215,6 +226,66 @@ not actually need fully dynamic codegen.
   variants, and the `USE_BLOCK_WRITE` precedence bug are still useful, but they should
   be measured after recovering static-LWS dynamic codegen so the effects do not mix.
 
+### Step-by-step prototype results
+
+Measurements below were run in the documented `llm`/`built_ov` aboutSHW environment;
+`python -m py_compile` and accuracy passed for both scripts.
+
+#### Step 1-3: bucket fixed LWS while preserving dynamic shape-info ABI
+
+Implementation in the harness:
+- RMS/MVN add a `bucket` variant that prepends the same shape-info kernel argument as
+  `ov`, but compiles with literal `-DLWS=<bucket_lws>` and `IS_DYNAMIC=0`, restoring
+  `reqd_work_group_size` in kernels that gate it on `!IS_DYNAMIC`.
+- Row count remains runtime dispatch through `gws=[LWS, rows]`; only the normalized
+  dim and selected LWS are bucket-specialized.
+
+Result: this is the main win.
+
+| kernel | case | `ov` | `bucket` | delta |
+|---|---|---:|---:|---:|
+| RMS | hidden | 512 us | 356 us | −30.5% |
+| RMS | q_norm | 704 us | 463 us | −34.2% |
+| RMS | k_norm | 178 us | 117 us | −34.0% |
+| MVN | vit | 594 us | 349 us | −41.2% |
+| MVN | merger | 761 us | 440 us | −42.2% |
+
+Conclusion: dynamic row dispatch is not the expensive part in this harness. The expensive
+part is losing compile-time LWS / fixed work-group metadata.
+
+#### Step 4: specialize stack/subgroup constants per bucket
+
+Implementation in the harness:
+- RMS adds `bucket_tuned`, which keeps the shape-info ABI and fixed LWS but swaps in the
+  previous static-style `STACK_SIZE=items+1` and `SUBGROUP_BLOCK_SIZE=subgroup_block_size(items)`.
+
+Result: not a blanket win.
+
+| case | `bucket` | `bucket_tuned` | result |
+|---|---:|---:|---|
+| hidden | 356 us | 361 us | neutral/slightly worse |
+| q_norm | 463 us | 825 us | worse |
+| k_norm | 117 us | 209 us | worse |
+
+Conclusion: keep the dynamic bucket constants for RMS q/k (`STACK_SIZE=8`) instead of the
+old static-style `STACK_SIZE=9`. Per-bucket tuning is still valid, but every constant must
+be measured; the fixed-LWS change should land independently.
+
+#### Step 5: audit shape-info usage and guards
+
+Implementation in the harness:
+- `bucket` preserves the shape-info ABI while matching static performance for MVN and
+  RMS hidden. That isolates shape-info as not the bottleneck when the body does not read it.
+
+Conclusion: for verified `:nopad` C6 norm paths, the shape-info argument can remain for ABI
+compatibility. The real target is avoiding runtime `LWS` and broad `IS_DYNAMIC` codegen.
+
+#### Step 6: keep algorithmic optimizations separate
+
+No new algorithmic kernel changes were mixed into this pass. The bucket result should be
+treated as the first OV-facing optimization target; RMS barrier changes, MVN algorithmic
+rewrites, and `USE_BLOCK_WRITE` should be measured after fixed-LWS dynamic codegen.
+
 ## Open / next
 
 - [x] Exact OV config (`ov` variant) — RMS within ~2%; MVN merger −8%, vit −18%.
@@ -224,6 +295,6 @@ not actually need fully dynamic codegen.
 - [ ] Prototype RMS SLM-barrier reduction (`sub_group_reduce_add` chain) — see
       `rms_gpu_profile.md §3` / `mvn_analysis.md §7.2`.
 - [ ] Prototype MVN Welford single-pass — see `mvn_analysis.md §7.1`.
-- [ ] Prototype bucketed fixed-LWS dynamic kernels for RMS/MVN and compare against the
+- [x] Prototype bucketed fixed-LWS dynamic kernels for RMS/MVN and compare against the
   current `ov` and `static` harness variants.
 - [ ] Consider the `USE_BLOCK_WRITE` precedence fix (I4) as a quick win.

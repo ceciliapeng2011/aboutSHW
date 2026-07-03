@@ -22,6 +22,8 @@
 #
 # Variants:
 #   ov     : exact OV config (dynamic, shape_info arg, runtime LWS)      -> matches OV us
+#   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS    -> step 1/3 probe
+#   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
 #   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
 #
 # Run inside the llm container (built_ov env):  python test_omni_rms.py
@@ -75,6 +77,13 @@ RMS_DYN_DEFS = r"""
 #define LWS (get_local_size(0))
 """
 
+RMS_SHAPE_ARG_DEFS = r"""
+#undef OPTIONAL_SHAPE_INFO_ARG
+#undef OPTIONAL_SHAPE_INFO_TENSOR
+#define OPTIONAL_SHAPE_INFO_ARG const __global int* shape_info,
+#define OPTIONAL_SHAPE_INFO_TENSOR shape_info,
+"""
+
 
 def get_item_num_and_lws(data_size, max_lws=MAX_LWS):
     """Port of rms_kernel_bfyx_opt.cpp::get_item_num_and_lws (f16: local_mem_per_wi=4)."""
@@ -105,6 +114,18 @@ def build(D, rank, eps, variant):
         opts = base + f" -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
         src = SHIM + "\n" + RMS_DYN_DEFS + "\n" + RMS_BODY
         disp = f"dyn sbs=8 stack={stack} LWS=rt"
+    elif variant == "bucket":
+        stack = (D + lws - 1) // lws
+        opts = base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        disp = f"bucket sbs=8 stack={stack} LWS={lws}"
+    elif variant == "bucket_tuned":
+        sbs = subgroup_block_size(items)
+        stack = items + 1
+        opts = base + (f" -DLWS={lws} -DSLM_SIZE={lws} -DSTACK_SIZE={stack} "
+                       f"-DSUBGROUP_BLOCK_SIZE={sbs}")
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        disp = f"bucket sbs={sbs} stack={stack} LWS={lws}"
     else:  # static specialization (same work)
         sbs = subgroup_block_size(items)
         stack = items + 1
@@ -138,7 +159,7 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     out_pool = [cl.tensor(zeros) for _ in range(pool)]
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket", "bucket_tuned") else []
 
     def _args(i):
         return shape_info + [in_pool[i % pool], tg, out_pool[i % pool]]
@@ -178,6 +199,8 @@ def main():
                                      ("q_norm", 2556 * 32, 128, 4, 1267),
                                      ("k_norm", 2556 * 8, 128, 4, 319)]:
         results.append(run_case(name, rows, D, rank, ref, "ov"))
+        results.append(run_case(name, rows, D, rank, ref, "bucket"))
+        results.append(run_case(name, rows, D, rank, ref, "bucket_tuned"))
         results.append(run_case(name, rows, D, rank, ref, "static"))
     assert all(results), "accuracy check failed"
     print("accuracy: all good")
