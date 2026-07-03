@@ -18,6 +18,10 @@
 #define MVN_STACK_SIZE 16
 #endif
 
+#ifndef MVN_REREAD_INPUT
+#define MVN_REREAD_INPUT 0
+#endif
+
 #if !IS_DYNAMIC
 __attribute__((reqd_work_group_size(LWS, 1, 1)))
 #endif
@@ -43,12 +47,16 @@ KERNEL (mvn_gpu_bfyx_opt)(
     if (in_data_set_idx < leftovers)
         ++iters_num;
 
+#if !MVN_REREAD_INPUT
     float data[MVN_STACK_SIZE];
+#endif
     float my_sum = 0.f;
     float my_sq = 0.f;
     for (uint i = 0; i < iters_num; ++i) {
         float v = (float)input[my_data_offset + i * workers_per_data_set];
+#if !MVN_REREAD_INPUT
         data[i] = v;
+#endif
         my_sum += v;
         my_sq = fma(v, v, my_sq);
     }
@@ -59,7 +67,12 @@ KERNEL (mvn_gpu_bfyx_opt)(
 #if NORMALIZE_VARIANCE == 0
     for (uint i = 0; i < iters_num; ++i) {
         uint iteration_in_data_set_offset = i * workers_per_data_set;
-        ACTIVATION_TYPE result = TO_ACTIVATION_TYPE(data[i]) - TO_ACTIVATION_TYPE(my_sum_mean);
+    #if MVN_REREAD_INPUT
+        float v = (float)input[my_data_offset + iteration_in_data_set_offset];
+    #else
+        float v = data[i];
+    #endif
+        ACTIVATION_TYPE result = TO_ACTIVATION_TYPE(v) - TO_ACTIVATION_TYPE(my_sum_mean);
 #   if HAS_FUSED_OPS
         FUSED_OPS;
         output[my_data_offset + iteration_in_data_set_offset] = FUSED_OPS_RESULT;
@@ -80,7 +93,12 @@ KERNEL (mvn_gpu_bfyx_opt)(
 
     for (uint i = 0; i < iters_num; ++i) {
         uint iteration_in_data_set_offset = i * workers_per_data_set;
-        ACTIVATION_TYPE result = (TO_ACTIVATION_TYPE(data[i]) - TO_ACTIVATION_TYPE(my_sum_mean)) * TO_ACTIVATION_TYPE(my_inv);
+    #if MVN_REREAD_INPUT
+        float v = (float)input[my_data_offset + iteration_in_data_set_offset];
+    #else
+        float v = data[i];
+    #endif
+        ACTIVATION_TYPE result = (TO_ACTIVATION_TYPE(v) - TO_ACTIVATION_TYPE(my_sum_mean)) * TO_ACTIVATION_TYPE(my_inv);
 #   if HAS_FUSED_OPS
         FUSED_OPS;
         output[my_data_offset + iteration_in_data_set_offset] = FUSED_OPS_RESULT;

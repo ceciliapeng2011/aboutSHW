@@ -23,6 +23,7 @@
 # Variants:
 #   ov     : exact OV config (dynamic, shape_info arg, fused gamma+beta, runtime LWS)
 #   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS + reqd_work_group_size
+#   generalized : dynamic ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
 #   static : same work, static-shape specialization
 #
 # NOTE: the fused epilogue reproduces OV's affine functionally (out = norm*gamma + beta,
@@ -41,6 +42,7 @@ from clops.utils import kernel_cache
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_LWS = 1024  # min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
+MAX_REGISTER_STACK = 16
 
 
 def _pool_size(bytes_per_set):
@@ -126,18 +128,37 @@ def get_lws(data_set_size, max_lws=MAX_LWS):
     return items, lws
 
 
+def generalized_lws(data_set_size, max_lws=MAX_LWS, target_items=8):
+    """Largest power-of-two LWS that keeps at least target_items per WI."""
+    lws = 1
+    limit = max(1, min(max_lws, data_set_size // target_items))
+    while 2 * lws <= limit:
+        lws *= 2
+    return lws
+
+
 def build(D, eps, variant):
     items, lws = get_lws(D)
+    stack = (D + lws - 1) // lws
     base = (f"-DNORMALIZE_VARIANCE=1 -DEPS_INSIDE_SQRT -DEPSILON={eps} "
             f"-DDATA_SET_SIZE={D} -DDATA_SETS_COUNT=0")
     if variant == "ov":
-        opts = base + " -DIS_DYNAMIC=1"
+        opts = base + f" -DIS_DYNAMIC=1 -DMVN_STACK_SIZE={stack}"
         src = SHIM + "\n" + MVN_DYN_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
     elif variant == "bucket":
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws}"
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
+        src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
+    elif variant == "generalized":
+        lws = generalized_lws(D)
+        items = D // lws
+        stack = (D + lws - 1) // lws
+        reread = stack > MAX_REGISTER_STACK
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={min(stack, MAX_REGISTER_STACK)}"
+        if reread:
+            opts += " -DMVN_REREAD_INPUT=1"
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
     else:  # static specialization (same fused work)
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws}"
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
         src = SHIM + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
     return src, opts, lws, items
 
@@ -170,7 +191,7 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     beta_pool = [cl.tensor(beta) for _ in range(pool)]
     # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
     # unused by the body but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket") else []
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket", "generalized") else []
 
     def _args(i):
         slot = i % pool
@@ -193,10 +214,12 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
         kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
     mn, med, std = _stats_us(cl.finish())
     gbps = physical_bytes_per_call / (med * 1e-6) / 1e9  # physical DRAM BW estimate
+    stack = (D + lws - 1) // lws
+    mode = "reread" if variant == "generalized" and stack > MAX_REGISTER_STACK else "cache"
 
     print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
           f"acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
-          f"{gbps:6.1f} GB/s (pool={pool}) (OV C6 {ov_ref_us:.0f} us)")
+          f"{gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) (OV C6 {ov_ref_us:.0f} us)")
     return ok
 
 
@@ -207,9 +230,14 @@ def main():
     print("    input/output/gamma/beta buffers rotated -> med/min/std us + physical DRAM GB/s")
     results = []
     # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
-    for name, rows, D, ref in [("vit", 6864, 1152, 833), ("merger", 1716, 4608, 910)]:
+    for name, rows, D, ref in [("small", 4096, 257, 0),
+                               ("vit", 6864, 1152, 833),
+                               ("wide", 1024, 8192, 0),
+                               ("merger", 1716, 4608, 910),
+                               ("huge", 256, 32768, 0)]:
         results.append(run_case(name, rows, D, ref, "ov"))
         results.append(run_case(name, rows, D, ref, "bucket"))
+        results.append(run_case(name, rows, D, ref, "generalized"))
         results.append(run_case(name, rows, D, ref, "static"))
     assert all(results), "accuracy check failed"
     print("accuracy: all good")

@@ -362,7 +362,7 @@ Status: not implemented in this commit.
 MVN one-pass sum/sumsq or Welford-style reduction remains the next non-RMS algorithmic
 work item after the RMS branch-specialization and generalized-LWS work settles.
 
-## 6. Commit 3a21d15 — generalized RMS hidden LWS rule
+## 6. Commit 3a21d15 + working tree — generalized norm LWS rule
 
 ### 6.1 Current validated status
 
@@ -394,23 +394,36 @@ Notes:
   `target_items=8` is preferred because it matches the existing selector threshold,
   chooses hidden `LWS=256`, and keeps D=128 q/k at the one-subgroup `LWS=16` bucket.
 - Physical roofline for this PTL setup is about 103 GB/s, so RMS q/k and hidden are now
-  locally solved in the aboutSHW harness. Next non-RMS work is MVN algorithmic tuning.
+  locally solved in the aboutSHW harness. MVN generalized LWS is recorded below.
 
 #### MVN
 
-No new MVN kernel change in this commit. The latest MVN status remains the fixed-LWS
-dynamic-ABI bucket result from the earlier snapshots, with physical DRAM reporting using
-rotated input/output/gamma/beta buffers.
+`test_omni_mvn.py` now also has a generalized LWS variant using the same target-items
+idea as RMS: choose the largest power-of-two `LWS` that keeps at least 8 normalized
+elements per work-item, while preserving the dynamic shape-info ABI and fused
+gamma/beta path. The generalized MVN variant sizes `MVN_STACK_SIZE=ceil(D/LWS)` so
+smaller LWS probes remain correct.
 
-### 6.2 Concrete improvement ideas for generalized RMS
+Latest cleaned validation run:
+`python -m py_compile test_omni_mvn.py && python test_omni_mvn.py`
 
-This section records the hidden RMS roofline exploration that replaced the temporary
-hardcoded `hidden_lws256` probe with the active generalized LWS rule.
+| case | generalized selected LWS | median | physical BW | status |
+|---|---:|---:|---:|---|
+| vit | 128 | 308.125 us | 102.7 GB/s | roofline; improves over `bucket` LWS=256 |
+| merger | 512 | 306.354 us | 103.3 GB/s | roofline; improves over `bucket` LWS=1024 |
+
+### 6.2 Concrete improvement ideas for generalized RMS/MVN
+
+This section records the generalized norm roofline exploration: RMS hidden replaced the
+temporary hardcoded `hidden_lws256` probe, and MVN replaced the old bucket LWS choices
+with the same target-items rule.
 
 | step | idea | status | result |
 |---:|---|---|---|
 | 5 | RMS hidden deeper multi-subgroup tuning | ✅ generalized | archived hardcoded `hidden_lws256`; generalized LWS rule reaches ~`252 us` / `104 GB/s` |
 | 6 | Keep physical DRAM/cold-buffer reporting consistent | ✅ kept | RMS rotates input/output/gamma and reports physical input+output+gamma bytes |
+| 7 | MVN generalized LWS rule | ✅ generalized | vit `308 us` / `103 GB/s`; merger `306 us` / `103 GB/s` |
+| 8 | MVN single-read register-cache safety | ✅ guarded | cache only when `ceil(D/LWS)<=16`; reread fallback for larger normalized dims |
 
 #### aboutSHW step 5: RMS hidden LWS sweep and follow-up probes
 
@@ -501,9 +514,87 @@ the measured hidden winner (`LWS=256`), and keeps q/k at the one-subgroup `LWS=1
 
 #### aboutSHW next
 
-RMS q/k and hidden now share a generalized roofline-reaching rule around ~103-105 GB/s
-with gamma rotated cold. The next non-RMS work item is MVN algorithmic work, comparing
-against current MVN `bucket` baselines: vit ~`349 us`, merger ~`440 us`.
+RMS q/k, RMS hidden, and MVN vit/merger now share a generalized roofline-reaching rule
+around ~103-105 GB/s with physical cold-buffer accounting. The next work item is moving
+the generalized LWS choice from aboutSHW into the real OpenVINO selector/JIT path, then
+validating it in the full Qwen3-Omni C6 graph.
+
+#### aboutSHW step 7: MVN generalized LWS rule
+
+Status: kept.
+
+Generalized rule:
+- Choose the largest power-of-two `LWS` that keeps at least 8 elements per work-item:
+  `LWS = floor_pow2(min(MAX_LWS, DATA_SET_SIZE / 8))`.
+- Preserve the dynamic shape-info ABI and fused gamma/beta path.
+- Set `MVN_STACK_SIZE=ceil(DATA_SET_SIZE / LWS)` for the generalized variant.
+
+Validated command:
+`python -m py_compile test_omni_mvn.py && python test_omni_mvn.py`
+
+| case | bucket LWS | bucket median | generalized LWS | generalized median | physical BW |
+|---|---:|---:|---:|---:|---:|
+| vit | 256 | 357.083 us | 128 | 308.125 us | 102.7 GB/s |
+| merger | 1024 | 441.354 us | 512 | 306.354 us | 103.3 GB/s |
+
+MVN LWS sweep evidence:
+
+| case | LWS | median | physical BW | conclusion |
+|---|---:|---:|---:|---|
+| vit | 128 | 308.750 us | 102.5 GB/s | roofline; selected by generalized rule |
+| vit | 256 | 346.770 us | 91.2 GB/s | old bucket behavior; slower |
+| vit | 512 | 590.000 us | 53.6 GB/s | rejected |
+| vit | 1024 | 1317.604 us | 24.0 GB/s | rejected |
+| merger | 128 | 360.520 us | 87.8 GB/s | valid after stack fix, but slower |
+| merger | 256 | 314.062 us | 100.8 GB/s | near roofline, but not fastest |
+| merger | 512 | 307.291 us | 103.0 GB/s | roofline; selected by generalized rule |
+| merger | 1024 | 441.250 us | 71.7 GB/s | old bucket behavior; slower |
+
+Conclusion: MVN shares the same generalized target-items rule that solved RMS. This
+avoids shape-specific hardcoding while selecting `LWS=128` for vit (`D=1152`) and
+`LWS=512` for merger (`D=4608`).
+
+#### aboutSHW step 8: MVN register-cache safety for larger shapes
+
+Status: kept as a guard around the single-read optimization.
+
+The `float data[MVN_STACK_SIZE]` register cache is shape-dependent. Each work-item stores
+`ceil(DATA_SET_SIZE / LWS)` floats. It is safe only when the JIT-provided
+`MVN_STACK_SIZE` is at least that value, and it is only a good general strategy while the
+per-WI stack stays small enough to avoid high register pressure.
+
+Implementation rule:
+- For all harness variants, set `MVN_STACK_SIZE=ceil(DATA_SET_SIZE / LWS)` so the cached
+  path cannot write past the register array.
+- For `generalized`, keep the single-read cached path only when
+  `ceil(DATA_SET_SIZE / LWS) <= 16`.
+- If the stack would exceed 16, compile `MVN_REREAD_INPUT=1`: compute sum and sumsq in
+  one pass, then reread input for the output pass instead of storing a large register
+  array. This is safer for arbitrary larger shapes, though it gives up the one-read
+  traffic advantage.
+
+Welford note: Welford can improve numerical stability, but it does not by itself remove
+the need to either cache input for the output pass or reread it. The immediate
+generalization risk here was register-array size, so the current kept fallback is reread.
+Welford remains a future numerical-stability probe if stress cases expose cancellation in
+the sum/sumsq variance formula.
+
+Extended validation command:
+`python -m py_compile test_omni_mvn.py && python test_omni_mvn.py`
+
+| case | rows | D | generalized LWS | stack | mode | median | physical BW | status |
+|---|---:|---:|---:|---:|---|---:|---:|---|
+| small | 4096 | 257 | 32 | 9 | cache | 57.291 us | 73.5 GB/s | non-divisible D passes |
+| vit | 6864 | 1152 | 128 | 9 | cache | 305.937 us | 103.4 GB/s | roofline |
+| wide | 1024 | 8192 | 1024 | 8 | cache | 333.020 us | 100.9 GB/s | large cached path passes |
+| merger | 1716 | 4608 | 512 | 9 | cache | 305.937 us | 103.4 GB/s | roofline |
+| huge | 256 | 32768 | 1024 | 32 | reread | 371.770 us | 90.6 GB/s | safe fallback passes |
+
+Conclusion: the single-read register-cache optimization is not universally safe as a
+fixed `MVN_STACK_SIZE=16` strategy. The generalized aboutSHW kernel must either JIT the
+correct stack size for cached shapes or use the reread fallback for larger normalized
+dims. For the current Omni shapes, stack is 9 and the cached path remains the fastest
+roofline-reaching solution.
 
 ## 7. Issues found & causes
 
@@ -612,10 +703,11 @@ prepended macro blocks + `-D` flags. Variants:
   `ONE_SUBGROUP_ROW=1`, compiling out SLM and the runtime one-subgroup branch.
 - **`hidden_specialized`** — RMS-only kept variant for D=2560 hidden: `bucket` plus
   `MULTI_SUBGROUP_ROW=1`, compiling directly to the known multi-subgroup SLM path.
-- **`generalized`** — RMS-only generalized rule: choose the largest power-of-two `LWS`
-  that keeps at least 8 elements per work-item, then compile either `ONE_SUBGROUP_ROW`
-  or `MULTI_SUBGROUP_ROW` from that selected LWS. This reaches the measured roofline for
-  hidden and q/k without a hidden-only hardcode.
+- **`generalized`** — RMS/MVN generalized rule: choose the largest power-of-two `LWS`
+  that keeps at least 8 elements per work-item. RMS then compiles either
+  `ONE_SUBGROUP_ROW` or `MULTI_SUBGROUP_ROW`; MVN sets `MVN_STACK_SIZE=ceil(D/LWS)`.
+  This reaches the measured roofline for RMS hidden/q/k and MVN vit/merger without
+  shape-specific hardcoding.
 - **`static`** — same work, compile-constant `LWS` (shape specialization). Optimization
   target; **not** an OV reproduction. Compare the same variant before/after a change.
 
@@ -627,7 +719,9 @@ prepended macro blocks + `-D` flags. Variants:
   traffic instead of logical per-element fused traffic.
 - [ ] Prototype RMS SLM-barrier reduction (`sub_group_reduce_add` chain) — see
       `rms_gpu_profile.md §3` / `mvn_analysis.md §7.2`.
-- [ ] Prototype MVN Welford single-pass — see `mvn_analysis.md §7.1`.
+- [x] Explore MVN LWS tuning after the one-read sum/sumsq kernel; generalized LWS reaches
+  roofline for vit and merger, so Welford is no longer the next performance item for
+  these measured shapes.
 - [x] Prototype bucketed fixed-LWS dynamic kernels for RMS/MVN and compare against the
   current `ov` and `static` harness variants.
 - [ ] Consider the `USE_BLOCK_WRITE` precedence fix (I4) as a quick win.
