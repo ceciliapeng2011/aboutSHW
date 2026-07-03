@@ -27,6 +27,19 @@ Validated-status sections are append-only snapshots. Do **not** overwrite an exi
 `## Current validated status (date, commit ...)` section when new measurements are taken;
 add a new section with the current commit and keep older sections for comparison.
 
+## Roofline exploration rule
+
+The measured physical DRAM roofline for this PTL setup is about **103 GB/s**. When an
+optimization reaches that limit, treat it as a solved local point, not automatically as
+the final design:
+- Record the measurement, the hypothesis it validates, and the exact code-change patch
+  that produced the result.
+- Revert hardcoded or over-specialized probe code after recording it, then continue with
+  the next exploration step toward a more generalized solution.
+- Prefer a generalized rule when multiple variants reach the same roofline; keep a
+  hardcoded specialization only if it remains the simplest correct expression of the
+  measured rule.
+
 ## Current validated status (2026-07-03, commit c0bceb5)
 
 Run environment is the aboutSHW setup from `HOW_TO_RUN_aboutSHW.md`: `llm` docker
@@ -261,6 +274,10 @@ prepended macro blocks + `-D` flags. Variants:
   `ONE_SUBGROUP_ROW=1`, compiling out SLM and the runtime one-subgroup branch.
 - **`hidden_specialized`** — RMS-only kept variant for D=2560 hidden: `bucket` plus
   `MULTI_SUBGROUP_ROW=1`, compiling directly to the known multi-subgroup SLM path.
+- **`generalized`** — RMS-only generalized rule: choose the largest power-of-two `LWS`
+  that keeps at least 8 elements per work-item, then compile either `ONE_SUBGROUP_ROW`
+  or `MULTI_SUBGROUP_ROW` from that selected LWS. This reaches the measured roofline for
+  hidden and q/k without a hidden-only hardcode.
 - **`static`** — same work, compile-constant `LWS` (shape specialization). Optimization
   target; **not** an OV reproduction. Compare the same variant before/after a change.
 
@@ -275,8 +292,8 @@ standalone harness has a fully optimized and measured local winner.
 | 2 | RMS hidden compile-time multi-subgroup specialization (`MULTI_SUBGROUP_ROW=1`) | ✅ kept | hidden `356 -> 341 us` vs `bucket` |
 | 3 | RMS static-style stack/subgroup constants (`bucket_tuned`) | ❌ abandoned as-is | q/k regress to ~`833/209 us`; do not copy `STACK_SIZE=items+1` blindly |
 | 4 | MVN algorithmic kernel variant: one-pass sum/sumsq or Welford-style reduction | ⬜ not implemented | next MVN work item after RMS local variants settle |
-| 5 | RMS hidden deeper multi-subgroup tuning | ⬜ not implemented | possible next RMS work: tune SLM reduction shape after `hidden_specialized` |
-| 6 | Keep physical DRAM/cold-buffer reporting consistent | ✅ kept | MVN rotates input/output/gamma/beta; RMS currently rotates input/output and reports that model |
+| 5 | RMS hidden deeper multi-subgroup tuning | ✅ generalized | archived hardcoded `hidden_lws256`; generalized LWS rule reaches ~`252 us` / `104 GB/s` |
+| 6 | Keep physical DRAM/cold-buffer reporting consistent | ✅ kept | MVN rotates input/output/gamma/beta; RMS rotates input/output/gamma and reports physical input+output+gamma bytes |
 
 ### aboutSHW step 1: RMS q/k one-subgroup specialization
 
@@ -322,12 +339,98 @@ Status: abandoned as-is.
 `bucket_tuned` reused static-style `STACK_SIZE=items+1`; for q/k this produces
 `STACK_SIZE=9` and regresses badly versus the dynamic bucket's `STACK_SIZE=8`.
 
+### aboutSHW step 5: RMS hidden LWS sweep and follow-up probes
+
+Status: archived `hidden_lws256`; removed neutral follow-up probes; continued with a
+generalized LWS selection rule.
+
+Validated command for each step:
+`python -m py_compile test_omni_rms.py && python test_omni_rms.py`
+
+| step | probe | hidden median | physical BW | status |
+|---:|---|---:|---:|---|
+| 0 | baseline `hidden_specialized` (`LWS=512`) | 339.791 us | 77.0 GB/s | replaced by LWS sweep winner |
+| 1 | `hidden_lws256` | 251.666 us | 104.0 GB/s | roofline reached; patch archived, hardcoded probe reverted |
+| 1 | `hidden_lws512` | 338.958 us | 77.2 GB/s | rejected; same as old hidden path |
+| 1 | `hidden_lws1024` | 886.145 us | 29.5 GB/s | rejected; too many subgroup partials / poor occupancy |
+| 2 | fixed hidden vector path on `LWS=256` | ~250.5 us | ~104.5 GB/s | still roofline and ~1.36x faster than `LWS=512` baseline; removed because it adds no stable gain over `hidden_lws256` |
+| 3 | reread-input/no-`data[]` probe on `LWS=256` | ~250.6-252.1 us | not comparable | still near the `hidden_lws256` time and faster than `LWS=512` baseline; removed because reread traffic is not honest physical traffic and adds no real speed gain |
+| 4 | single-subgroup reducer probe on `LWS=256` | ~251.1 us | ~104.2 GB/s | still roofline and ~1.35x faster than `LWS=512` baseline; removed because it adds no stable gain over `hidden_lws256` |
+
+Archived roofline patch for `hidden_lws256`:
+
+```diff
+diff --git a/opencl/tests/omni_norm/test_omni_rms.py b/opencl/tests/omni_norm/test_omni_rms.py
+@@
+ #   qk_specialized : bucket + compile-time one-subgroup row path for D=128 q/k
+ #   hidden_specialized : bucket + compile-time multi-subgroup row path for D=2560 hidden
++#   hidden_lws{256,512,1024} : hidden_specialized with explicit LWS sweep
+ #   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
+@@
+     elif variant == "hidden_specialized":
+         stack = (D + lws - 1) // lws
+         opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+                 f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
+         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+         disp = f"hidden multi-sg stack={stack} LWS={lws}"
++    elif variant.startswith("hidden_lws"):
++        lws = int(variant.removeprefix("hidden_lws"))
++        items = D // lws
++        stack = (D + lws - 1) // lws
++        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
++                f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
++        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
++        disp = f"hidden lws sweep stack={stack} LWS={lws}"
+@@
+         if D == 2560:
+             results.append(run_case(name, rows, D, rank, ref, "hidden_specialized"))
++            results.append(run_case(name, rows, D, rank, ref, "hidden_lws256"))
++            results.append(run_case(name, rows, D, rank, ref, "hidden_lws512"))
++            results.append(run_case(name, rows, D, rank, ref, "hidden_lws1024"))
+```
+
+### aboutSHW step 6: generalized RMS LWS rule
+
+Status: kept.
+
+Generalized rule:
+- Choose the largest power-of-two `LWS` that keeps at least 8 elements per work-item:
+  `LWS = floor_pow2(min(MAX_LWS, DATA_SIZE / 8))`, clamped to at least one subgroup.
+- Use `ONE_SUBGROUP_ROW` when the selected `LWS` is one subgroup (`16`), otherwise use
+  `MULTI_SUBGROUP_ROW`.
+- Keep the dynamic shape-info ABI and cold-gamma physical-bandwidth reporting.
+
+Validated command:
+`python -m py_compile test_omni_rms.py && python test_omni_rms.py`
+
+| case | selected LWS | median | physical BW | comparison |
+|---|---:|---:|---:|---|
+| hidden | 256 | 251.458 us | 104.1 GB/s | matches archived `hidden_lws256` roofline result |
+| q_norm | 16 | 401.145 us | 104.4 GB/s | matches `qk_specialized` roofline result |
+| k_norm | 16 | 100.000 us | 104.7 GB/s | matches `qk_specialized` roofline result |
+
+Hidden target-items sweep, used to check whether `target_items=8` is a fragile magic
+number or a generalized rule:
+
+| target_items | selected LWS | hidden median | physical BW | conclusion |
+|---:|---:|---:|---:|---|
+| 4 | 512 | 342.187 us | 76.5 GB/s | rejected; falls back to the old `LWS=512` behavior |
+| 6 | 256 | 253.333 us | 103.3 GB/s | roofline; same useful LWS bucket as `target_items=8` |
+| 8 | 256 | 251.770 us | 104.0 GB/s | kept; aligns with the existing selector's 8-item threshold and reaches roofline |
+| 16 | 128 | 252.708 us | 103.6 GB/s | roofline too, but uses more per-WI data and is not faster |
+| 32 | 64 | 257.083 us | 101.8 GB/s | near roofline but slightly slower; not preferred |
+
+Conclusion: the generalized rule reaches the same physical roofline as the hardcoded
+hidden `LWS=256` probe and the q/k one-subgroup specialization. The target-items sweep
+shows multiple non-hardcoded choices reach the roofline, but `target_items=8` is the
+preferred rule because it matches the selector's existing item-count threshold, chooses
+the measured hidden winner (`LWS=256`), and keeps q/k at the one-subgroup `LWS=16` bucket.
+
 ### aboutSHW next
 
-The next aboutSHW-only optimization should be MVN algorithmic work, because RMS now has
-two local branch-specialization wins on top of the fixed-LWS bucket. Start with an MVN
-one-pass sum/sumsq or Welford-style variant and compare against current MVN `bucket`:
-vit ~`349 us`, merger ~`440 us`.
+RMS q/k and hidden now share a generalized roofline-reaching rule around ~103-105 GB/s
+with gamma rotated cold. The next non-RMS work item is MVN algorithmic work, comparing
+against current MVN `bucket` baselines: vit ~`349 us`, merger ~`440 us`.
 
 ## Concrete improvement ideas for dynamic OV (commit c0bceb5)
 

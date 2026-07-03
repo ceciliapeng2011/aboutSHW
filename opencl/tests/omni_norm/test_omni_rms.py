@@ -25,6 +25,7 @@
 #   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS    -> step 1/3 probe
 #   qk_specialized : bucket + compile-time one-subgroup row path for D=128 q/k
 #   hidden_specialized : bucket + compile-time multi-subgroup row path for D=2560 hidden
+#   generalized : dynamic ABI + generalized LWS rule + subgroup-row specialization
 #   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
 #   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
 #
@@ -96,6 +97,15 @@ def get_item_num_and_lws(data_size, max_lws=MAX_LWS):
     return items, lws
 
 
+def generalized_lws(data_size, max_lws=MAX_LWS, target_items=8):
+    """Largest power-of-two LWS that keeps at least target_items per WI."""
+    lws = SUB_GROUP_SIZE
+    limit = max(SUB_GROUP_SIZE, min(max_lws, data_size // target_items))
+    while 2 * lws <= limit:
+        lws *= 2
+    return lws
+
+
 def subgroup_block_size(items):
     if items >> 3:
         return 8
@@ -133,6 +143,16 @@ def build(D, rank, eps, variant):
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
         disp = f"hidden multi-sg stack={stack} LWS={lws}"
+    elif variant == "generalized":
+        lws = generalized_lws(D)
+        items = D // lws
+        stack = (D + lws - 1) // lws
+        row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
+        row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+                f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        disp = f"generalized {row_kind} stack={stack} LWS={lws}"
     elif variant == "bucket_tuned":
         sbs = subgroup_block_size(items)
         stack = items + 1
@@ -164,20 +184,22 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     x = np.random.uniform(-2.0, 2.0, [rows, D]).astype(np.float16)
     g = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
     zeros = np.zeros_like(x)
-    tg = cl.tensor(g)
     # Rotate through a pool of DISTINCT input/output buffers so back-to-back launches do
     # not re-read cache-resident data -> measures the true DRAM-bound cost, not L2/SLC hits.
-    bytes_per_set = x.nbytes * 2  # input read + output write (DRAM traffic per call)
+    cold_gamma = True
+    bytes_per_set = x.nbytes * 2 + g.nbytes
     pool = _pool_size(bytes_per_set)
     in_pool = [cl.tensor(x) for _ in range(pool)]
     out_pool = [cl.tensor(zeros) for _ in range(pool)]
+    gamma_pool = [cl.tensor(g) for _ in range(pool)]
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in (
-        "ov", "bucket", "qk_specialized", "hidden_specialized", "bucket_tuned") else []
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized", "bucket_tuned") else []
 
     def _args(i):
-        return shape_info + [in_pool[i % pool], tg, out_pool[i % pool]]
+        slot = i % pool
+        return shape_info + [in_pool[slot], gamma_pool[slot], out_pool[slot]]
 
     kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(0))
     cl.finish()
@@ -195,11 +217,12 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     for i in range(iters):
         kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
     mn, med, std = _stats_us(cl.finish())
-    gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective DRAM bandwidth at median
+    gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective physical DRAM bandwidth at median
 
     print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
           f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
-          f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}) (OV C6 {ov_ref_us:.0f} us)")
+          f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}, gamma={'cold' if cold_gamma else 'hot'}) "
+          f"(OV C6 {ov_ref_us:.0f} us)")
     return ok
 
 
@@ -219,6 +242,7 @@ def main():
             results.append(run_case(name, rows, D, rank, ref, "hidden_specialized"))
         if D == 128:
             results.append(run_case(name, rows, D, rank, ref, "qk_specialized"))
+        results.append(run_case(name, rows, D, rank, ref, "generalized"))
         results.append(run_case(name, rows, D, rank, ref, "bucket_tuned"))
         results.append(run_case(name, rows, D, rank, ref, "static"))
     assert all(results), "accuracy check failed"
