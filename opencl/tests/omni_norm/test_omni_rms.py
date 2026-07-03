@@ -35,6 +35,18 @@ from clops.utils import kernel_cache
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUB_GROUP_SIZE = 16
 MAX_LWS = 1024  # maxSlmSize = min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
+CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
+
+
+def _pool_size(bytes_per_set):
+    """#distinct buffer sets so the rotated footprint exceeds cache (kills reuse hits)."""
+    return max(3, min(64, -(-CACHE_FLUSH_BYTES // bytes_per_set)))
+
+
+def _stats_us(lat_ns):
+    """min / median / std (us) from per-call device times (ns)."""
+    a = np.sort(np.asarray(lat_ns, dtype=np.float64)) / 1e3
+    return a[0], a[len(a) // 2], a.std()
 
 
 def _read(name):
@@ -116,33 +128,42 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     np.random.seed(0)
     x = np.random.uniform(-2.0, 2.0, [rows, D]).astype(np.float16)
     g = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
-    tx, tg, to = cl.tensor(x), cl.tensor(g), cl.tensor(np.zeros_like(x))
+    zeros = np.zeros_like(x)
+    tg = cl.tensor(g)
+    # Rotate through a pool of DISTINCT input/output buffers so back-to-back launches do
+    # not re-read cache-resident data -> measures the true DRAM-bound cost, not L2/SLC hits.
+    bytes_per_set = x.nbytes * 2  # input read + output write (DRAM traffic per call)
+    pool = _pool_size(bytes_per_set)
+    in_pool = [cl.tensor(x) for _ in range(pool)]
+    out_pool = [cl.tensor(zeros) for _ in range(pool)]
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
-    args = shape_info + [tx, tg, to]
 
-    kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    def _args(i):
+        return shape_info + [in_pool[i % pool], tg, out_pool[i % pool]]
+
+    kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(0))
     cl.finish()
-    cur = to.numpy()
+    cur = out_pool[0].numpy()
     ref = ref_rms(x, g, eps)
     ok = np.allclose(cur, ref, atol=1e-2, rtol=1e-2)
     if not ok:
         bad = np.abs(cur.astype(np.float32) - ref.astype(np.float32))
         print(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
 
-    # steady-state median (warm up first; early launches run at a low GPU clock).
-    for _ in range(iters):
-        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    # steady-state stats (warm up first; early launches run at a low GPU clock).
+    for i in range(iters):
+        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
     cl.finish()
-    for _ in range(iters):
-        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
-    lat = sorted(cl.finish())
-    med_us = lat[len(lat) // 2] / 1e3
+    for i in range(iters):
+        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
+    mn, med, std = _stats_us(cl.finish())
+    gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective DRAM bandwidth at median
 
     print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
-          f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | {med_us:8.3f} us/call (median) "
-          f"(OV C6 {ov_ref_us:.0f} us)")
+          f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
+          f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}) (OV C6 {ov_ref_us:.0f} us)")
     return ok
 
 
@@ -150,6 +171,7 @@ def main():
     cl.profiling(True)
     print("=== OV rms_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 Thinker prefill (T=2556) ===")
     print("    ov = exact OV config; static = same work, static-shape specialization")
+    print("    buffers rotated (cold cache) -> med/min/std us + effective DRAM GB/s")
     results = []
     # ov_ref_us = per-call device time from C6 CLIntercept trace (rms_gpu_profile.md).
     for name, rows, D, rank, ref in [("hidden", 2556, 2560, 3, 722),
