@@ -26,6 +26,10 @@
 #define MULTI_SUBGROUP_ROW 0
 #endif
 
+#ifndef RMS_REREAD_INPUT
+#define RMS_REREAD_INPUT 0
+#endif
+
 REQD_SUB_GROUP_SIZE(SUB_GROUP_SIZE)
 KERNEL(rms_gpu_bfyx_opt)(
     OPTIONAL_SHAPE_INFO_ARG
@@ -41,6 +45,7 @@ KERNEL(rms_gpu_bfyx_opt)(
 {
     const uint data_idx = get_global_id(1);
     const uint in_data_idx = get_global_id(0);
+    const uint local_data_idx = get_local_id(0);
     const uint workers_per_data = LWS;
     const uint data_size = DATA_SIZE;
     const uint items_num = data_size / workers_per_data;
@@ -74,7 +79,9 @@ KERNEL(rms_gpu_bfyx_opt)(
     const uint sgs = get_sub_group_size();
     const uint subgroup_offset = get_sub_group_id() * sgs * items_num;
 
+#if !RMS_REREAD_INPUT
     ACCUMULATOR_TYPE data[STACK_SIZE];
+#endif
     ACCUMULATOR_TYPE rms = ACCUMULATOR_VAL_ZERO;
 
 #if !ONE_SUBGROUP_ROW
@@ -88,29 +95,51 @@ KERNEL(rms_gpu_bfyx_opt)(
         const uint ibase = input_data_offset + subgroup_offset;
         for (; i + 8 <= items_num; i += 8) {
             half8 v = DT_INPUT_BLOCK_READ8(input, ibase + i * sgs);
-            unroll_for (int j = 0; j < 8; j++) { ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]); rms += t * t; data[i + j] = t; }
+            unroll_for (int j = 0; j < 8; j++) {
+                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += t * t;
+#if !RMS_REREAD_INPUT
+                data[i + j] = t;
+#endif
+            }
         }
         for (; i + 4 <= items_num; i += 4) {
             half4 v = DT_INPUT_BLOCK_READ4(input, ibase + i * sgs);
-            unroll_for (int j = 0; j < 4; j++) { ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]); rms += t * t; data[i + j] = t; }
+            unroll_for (int j = 0; j < 4; j++) {
+                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += t * t;
+#if !RMS_REREAD_INPUT
+                data[i + j] = t;
+#endif
+            }
         }
         for (; i + 2 <= items_num; i += 2) {
             half2 v = DT_INPUT_BLOCK_READ2(input, ibase + i * sgs);
-            unroll_for (int j = 0; j < 2; j++) { ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]); rms += t * t; data[i + j] = t; }
+            unroll_for (int j = 0; j < 2; j++) {
+                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += t * t;
+#if !RMS_REREAD_INPUT
+                data[i + j] = t;
+#endif
+            }
         }
     }
     for (; i < items_num; i++)
     {
         ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs]);
         rms += tmp * tmp;
+#if !RMS_REREAD_INPUT
         data[i] = tmp;
+#endif
     }
 
-    if (in_data_idx < leftovers)
+    if (local_data_idx < leftovers)
     {
-        ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + in_data_idx]);
+        ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + local_data_idx]);
         rms += tmp * tmp;
+#if !RMS_REREAD_INPUT
         data[items_num] = tmp;
+#endif
     }
 
     rms = sub_group_reduce_add(rms);
@@ -173,11 +202,16 @@ KERNEL(rms_gpu_bfyx_opt)(
     // general/fused path: scalar (fused-ops not used by the Omni RMS config)
     for (i = 0; i < items_num; i++)
     {
+    #if RMS_REREAD_INPUT
+        ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs]);
+    #else
+        ACCUMULATOR_TYPE data_value = data[i];
+    #endif
 #if ELEMENTWISE_AFFINE
         ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[subgroup_offset + get_sub_group_local_id() + i * sgs]);
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i] * temp);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value * temp);
 #else
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i]);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value);
 #endif
         LAST_DIM = subgroup_offset + get_sub_group_local_id() + i * sgs;
         FUSED_OPS;
@@ -197,10 +231,15 @@ KERNEL(rms_gpu_bfyx_opt)(
 #endif
             half8 o;
             unroll_for (int j = 0; j < 8; j++) {
-#if ELEMENTWISE_AFFINE
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j] * TO_ACCUMULATOR_TYPE(g[j]));
+#if RMS_REREAD_INPUT
+                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
 #else
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j]);
+                ACCUMULATOR_TYPE data_value = data[i + j];
+#endif
+#if ELEMENTWISE_AFFINE
+                o[j] = TO_OUTPUT_TYPE(rms * data_value * TO_ACCUMULATOR_TYPE(g[j]));
+#else
+                o[j] = TO_OUTPUT_TYPE(rms * data_value);
 #endif
             }
             DT_OUTPUT_BLOCK_WRITE8(output, obase + i * sgs, o);
@@ -211,10 +250,15 @@ KERNEL(rms_gpu_bfyx_opt)(
 #endif
             half4 o;
             unroll_for (int j = 0; j < 4; j++) {
-#if ELEMENTWISE_AFFINE
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j] * TO_ACCUMULATOR_TYPE(g[j]));
+#if RMS_REREAD_INPUT
+                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
 #else
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j]);
+                ACCUMULATOR_TYPE data_value = data[i + j];
+#endif
+#if ELEMENTWISE_AFFINE
+                o[j] = TO_OUTPUT_TYPE(rms * data_value * TO_ACCUMULATOR_TYPE(g[j]));
+#else
+                o[j] = TO_OUTPUT_TYPE(rms * data_value);
 #endif
             }
             DT_OUTPUT_BLOCK_WRITE4(output, obase + i * sgs, o);
@@ -225,10 +269,15 @@ KERNEL(rms_gpu_bfyx_opt)(
 #endif
             half2 o;
             unroll_for (int j = 0; j < 2; j++) {
-#if ELEMENTWISE_AFFINE
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j] * TO_ACCUMULATOR_TYPE(g[j]));
+#if RMS_REREAD_INPUT
+                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
 #else
-                o[j] = TO_OUTPUT_TYPE(rms * data[i + j]);
+                ACCUMULATOR_TYPE data_value = data[i + j];
+#endif
+#if ELEMENTWISE_AFFINE
+                o[j] = TO_OUTPUT_TYPE(rms * data_value * TO_ACCUMULATOR_TYPE(g[j]));
+#else
+                o[j] = TO_OUTPUT_TYPE(rms * data_value);
 #endif
             }
             DT_OUTPUT_BLOCK_WRITE2(output, obase + i * sgs, o);
@@ -236,30 +285,40 @@ KERNEL(rms_gpu_bfyx_opt)(
     }
     for (; i < items_num; i++)
     {
+    #if RMS_REREAD_INPUT
+        ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs]);
+    #else
+        ACCUMULATOR_TYPE data_value = data[i];
+    #endif
 #if ELEMENTWISE_AFFINE
         ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[subgroup_offset + get_sub_group_local_id() + i * sgs]);
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i] * temp);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value * temp);
 #else
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i]);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value);
 #endif
         output[output_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs] = normalized;
     }
 #endif
 
-    if (in_data_idx < leftovers)
+        if (local_data_idx < leftovers)
     {
+    #if RMS_REREAD_INPUT
+        ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + local_data_idx]);
+    #else
+        ACCUMULATOR_TYPE data_value = data[items_num];
+    #endif
 #if ELEMENTWISE_AFFINE
-        ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[workers_per_data * items_num + in_data_idx]);
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[items_num] * temp);
+        ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[workers_per_data * items_num + local_data_idx]);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value * temp);
 #else
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[items_num]);
+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value);
 #endif
         #if HAS_FUSED_OPS
-            LAST_DIM = workers_per_data * items_num + in_data_idx;
+            LAST_DIM = workers_per_data * items_num + local_data_idx;
             FUSED_OPS;
             normalized = FUSED_OPS_RESULT;
         #endif
-        output[output_data_offset + workers_per_data * items_num + in_data_idx] = normalized;
+        output[output_data_offset + workers_per_data * items_num + local_data_idx] = normalized;
     }
 }
 #undef USE_BLOCK_WRITE

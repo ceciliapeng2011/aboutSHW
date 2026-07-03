@@ -25,7 +25,8 @@
 #   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS    -> step 1/3 probe
 #   qk_specialized : bucket + compile-time one-subgroup row path for D=128 q/k
 #   hidden_specialized : bucket + compile-time multi-subgroup row path for D=2560 hidden
-#   generalized : dynamic ABI + generalized LWS rule + subgroup-row specialization
+#   generalized : dynamic ABI + generalized LWS rule + subgroup-row specialization;
+#                 cached when stack<=16, reread fallback otherwise
 #   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
 #   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
 #
@@ -41,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SUB_GROUP_SIZE = 16
 MAX_LWS = 1024  # maxSlmSize = min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
+MAX_REGISTER_STACK = 16
 
 
 def _pool_size(bytes_per_set):
@@ -147,12 +149,16 @@ def build(D, rank, eps, variant):
         lws = generalized_lws(D)
         items = D // lws
         stack = (D + lws - 1) // lws
+        reread = stack > MAX_REGISTER_STACK
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={min(stack, MAX_REGISTER_STACK)} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
+        if reread:
+            opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
-        disp = f"generalized {row_kind} stack={stack} LWS={lws}"
+        mode = "reread" if reread else "cache"
+        disp = f"generalized {row_kind} stack={stack} {mode} LWS={lws}"
     elif variant == "bucket_tuned":
         sbs = subgroup_block_size(items)
         stack = items + 1
@@ -233,9 +239,13 @@ def main():
     print("    buffers rotated (cold cache) -> med/min/std us + effective DRAM GB/s")
     results = []
     # ov_ref_us = per-call device time from C6 CLIntercept trace (rms_gpu_profile.md).
-    for name, rows, D, rank, ref in [("hidden", 2556, 2560, 3, 722),
+    for name, rows, D, rank, ref in [("tail16", 4096, 272, 3, 0),
+                                     ("hidden", 2556, 2560, 3, 722),
                                      ("q_norm", 2556 * 32, 128, 4, 1267),
-                                     ("k_norm", 2556 * 8, 128, 4, 319)]:
+                                     ("k_norm", 2556 * 8, 128, 4, 319),
+                                     ("mid", 2048, 1152, 3, 0),
+                                     ("wide", 1024, 8192, 3, 0),
+                                     ("huge", 256, 32768, 3, 0)]:
         results.append(run_case(name, rows, D, rank, ref, "ov"))
         results.append(run_case(name, rows, D, rank, ref, "bucket"))
         if D == 2560:

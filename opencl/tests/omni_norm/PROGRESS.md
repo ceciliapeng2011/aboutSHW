@@ -424,6 +424,7 @@ with the same target-items rule.
 | 6 | Keep physical DRAM/cold-buffer reporting consistent | ✅ kept | RMS rotates input/output/gamma and reports physical input+output+gamma bytes |
 | 7 | MVN generalized LWS rule | ✅ generalized | vit `308 us` / `103 GB/s`; merger `306 us` / `103 GB/s` |
 | 8 | MVN single-read register-cache safety | ✅ guarded | cache only when `ceil(D/LWS)<=16`; reread fallback for larger normalized dims |
+| 9 | RMS register-cache safety | ✅ guarded | cache only when `ceil(D/LWS)<=16`; reread fallback validates `D=32768` |
 
 #### aboutSHW step 5: RMS hidden LWS sweep and follow-up probes
 
@@ -596,6 +597,48 @@ correct stack size for cached shapes or use the reread fallback for larger norma
 dims. For the current Omni shapes, stack is 9 and the cached path remains the fastest
 roofline-reaching solution.
 
+#### aboutSHW step 9: RMS register-cache safety for larger shapes
+
+Status: kept as a guard around the single-read RMS optimization.
+
+RMS also caches per-work-item input values in `ACCUMULATOR_TYPE data[STACK_SIZE]` so it
+can read input once, reduce RMS, then write normalized output. The required stack is
+shape-dependent: each work-item stores `ceil(DATA_SIZE / LWS)` values. This is safe only
+when the JIT-provided `STACK_SIZE` covers that value, and it is only a good general
+strategy while the stack remains small enough to avoid high register pressure.
+
+Implementation rule:
+- Existing `ov`, `bucket`, `qk_specialized`, and `hidden_specialized` variants already
+  set `STACK_SIZE=ceil(DATA_SIZE / LWS)`.
+- `generalized` keeps the cached one-read path only when `ceil(DATA_SIZE / LWS) <= 16`.
+- If the stack would exceed 16, compile `RMS_REREAD_INPUT=1`: compute RMS in the first
+  pass, then reread input for the output pass instead of declaring a large `data[]`
+  register array.
+
+Extended validation command:
+`python -m py_compile test_omni_rms.py && python test_omni_rms.py`
+
+| case | rows | D | generalized LWS | stack | mode | median | physical BW | status |
+|---|---:|---:|---:|---:|---|---:|---:|---|
+| tail16 | 4096 | 272 | 32 | 9 | cache | 48.645 us | 91.6 GB/s | tail multiple of subgroup passes |
+| hidden | 2556 | 2560 | 256 | 10 | cache | 251.354 us | 104.2 GB/s | roofline |
+| q_norm | 81792 | 128 | 16 | 8 | cache | 402.604 us | 104.0 GB/s | roofline |
+| k_norm | 20448 | 128 | 16 | 8 | cache | 99.895 us | 104.8 GB/s | roofline |
+| mid | 2048 | 1152 | 128 | 9 | cache | 91.562 us | 103.1 GB/s | roofline |
+| wide | 1024 | 8192 | 1024 | 8 | cache | 353.645 us | 94.9 GB/s | large cached path passes |
+| huge | 256 | 32768 | 1024 | 32 | reread | 351.562 us | 95.6 GB/s | safe fallback passes |
+
+Odd-tail finding: `D=129`, `D=255`, and `D=257` fail accuracy in the existing RMS
+baseline variants too, not only in the new generalized fallback. The observed symptom is
+unwritten or incorrect tail output when `DATA_SIZE % LWS` is smaller than a subgroup.
+That is recorded as an existing RMS tail-handling limitation, not a regression from the
+stack fallback. The kept extended suite uses `D=272` as a tail case where the tail is one
+full subgroup and all variants pass.
+
+Conclusion: like MVN, RMS should not use an unbounded register cache for arbitrary large
+normalized dims. The generalized path now keeps the one-read cache for the roofline Omni
+shapes and uses reread fallback for larger stacks.
+
 ## 7. Issues found & causes
 
 ### I1 — Microbench looked ~1.5x SLOWER than OV, but wasn't (measurement artifact)
@@ -705,8 +748,9 @@ prepended macro blocks + `-D` flags. Variants:
   `MULTI_SUBGROUP_ROW=1`, compiling directly to the known multi-subgroup SLM path.
 - **`generalized`** — RMS/MVN generalized rule: choose the largest power-of-two `LWS`
   that keeps at least 8 elements per work-item. RMS then compiles either
-  `ONE_SUBGROUP_ROW` or `MULTI_SUBGROUP_ROW`; MVN sets `MVN_STACK_SIZE=ceil(D/LWS)`.
-  This reaches the measured roofline for RMS hidden/q/k and MVN vit/merger without
+  `ONE_SUBGROUP_ROW` or `MULTI_SUBGROUP_ROW`; RMS/MVN both keep the register-cache path
+  only while `ceil(D/LWS)<=16` and use reread fallback for larger normalized dims.
+  This reaches the measured roofline for RMS hidden/q/k/mid and MVN vit/merger without
   shape-specific hardcoding.
 - **`static`** — same work, compile-constant `LWS` (shape specialization). Optimization
   target; **not** an OV reproduction. Compare the same variant before/after a change.
@@ -722,6 +766,8 @@ prepended macro blocks + `-D` flags. Variants:
 - [x] Explore MVN LWS tuning after the one-read sum/sumsq kernel; generalized LWS reaches
   roofline for vit and merger, so Welford is no longer the next performance item for
   these measured shapes.
+- [x] Guard RMS register-cache stack size and validate extended shapes, including a
+  reread fallback for `D=32768`.
 - [x] Prototype bucketed fixed-LWS dynamic kernels for RMS/MVN and compare against the
   current `ov` and `static` harness variants.
 - [ ] Consider the `USE_BLOCK_WRITE` precedence fix (I4) as a quick win.
