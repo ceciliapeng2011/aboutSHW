@@ -29,11 +29,11 @@ KERNEL (mvn_gpu_bfyx_opt)(
     , FUSED_OPS_DECLS
 #endif
 ) {
-    const uint data_set_idx = get_global_id(1);
-    const uint workers_per_data_set = LWS;
-    const uint in_data_set_idx = get_global_id(0);
-    const uint data_set_size = DATA_SET_SIZE;
-    const uint data_sets_count = DATA_SETS_COUNT;
+    const uint data_set_idx = get_global_id(1);     // in processing of which data set this WI participates?
+    const uint workers_per_data_set = LWS;          // how many WI participates in processing of one data set
+    const uint in_data_set_idx = get_global_id(0);  // this WI's id in group of items processing single data set
+    const uint data_set_size = DATA_SET_SIZE;       // how many elements are in one data set
+    // const uint data_sets_count = DATA_SETS_COUNT;   // how many data sets are in the processing payload
     const uint items_num = data_set_size / workers_per_data_set;
     const uint leftovers = data_set_size % workers_per_data_set;
 

@@ -151,19 +151,21 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     gamma = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
     beta = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
     zeros = np.zeros_like(x)
-    tgamma, tbeta = cl.tensor(gamma), cl.tensor(beta)
-    # Rotate through a pool of DISTINCT input/output buffers so back-to-back launches do
+    # Rotate through a pool of DISTINCT input/output/fused buffers so back-to-back launches do
     # not re-read cache-resident data -> measures the true DRAM-bound cost, not L2/SLC hits.
-    bytes_per_set = x.nbytes * 2  # input read + output write (DRAM traffic per call)
-    pool = _pool_size(bytes_per_set)
+    physical_bytes_per_call = x.nbytes * 2 + gamma.nbytes + beta.nbytes
+    pool = _pool_size(physical_bytes_per_call)
     in_pool = [cl.tensor(x) for _ in range(pool)]
     out_pool = [cl.tensor(zeros) for _ in range(pool)]
+    gamma_pool = [cl.tensor(gamma) for _ in range(pool)]
+    beta_pool = [cl.tensor(beta) for _ in range(pool)]
     # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
     # unused by the body but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
 
     def _args(i):
-        return shape_info + [in_pool[i % pool], out_pool[i % pool], tgamma, tbeta]
+        slot = i % pool
+        return shape_info + [in_pool[slot], out_pool[slot], gamma_pool[slot], beta_pool[slot]]
 
     kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(0))
     cl.finish()
@@ -181,7 +183,7 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     for i in range(iters):
         kernels.enqueue("mvn_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
     mn, med, std = _stats_us(cl.finish())
-    gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective DRAM bandwidth at median
+    gbps = physical_bytes_per_call / (med * 1e-6) / 1e9  # physical DRAM BW estimate
 
     print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
           f"acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
@@ -193,7 +195,7 @@ def main():
     cl.profiling(True)
     print("=== OV mvn_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 vision encoder ===")
     print("    ov = exact OV config (fused gamma+beta); static = same work, static shapes")
-    print("    buffers rotated (cold cache) -> med/min/std us + effective DRAM GB/s")
+    print("    input/output/gamma/beta buffers rotated -> med/min/std us + physical DRAM GB/s")
     results = []
     # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
     for name, rows, D, ref in [("vit", 6864, 1152, 833), ("merger", 1716, 4608, 910)]:
