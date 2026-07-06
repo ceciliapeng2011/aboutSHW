@@ -303,6 +303,7 @@ void sdpa_kernel_lsc(
     constexpr int num_P_tiles = REG_N / REG_M;
     matrix<half, padded_head_size/REG_K, REG_K*REG_N> rQ;
     matrix <float, padded_head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
+    rO = 0.0f;  // Zero the accumulator: the first softmax block scales rO by max_comp==0, and 0*NaN==NaN if the GRF holds stale NaN/Inf bits.
 
     auto q_tokens_left = q_len;
     static_assert(q_step == REG_N);
@@ -674,6 +675,8 @@ void sdpa_kernel_lsc_prefetch_q2(
     // Two rO halves
     matrix<float, padded_head_size/REG_N*num_P_tiles, REG_M*REG_N> rO_a;
     matrix<float, padded_head_size/REG_N*num_P_tiles, REG_M*REG_N> rO_b;
+    rO_a = 0.0f;  // See rO note above: avoid 0*NaN from stale GRF bits.
+    rO_b = 0.0f;  // See rO note above: avoid 0*NaN from stale GRF bits.
 
     int q_len_a = q_len;
     if (q_len_a < 0) q_len_a = 0;
@@ -938,6 +941,7 @@ void sdpa_kernel(
 
     constexpr int num_P_tiles = REG_N / REG_M;
     matrix <float, padded_head_size/REG_N*num_P_tiles, REG_M*REG_N> rO;
+    rO = 0.0f;    // Zero the accumulator: the first softmax block scales rO by max_comp==0, and 0*NaN==NaN if the GRF holds stale NaN/Inf bits.
     int causal_left = q_start;
 
     constexpr uint slm_buff_size = kv_step * padded_head_size * sizeof(half);
