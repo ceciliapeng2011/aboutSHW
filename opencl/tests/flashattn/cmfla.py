@@ -21,6 +21,20 @@ def get_cm_grf_width():
 
 CM_GRF_WIDTH = get_cm_grf_width()
 
+def round_up_to_tile(value, tile_size):
+    return (value + tile_size - 1) // tile_size * tile_size
+
+def get_default_kv_blk(head_size):
+    padded_head_size = round_up_to_tile(head_size, 16)
+    tail_size = padded_head_size - head_size
+    # KV_BLK=2 amortizes softmax/rescale overhead but increases live tiled state.
+    # Use the CM kernel's padded head shape, not only the model-visible head size:
+    #   - padded<=64 and exact/near-exact 16-aligned heads benchmark well with KV_BLK=2;
+    #   - tail-heavy padded heads, including Omni HD=72 -> padded HD=80, prefer KV_BLK=1.
+    if padded_head_size <= 64 or tail_size <= 1:
+        return 2
+    return 1
+
 class flash_attn_cm:
     def __init__(self, num_heads, num_kv_heads, head_size, is_causal = False):
         self.num_heads = num_heads
@@ -32,7 +46,7 @@ class flash_attn_cm:
         print(f"compiling {cwd} {num_heads=} {head_size=} ...")
 
         scale_factor = 1.0/(head_size**0.5)
-        default_kv_blk = 2 if head_size <= 64 else 1
+        default_kv_blk = get_default_kv_blk(head_size)
         kv_blk = int(os.environ.get("CMFLA_KV_BLK", str(default_kv_blk)))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
@@ -279,20 +293,38 @@ if __name__ == "__main__":
                                          acc_check=acc_check)
         vl_results.append((label, sub_seq_len, avg_ms, eff))
 
-    # Summary table matching §4.2c of perf_analysis_omni_vs_vl.md
-    print()
-    print("=" * 100)
-    print("  Qwen3-Omni-4B (HD=72, ViT) vs Qwen3-VL-4B (HD=64, Merger) — VLSDPA HW Utilization on PTL 4Xe")
-    print(f"  Target: {TARGET_EFF}% XMX FP16 efficiency  |  Peak: 20.07 TFLOPS")
-    print("=" * 100)
-    hdr = f"  {'Test':<22}  {'M/img':>6}  {'Omni ms':>9}  {'Omni Eff%':>10}  {'Omni vs55%':>11}  {'VL ms':>9}  {'VL Eff%':>8}  {'VL vs55%':>9}  {'Delta Eff':>10}"
-    print(hdr)
-    print("-" * 100)
-    for (label, m_img, omni_ms, omni_eff), (_, _, vl_ms, vl_eff) in zip(omni_results, vl_results):
-        omni_vs55 = omni_eff / TARGET_EFF * 100
-        vl_vs55   = vl_eff   / TARGET_EFF * 100
-        delta     = vl_eff - omni_eff
-        omni_pass = "✅" if omni_vs55 >= 100 else "❌"
-        vl_pass   = "✅" if vl_vs55   >= 100 else "❌"
-        print(f"  {label:<22}  {m_img:>6}  {omni_ms:>9.2f}  {omni_eff:>9.1f}%  {omni_vs55:>9.1f}% {omni_pass}  {vl_ms:>9.2f}  {vl_eff:>7.1f}%  {vl_vs55:>8.1f}% {vl_pass}  VL+{delta:>5.1f}pp")
-    print("=" * 100)
+    def print_summary(title, omni_head_size_for_eff):
+        print()
+        print("=" * 112)
+        print(f"  {title}")
+        print(f"  Target: {TARGET_EFF}% XMX FP16 efficiency  |  Peak: 20.07 TFLOPS")
+        print("=" * 112)
+        hdr = (f"  {'Test':<22}  {'M/img':>6}  {'Omni ms':>9}  {'Omni Eff%':>10}  {'Omni vs55%':>11}"
+               f"  {'VL ms':>9}  {'VL Eff%':>8}  {'VL vs55%':>9}  {'Delta Eff':>10}")
+        print(hdr)
+        print("-" * 112)
+        for (label, seq_len, sub_seq_len), (_, m_img, omni_ms, _), (_, _, vl_ms, vl_eff) in zip(
+                CASES, omni_results, vl_results):
+            num_seqs = seq_len // sub_seq_len
+            real_flops = num_seqs * m_img * m_img * 4 * 16 * omni_head_size_for_eff
+            hw_peak_flops = 20e12
+            omni_eff = real_flops / (omni_ms * 1e-3) / hw_peak_flops * 100
+            omni_vs55 = omni_eff / TARGET_EFF * 100
+            vl_vs55   = vl_eff   / TARGET_EFF * 100
+            delta     = vl_eff - omni_eff
+            omni_pass = "✅" if omni_vs55 >= 100 else "❌"
+            vl_pass   = "✅" if vl_vs55   >= 100 else "❌"
+            print(f"  {label:<22}  {m_img:>6}  {omni_ms:>9.2f}  {omni_eff:>9.1f}%  {omni_vs55:>9.1f}% {omni_pass}  {vl_ms:>9.2f}  {vl_eff:>7.1f}%  {vl_vs55:>8.1f}% {vl_pass}  VL+{delta:>5.1f}pp")
+        print("=" * 112)
+
+    # Group 1: model-visible useful work. Omni uses HD=72, VL uses HD=64.
+    print_summary(
+        "Group 1: useful-HD utilization — Omni HD=72 vs VL HD=64",
+        omni_head_size_for_eff=72,
+    )
+
+    # Group 2: executed tile work. Omni HD=72 is rounded to padded HD=80 by the CM kernel.
+    print_summary(
+        "Group 2: padded-HD utilization — Omni executed HD=80 vs VL HD=64",
+        omni_head_size_for_eff=80,
+    )

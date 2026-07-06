@@ -575,8 +575,13 @@ void sdpa_kernel_lsc_prefetch(
         // ---- one online-softmax update over the whole block ----
         auto max_comp = online_softmax_update_tree(St, cur_max, cur_sum);
 
-        // ---- rescale rO (skip first iter where max_comp=0 on zero rO; gated for small heads) ----
-        if constexpr (head_size <= 64) {
+        // ---- rescale rO (skip first iter only when KV blocking amortizes the branch) ----
+        // The kv_base=0 rescale is mathematically redundant for every head size: max_comp=0
+        // and rO is still zero.  The skip, however, adds a runtime kv_base branch to every
+        // outer KV block.  Enable it only for KV_BLK>=2, where fewer outer iterations make
+        // the branch cost small enough to be profitable; KV_BLK=1 paths such as Omni HD=72
+        // keep the straight-line rescale because forcing the branch measured as a regression.
+        if constexpr (KV_BLK >= 2) {
             if (kv_base > 0) {
                 #pragma unroll
                 for(int t = 0; t < padded_head_size/REG_N*num_P_tiles; t++) {
