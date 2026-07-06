@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Stand-alone unit / micro-benchmark for the OpenVINO intel_gpu RMSNorm kernel
+# (rms_gpu_bfyx_opt.cl), reproducing EXACTLY what OV runs for the Qwen3-Omni-4B (C6)
+# Thinker prefill shapes. No hypotheses — every JIT const / arg / flag below is taken
+# from the verbose log + exec graph (see README "No-hypothesis rule").
+#
+# Verified from C6.verbose.log (kernel hash rms_gpu_bfyx_opt_12060.../14061.../12133...):
+#   - args (set_kernel_arg): shape_info(64B), input, gamma, output  -> 4 args, NO residual
+#   - is_dynamic=1 ; input/output tensors ":nopad" -> HAS_PADDING=0 (flat addressing)
+#   - normalized dim is STATIC (log `?x?x2560`) -> DATA_SIZE is a compile constant
+#   - dispatch (Enqueue kernel): gws=[LWS,rows,1] lws=[LWS,1,1]
+#   - dynamic JIT (rms_kernel_bfyx_opt.cpp): LWS=get_local_size(0), SUBGROUP_BLOCK_SIZE=8,
+#     STACK_SIZE=ceil_div(D,lws), SLM_SIZE=maxSlmSize, ELEMENTWISE_AFFINE=1 (gamma)
+#
+# Cases (Thinker, T=2556):
+#   hidden : input_layernorm + post_attention_layernorm   [2556, 2560]     D=2560, rank 3
+#   q_norm : per-head query RMSNorm (GQA, 32 q-heads)      [2556*32, 128]   D=128,  rank 4
+#   k_norm : per-head key   RMSNorm (GQA,  8 kv-heads)     [2556*8,  128]   D=128,  rank 4
+#
+# Variants:
+#   ov     : exact OV config (dynamic, shape_info arg, runtime LWS)      -> matches OV us
+#   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
+#
+# Run inside the llm container (built_ov env):  python test_omni_rms.py
+
+import os
+import numpy as np
+import torch
+from clops import cl
+from clops.utils import kernel_cache
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SUB_GROUP_SIZE = 16
+MAX_LWS = 1024  # maxSlmSize = min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
+
+
+def _read(name):
+    return open(os.path.join(HERE, name)).read()
+
+
+def _body(cl_name):
+    """Verbatim OV kernel with the OV #include lines (shim replaces them) stripped."""
+    return "\n".join(l for l in _read(cl_name).splitlines()
+                     if not l.strip().startswith('#include "include/'))
+
+
+SHIM = _read("ov_norm_shim.cl")
+RMS_BODY = _body("rms_gpu_bfyx_opt.cl")
+
+# Dynamic (=OV) defs: OV passes a shape_info buffer as the leading kernel arg and uses a
+# runtime local size. HAS_PADDING=0 (tensors are :nopad), so shape_info is not read by
+# the body; DATA_SIZE stays a compile constant (normalized dim is static). Only LWS is
+# runtime. This mirrors rms_kernel_bfyx_opt.cpp's dynamic branch exactly.
+RMS_DYN_DEFS = r"""
+#undef OPTIONAL_SHAPE_INFO_ARG
+#undef OPTIONAL_SHAPE_INFO_TENSOR
+#define OPTIONAL_SHAPE_INFO_ARG const __global int* shape_info,
+#define OPTIONAL_SHAPE_INFO_TENSOR shape_info,
+#undef LWS
+#define LWS (get_local_size(0))
+"""
+
+
+def get_item_num_and_lws(data_size, max_lws=MAX_LWS):
+    """Port of rms_kernel_bfyx_opt.cpp::get_item_num_and_lws (f16: local_mem_per_wi=4)."""
+    lws, items = 1, data_size
+    while (items > 8 or lws < items) and (2 * lws <= max_lws):
+        lws *= 2
+        items //= 2
+    return items, lws
+
+
+def subgroup_block_size(items):
+    if items >> 3:
+        return 8
+    if items >> 2:
+        return 4
+    if items >> 1:
+        return 2
+    return 1
+
+
+def build(D, rank, eps, variant):
+    items, lws = get_item_num_and_lws(D)
+    base = (f"-DELEMENTWISE_AFFINE=1 -DSUB_GROUP_SIZE={SUB_GROUP_SIZE} "
+            f"-DINPUT_RANK={rank} -DDATA_SIZE={D} -DEPSILON={eps}")
+    if variant == "ov":
+        # dynamic: SBS=8, STACK_SIZE=ceil_div(D,lws), SLM_SIZE=maxSlmSize; LWS runtime.
+        stack = (D + lws - 1) // lws
+        opts = base + f" -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
+        src = SHIM + "\n" + RMS_DYN_DEFS + "\n" + RMS_BODY
+        disp = f"dyn sbs=8 stack={stack} LWS=rt"
+    else:  # static specialization (same work)
+        sbs = subgroup_block_size(items)
+        stack = items + 1
+        opts = base + (f" -DLWS={lws} -DSLM_SIZE={lws} -DSTACK_SIZE={stack} "
+                       f"-DSUBGROUP_BLOCK_SIZE={sbs}")
+        src = SHIM + "\n" + RMS_BODY
+        disp = f"sbs={sbs} stack={stack} LWS={lws}"
+    return src, opts, lws, items, disp
+
+
+def ref_rms(x, g, eps):
+    xf = torch.from_numpy(x).float()
+    var = xf.pow(2).mean(-1, keepdim=True)
+    return (xf * torch.rsqrt(var + eps) * torch.from_numpy(g).float()).half().numpy()
+
+
+def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
+    src, opts, lws, items, disp = build(D, rank, eps, variant)
+    kernels = kernel_cache(src, opts)
+
+    np.random.seed(0)
+    x = np.random.uniform(-2.0, 2.0, [rows, D]).astype(np.float16)
+    g = np.random.uniform(-1.0, 1.0, [D]).astype(np.float16)
+    tx, tg, to = cl.tensor(x), cl.tensor(g), cl.tensor(np.zeros_like(x))
+    # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
+    # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant == "ov" else []
+    args = shape_info + [tx, tg, to]
+
+    kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    cl.finish()
+    cur = to.numpy()
+    ref = ref_rms(x, g, eps)
+    ok = np.allclose(cur, ref, atol=1e-2, rtol=1e-2)
+    if not ok:
+        bad = np.abs(cur.astype(np.float32) - ref.astype(np.float32))
+        print(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
+
+    # steady-state median (warm up first; early launches run at a low GPU clock).
+    for _ in range(iters):
+        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    cl.finish()
+    for _ in range(iters):
+        kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *args)
+    lat = sorted(cl.finish())
+    med_us = lat[len(lat) // 2] / 1e3
+
+    print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
+          f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | {med_us:8.3f} us/call (median) "
+          f"(OV C6 {ov_ref_us:.0f} us)")
+    return ok
+
+
+def main():
+    cl.profiling(True)
+    print("=== OV rms_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 Thinker prefill (T=2556) ===")
+    print("    ov = exact OV config; static = same work, static-shape specialization")
+    results = []
+    # ov_ref_us = per-call device time from C6 CLIntercept trace (rms_gpu_profile.md).
+    for name, rows, D, rank, ref in [("hidden", 2556, 2560, 3, 722),
+                                     ("q_norm", 2556 * 32, 128, 4, 1267),
+                                     ("k_norm", 2556 * 8, 128, 4, 319)]:
+        results.append(run_case(name, rows, D, rank, ref, "ov"))
+        results.append(run_case(name, rows, D, rank, ref, "static"))
+    assert all(results), "accuracy check failed"
+    print("accuracy: all good")
+
+
+if __name__ == "__main__":
+    main()
