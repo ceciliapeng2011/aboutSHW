@@ -11,6 +11,8 @@
 //   3. Single-sub-group rows (q/k, lws==SUB_GROUP_SIZE) skip SLM + all barriers entirely.
 //   4. Multi-sub-group rows (hidden) reduce partials with ONE barrier (every sub-group reduces
 //      redundantly) instead of the original log-tree of barriers.
+//   5. Bound the register cache: STACK_SIZE is ceil(D/LWS) for cached shapes, while
+//      RMS_REREAD_INPUT avoids a large per-WI register array for larger normalized dims.
 
 #include "include/fetch_utils.cl"
 #include "include/batch_headers/sub_group_block_read.cl"

@@ -11,6 +11,8 @@
 //   3. Drop work_group_broadcast: every WI derives mean/inv from the two reduced scalars.
 //   4. Keep the well-optimized built-in work_group_reduce_add and add NO sub-group-size constraint
 //      — forcing REQD_SUB_GROUP_SIZE or a manual SLM reduction was measured to REGRESS on this HW.
+//   5. Bound the register cache: MVN_STACK_SIZE is ceil(D/LWS) for cached shapes, while
+//      MVN_REREAD_INPUT avoids a large per-WI register array for larger normalized dims.
 
 #include "include/batch_headers/fetch_data.cl"
 
