@@ -14,15 +14,15 @@
  * limitations under the License.
  *******************************************************************************/
 #include "cm_attention_common.hpp"
-#define CM_HAS_LSC_UNTYPED_2D 1
 
 // Number of kv sub-tiles (kv_step rows each) processed per online-softmax update in
 // sdpa_kernel_lsc_prefetch. Larger amortizes the rO rescale + softmax bookkeeping over
 // more DPAS work at the cost of GRF pressure. Overridable via -DCMFLA_KV_BLK=N.
 #ifndef CMFLA_KV_BLK
-#define CMFLA_KV_BLK 2
+#define CMFLA_KV_BLK 1
 #endif
 
+// online_softmax_update_tree and transpose_St_to_P_half are defined in cm_attention_common.hpp
 
 #ifdef CM_HAS_LSC_UNTYPED_2D
 //@prefetch_u8 would have duplicated decompress perf issue. comments out for now.
