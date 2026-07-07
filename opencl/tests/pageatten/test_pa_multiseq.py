@@ -114,7 +114,8 @@ class PaMultiTokenRunner:
 
         self.q_step = CM_GRF_WIDTH // 32
         self.max_wg_size = 16       # Most optimal thread numbers per workgroup
-        self.optimized_wg_seq_len = self.max_wg_size * self.q_step
+        self.xe_arch = 1 if CM_GRF_WIDTH == 256 else 2
+        self.optimized_wg_seq_len = self.get_wg_seq_len()
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
@@ -152,6 +153,12 @@ class PaMultiTokenRunner:
         if self.sparse_block_size in (128, 256):
             optimized_options = base_options + f" -DCMPA_WG_SEQ_LEN={int(self.optimized_wg_seq_len)}"
             self.kernels_optimized = cl.kernels(src1, optimized_options)
+
+    def get_wg_seq_len(self) -> int:
+        if self.head_size == 256 and self.xe_arch >= 2:
+            num_team = 8
+            return num_team * self.q_step
+        return self.max_wg_size * self.q_step
 
     @staticmethod
     @functools.cache
@@ -411,9 +418,8 @@ class PaMultiTokenRunner:
             t_block_indices_begins = cl.tensor(block_indices_begins.detach().numpy())
             t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
 
-            q_step = self.q_step
             wg_size = self.max_wg_size
-            wg_seq_len = wg_size * q_step
+            wg_seq_len = self.get_wg_seq_len()
 
             blocked_q_starts_and_subseq_mapping, wg_count = self._build_wg_block_start_and_subseq_mapping(
                 kern_attn_inputs,
@@ -1200,6 +1206,8 @@ def _with_kv_cache_compression_modes(
 
 def _sparse_block_sizes_for_case(case: PagedAttentionTestCase) -> tuple[int, ...]:
     if case.block_size == 256:
+        if case.k_head_size == 256:
+            return (1, 128)
         return (1, 128, 256)
     return (1,)
 

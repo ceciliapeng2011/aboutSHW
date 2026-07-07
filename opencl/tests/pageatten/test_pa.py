@@ -98,7 +98,7 @@ class page_atten_cm:
         # 2 workers = 16 lanes per WG). Each team handles one q_step-sized q-slice,
         # so wg_seq_len = num_team * q_step. For head_size!=256, num_team=wg_size and
         # num_worker=1, which is equivalent to wg_size * q_step.
-        if head_size == 256:
+        if head_size == 256 and xe_arch >= 2:
             num_team = 8
             self.wg_seq_len = num_team * q_step
         else:
