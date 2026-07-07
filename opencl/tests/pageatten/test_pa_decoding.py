@@ -51,7 +51,7 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-
 class DecodingCase:
     num_heads: int = 32
     num_kv_heads: int = 8
-    head_size: int = 256
+    head_size: int = 128
     block_size: int = 256
     sub_block_size: int = DEFAULT_SUB_BLOCK_SIZE
     kv_len: int = 4097
@@ -382,6 +382,9 @@ GENERATE_ONLY_SINGLE_SUBSEQ_CASES = (
     DecodingCase(kv_len=1025, kv_cache_compression=0),
     DecodingCase(kv_len=1025, kv_cache_compression=1),
     DecodingCase(kv_len=1025, kv_cache_compression=2),
+    DecodingCase(kv_len=1025, kv_cache_compression=0, head_size=256),
+    DecodingCase(kv_len=1025, kv_cache_compression=1, head_size=256),
+    DecodingCase(kv_len=1025, kv_cache_compression=2, head_size=256),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=0),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=1),
     DecodingCase(num_heads=8, num_kv_heads=2, head_size=64, block_size=256, kv_len=513, kv_cache_compression=2),
@@ -565,26 +568,27 @@ def test_pa_perf_bandwidth_generate_single_subsequence_default_params():
         pytest.skip("Set RUN_PA_PERF=1 to enable bandwidth perf test")
 
     # Same core parameters as pa_2nd_token.py defaults.
-    case = DecodingCase(
-        num_heads=32,
-        num_kv_heads=8,
-        head_size=256,
-        block_size=256,
-        kv_len=32769,
-        kv_cache_compression=0,
-    )
-    perf = _run_bandwidth_measurement(case, loop_cnt=100, warmup=5)
+    for head_size in [128, 256]:
+        case = DecodingCase(
+            num_heads=32,
+            num_kv_heads=8,
+            head_size=head_size,
+            block_size=256,
+            kv_len=32769,
+            kv_cache_compression=0,
+        )
+        perf = _run_bandwidth_measurement(case, loop_cnt=100, warmup=5)
 
-    print(
-        "[perf] "
-        f"cm_sdpa_2nd_bw={perf['cm_sdpa_2nd_bw_gbs']:.3f} GB/s, "
-        f"cm_sdpa_2nd_reduce_bw={perf['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s, "
-        f"cm_sdpa_2nd_ms={perf['cm_sdpa_2nd_ms']:.3f}, "
-        f"cm_sdpa_2nd_reduce_ms={perf['cm_sdpa_2nd_reduce_ms']:.3f}"
-    )
+        print(
+            "[perf] "
+            f"cm_sdpa_2nd_bw={perf['cm_sdpa_2nd_bw_gbs']:.3f} GB/s, "
+            f"cm_sdpa_2nd_reduce_bw={perf['cm_sdpa_2nd_reduce_bw_gbs']:.3f} GB/s, "
+            f"cm_sdpa_2nd_ms={perf['cm_sdpa_2nd_ms']:.3f}, "
+            f"cm_sdpa_2nd_reduce_ms={perf['cm_sdpa_2nd_reduce_ms']:.3f}"
+        )
 
-    assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
-    assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
+        assert perf["cm_sdpa_2nd_bw_gbs"] > 0.0
+        assert perf["cm_sdpa_2nd_reduce_bw_gbs"] > 0.0
 
 # Usage:
 #   python -m py_compile test_pa_decoding.py
