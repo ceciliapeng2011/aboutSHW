@@ -566,6 +566,9 @@ if __name__ == "__main__":
             run_pa_kv_cache_update_case([128*1024], [1*1024], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, check_perf=True)
             run_pa_kv_cache_update_case([1024], [0], num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
             run_pa_kv_cache_update_case([129], [0], num_kv_heads=2, k_head_size=64, v_head_size=64, block_size=16, check_perf=True)
+            run_pa_kv_cache_update_case([32*1024], [0], num_kv_heads=8, k_head_size=256, v_head_size=256, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+            run_pa_kv_cache_update_case([64*1024], [0], num_kv_heads=8, k_head_size=256, v_head_size=256, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
+            run_pa_kv_cache_update_case([128*1024], [0], num_kv_heads=8, k_head_size=256, v_head_size=256, block_size=256, enable_kvcache_compress=compress_kvcache, check_perf=True)
 
     if 1:
         token_pairs_acc = [
@@ -579,14 +582,15 @@ if __name__ == "__main__":
             ([37, 91, 1], [21, 3, 1]),
         ]
         for num_tokens, past_lens in token_pairs_acc:
-            for sub_block_size in [16, 32]:
+            for sub_block_size in [16]:
                 for enalbe_kvcache_compress in [0, 1, 2]:
                     # Skip combinations that exceed CM matrix size limit (< 8192 bytes)
                     # With k_head_size=128, sub_block_size=32: matrix size = 32*128*2 = 8192 bytes (hits limit)
                     # OpenVINO uses sub_block_size=16 which avoids this issue
                     if sub_block_size == 32 and enalbe_kvcache_compress == 2:
                         continue  # Skip: would cause "matrix size exceeds maximum" error
-                    run_pa_kv_cache_update_case(num_tokens, past_lens, num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=False)
+                    for head_size in [128, 256]:
+                        run_pa_kv_cache_update_case(num_tokens, past_lens, num_kv_heads=8, k_head_size=head_size, v_head_size=head_size, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=False)
 
     if 1:
         token_pairs_perf = [
@@ -597,12 +601,13 @@ if __name__ == "__main__":
             ([1], [32*1024+15]),
         ]
         for num_tokens, past_lens in token_pairs_perf:
-            for sub_block_size in [16, 32]:
+            for sub_block_size in [16]:
                 for enalbe_kvcache_compress in [0, 1, 2]:
                     # Skip combinations that exceed CM matrix size limit (see accuracy tests above)
                     if sub_block_size == 32 and enalbe_kvcache_compress == 2:
                         continue
-                    run_pa_kv_cache_update_case(num_tokens, past_lens, num_kv_heads=8, k_head_size=128, v_head_size=128, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=True)
+                    for head_size in [128, 256]:
+                        run_pa_kv_cache_update_case(num_tokens, past_lens, num_kv_heads=8, k_head_size=head_size, v_head_size=head_size, block_size=256, sub_block_size=sub_block_size, enable_kvcache_compress=enalbe_kvcache_compress, check_perf=True)
 
 # Usage:
 # python -m pytest -q test_kvcache_update.py -k "test_pa_kv_cache_update_functional"

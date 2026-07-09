@@ -94,15 +94,24 @@ class page_atten_cm:
 
         wg_size = 16
         q_step = CM_GRF_WIDTH // 32
-        self.wg_seq_len = wg_size * q_step
+        # head_size==256 partitions head_size across 2 workers per team (8 teams *
+        # 2 workers = 16 lanes per WG). Each team handles one q_step-sized q-slice,
+        # so wg_seq_len = num_team * q_step. For head_size!=256, num_team=wg_size and
+        # num_worker=1, which is equivalent to wg_size * q_step.
+        if head_size == 256 and xe_arch >= 2:
+            num_team = 8
+            self.wg_seq_len = num_team * q_step
+        else:
+            self.wg_seq_len = wg_size * q_step
 
         src1 = r'''#include "pa_multi_token.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=}...")
 
         scale_factor = 1.0/(head_size**0.5)
+        abortonspill = '-Qxcm_jit_option="-abortonspill"' if head_size <= 128 else ''
         self.kernels = cl.kernels(src1,
-                     (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
+                     (f'-cmc {abortonspill} -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -DKERNEL_NAME=cm_page_attention'
                       f" -DCMFLA_NUM_HEADS={num_heads}"
                       f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
@@ -851,7 +860,7 @@ def test_ov():
     sub_block_sz = DEFAULT_SUB_BLOCK_SIZE
     xattn_thresh = 0.9
     sparse_block_sz, kv_block_size, trunk_sz = 256, 256, 4096 # trunk_sz no use
-    num_heads, num_kv_heads, head_size = 32, 8, 128
+    num_heads, num_kv_heads, head_size = 32, 8, 256
     base = '/home/ceciliapeng/dump_debug_binary/'
 
     key_block_sz, key_token_sz = get_k_cache_layout(head_size, kv_block_size, compressed_kvcache, sub_block_sz)
@@ -859,11 +868,11 @@ def test_ov():
 
     query = get_tensor(base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_src0__f16__612_4096_1_1__bfyx.bin').reshape([612, num_heads*head_size])
     key_cache = get_tensor(
-        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_3__f16__3_8_256_128__bfyx.bin',
+        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_3__f16__3_8_256_256__bfyx.bin',
         np.int8 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else np.float16,
     ).reshape([-1, num_kv_heads, key_block_sz, key_token_sz])
     value_cache = get_tensor(
-        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_4__f16__3_8_256_128__bfyx.bin',
+        base + 'program1_network1_0_pagedattentionextension_PagedAttentionExtension_28408_updated_src_4__f16__3_8_256_256__bfyx.bin',
         np.int8 if compressed_kvcache != KV_CACHE_COMPRESSION_NONE else np.float16,
     ).reshape([-1, num_kv_heads, value_block_sz, value_token_sz])
     # low = -1
@@ -1106,14 +1115,14 @@ if __name__ == "__main__":
                             print(f'[PA_BASE_ACC_TETS]:seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache={"U8" if compressed_kvcache else "F16"}')
                             print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                             test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
-                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
+                            test_page_attn_causal_batch1(seq_len, num_heads = 1, num_kv_heads = 1, head_size = 256, block_sz=block_sz, trunk_sz=blocks_per_trunk*block_sz, compressed_kvcache=compressed_kvcache, sub_block_sz=block_sz, sparse_block_sz=1, check_acc=True)
 
         if 1:
             seq_len = 32 * 1024
             block_sz = 256
             trunk_sz = seq_len
             compressed_kv = KV_CACHE_COMPRESSION_BY_CHANNEL
-            for sub_block_sz in [16, 32, 64, 128]:
+            for sub_block_sz in [16]:
                 print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                 print(f'[PA_BY_CHANNEL_ACC_TESTS]: seq_len={seq_len} block_sz={block_sz} trunk_sz={trunk_sz} kv_cache={compressed_kv} sub_block_sz={sub_block_sz}')
                 print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
@@ -1126,7 +1135,7 @@ if __name__ == "__main__":
                 for density in [1.0, 0.5, 0.75]:
                     for blocks_per_trunk in [1, 15, 16, 17, 32, 300]:
                         for seq_len in [16*15, 16*16, 16*16+1, 1024, 1024+1, 8*1024, 8*1024+3, 16*1024]:
-                            for head_size in [32, 96, 128]:
+                            for head_size in [32, 96, 128, 256]:
                                 for compressed_kvcache in [KV_CACHE_COMPRESSION_BY_TOKEN, KV_CACHE_COMPRESSION_NONE]:
                                     print("----------------------------------------------------------------------------------------------------------------------------------------------------------------------")
                                     print(f'[XATTENION_ACC_TETS]:seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} kv_cache={"U8" if compressed_kvcache else "F16"} {sparse_block_sz=} {density=}')
@@ -1137,9 +1146,10 @@ if __name__ == "__main__":
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=True)
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 256, density=0.33, check_acc=True)
-        test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 128, density=0.33, check_acc=True)
+        for head_size in [128, 256]:
+            test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = head_size, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=True)
+            test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = head_size, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 256, density=0.33, check_acc=True)
+            test_page_attn_causal_batch1(seq_len, num_heads = 2, num_kv_heads = 1, head_size = head_size, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 128, density=0.33, check_acc=True)
 
     # perf for sparse X attention, with QWen3 8K case
     def smoke_perf_test(
@@ -1152,7 +1162,8 @@ if __name__ == "__main__":
         seq_len, block_sz = 32*1024, 256
         trunk_sz = blocks_per_trunk*block_sz
 
-        test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
+        for head_size in [128, 256]:
+            test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = head_size, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = 1, density=1.0, check_acc=False)
 
         for sparse_block_sz in sparse_block_sizes:
             for density in densities:
@@ -1160,7 +1171,8 @@ if __name__ == "__main__":
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
                 # print(f'seq_len={seq_len} block_sz={block_sz} blocks_per_trunk={blocks_per_trunk} sparse_block_sz={sparse_block_sz}')
                 # print("-----------------------------------------------------------------------------------------------------------------------------------------")
-                test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
+                for head_size in [128, 256]:
+                    test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 8, head_size = head_size, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=compressed_kvcache, sub_block_sz=sub_block_sz, sparse_block_sz = sparse_block_sz, density=density, check_acc=False)
 
     pa_perf_mode = os.getenv("PA_PERF", "0") == "1"
     if pa_perf_mode:

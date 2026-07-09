@@ -205,9 +205,8 @@ class PaMultiTokenPerfRunner(PaMultiTokenRunner):
         t_subsequence_begins = cl.tensor(subsequence_begins.detach().numpy())
         t_selected_sequence_ids = cl.tensor(selected_sequence_ids.detach().numpy())
 
-        q_step = self.q_step
         wg_size = self.max_wg_size
-        wg_seq_len = wg_size * q_step
+        wg_seq_len = self.get_wg_seq_len()
 
         blocked_q_starts_and_subseq_mapping, wg_count = self._build_wg_block_start_and_subseq_mapping(
             kern_attn_inputs,
