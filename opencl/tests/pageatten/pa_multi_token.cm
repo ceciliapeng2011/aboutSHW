@@ -4,6 +4,10 @@
 
 namespace KERNEL_NAME {
 
+// The Q pre-scale domain (natural-log vs log2) is controlled by the JIT constant
+// CM_Q_SCALED_BY_LOG2, defined at compile time by the host Python script (test_pa.py).
+// See cm_attention_common.hpp for the contract.
+
 #include "cm_attention_common.hpp"
 #include "xattn_subseq_meta.hpp"
 #ifdef CM_HAS_LSC_UNTYPED_2D

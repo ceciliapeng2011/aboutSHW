@@ -105,6 +105,10 @@ class page_atten_cm:
         #          tree softmax for INT8 (dequant cost masks scratch overhead, gains ~1-5%).
         default_tree = "0" if self.compressed_kvcache == KV_CACHE_COMPRESSION_NONE else "1"
         use_tree = int(os.environ.get("CMPA_USE_TREE_SOFTMAX", default_tree))
+        # Q pre-scale domain: 1 folds log2e into Q so the softmax uses cm_exp (== exp2)
+        # directly (Item 13). Kept as an env-configurable JIT knob so the compile-time
+        # gate in cm_attention_common.hpp can be flipped without editing sources.
+        q_scaled_by_log2 = int(os.environ.get("CM_Q_SCALED_BY_LOG2", "1"))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -DKERNEL_NAME=cm_page_attention'
@@ -119,6 +123,7 @@ class page_atten_cm:
                       f" -DKV_CACHE_COMPRESSION={self.compressed_kvcache}"
                       f" -DSUB_BLOCK_SIZE={self.sub_block_sz}"
                       f" -DCMPA_USE_TREE_SOFTMAX={use_tree}"
+                      f" -DCM_Q_SCALED_BY_LOG2={q_scaled_by_log2}"
                       f" -mdump_asm -g2")
                      )
 

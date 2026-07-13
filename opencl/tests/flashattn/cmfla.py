@@ -48,6 +48,12 @@ class flash_attn_cm:
         scale_factor = 1.0/(head_size**0.5)
         default_kv_blk = get_default_kv_blk(head_size)
         kv_blk = int(os.environ.get("CMFLA_KV_BLK", str(default_kv_blk)))
+        # Q pre-scale domain: 1 folds log2e into Q so the softmax uses cm_exp (== exp2)
+        # directly (Item 13). Kept as an env-configurable JIT knob so the compile-time
+        # gate in cm_attention_common.hpp can be flipped without editing sources.
+        q_scaled_by_log2 = int(os.environ.get("CM_Q_SCALED_BY_LOG2", "1"))
+        # Softmax reduction shape: 0 = linear chain, 1 = balanced tree (Item 15).
+        use_tree = int(os.environ.get("CMPA_USE_TREE_SOFTMAX", "0"))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
@@ -58,6 +64,8 @@ class flash_attn_cm:
                       f" -DCMFLA_SCALE_FACTOR={scale_factor}"
                       f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
                       f" -DCMFLA_KV_BLK={kv_blk}"
+                      f" -DCM_Q_SCALED_BY_LOG2={q_scaled_by_log2}"
+                      f" -DCMPA_USE_TREE_SOFTMAX={use_tree}"
                       f" -mdump_asm -g2")
                      )
 
