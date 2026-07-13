@@ -145,20 +145,51 @@ def build(D, rank, eps, variant):
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
         disp = f"hidden multi-sg stack={stack} LWS={lws}"
-    elif variant == "generalized":
-        lws = generalized_lws(D)
+    elif variant in ("generalized", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
+        if variant == "gen_t16":
+            target_items = 16
+            sbs = 8
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen t16"
+        elif variant == "gen_hybrid":
+            target_items = 16 if D >= 2048 else 8
+            sbs = 8
+            stack_cap = MAX_REGISTER_STACK
+            tag = f"gen hybrid t{target_items}"
+        elif variant == "gen_block4":
+            target_items = 8
+            sbs = 4
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen block4"
+        elif variant == "gen_block2":
+            target_items = 8
+            sbs = 2
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen block2"
+        elif variant == "gen_stack12":
+            target_items = 8
+            sbs = 8
+            stack_cap = 12
+            tag = "gen stack12"
+        else:
+            target_items = 8
+            sbs = 8
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen t8"
+
+        lws = generalized_lws(D, target_items=target_items)
         items = D // lws
         stack = (D + lws - 1) // lws
-        reread = stack > MAX_REGISTER_STACK
+        reread = stack > stack_cap
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={min(stack, MAX_REGISTER_STACK)} "
-                f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={min(stack, stack_cap)} "
+                f"-DSUBGROUP_BLOCK_SIZE={sbs} {row_flag}")
         if reread:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
         mode = "reread" if reread else "cache"
-        disp = f"generalized {row_kind} stack={stack} {mode} LWS={lws}"
+        disp = f"{tag} {row_kind} sbs={sbs} stack={stack} cap={stack_cap} {mode} LWS={lws}"
     elif variant == "bucket_tuned":
         sbs = subgroup_block_size(items)
         stack = items + 1
@@ -201,7 +232,8 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in (
-        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized", "bucket_tuned") else []
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "bucket_tuned") else []
 
     def _args(i):
         slot = i % pool
@@ -225,7 +257,7 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     mn, med, std = _stats_us(cl.finish())
     gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective physical DRAM bandwidth at median
 
-    print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
+    print(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
           f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
           f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}, gamma={'cold' if cold_gamma else 'hot'}) "
           f"(OV C6 {ov_ref_us:.0f} us)")
@@ -253,6 +285,11 @@ def main():
         if D == 128:
             results.append(run_case(name, rows, D, rank, ref, "qk_specialized"))
         results.append(run_case(name, rows, D, rank, ref, "generalized"))
+        results.append(run_case(name, rows, D, rank, ref, "gen_t16"))
+        results.append(run_case(name, rows, D, rank, ref, "gen_hybrid"))
+        results.append(run_case(name, rows, D, rank, ref, "gen_block4"))
+        results.append(run_case(name, rows, D, rank, ref, "gen_block2"))
+        results.append(run_case(name, rows, D, rank, ref, "gen_stack12"))
         results.append(run_case(name, rows, D, rank, ref, "bucket_tuned"))
         results.append(run_case(name, rows, D, rank, ref, "static"))
     assert all(results), "accuracy check failed"

@@ -618,6 +618,31 @@ Implementation rule:
 Extended validation command:
 `python -m py_compile test_omni_rms.py && python test_omni_rms.py`
 
+#### aboutSHW step 10: generalized A/B hook set for local one-run comparisons
+
+Status: kept.
+
+The local test scripts now expose a small A/B matrix so a single run can compare the
+generalized rule against a few nearby policies without editing the harness between
+runs. The new variants are:
+
+- MVN: `gen_t16`, `gen_hybrid`, `gen_stack12`
+- RMS: `gen_t16`, `gen_hybrid`, `gen_block4`, `gen_block2`, `gen_stack12`
+
+Run path validated in the aboutSHW tree:
+
+- `source ~/OCL/aboutSHW/ocl.venv/bin/activate`
+- `cd ~/OCL/aboutSHW/opencl/tests/omni_norm`
+- `python test_omni_mvn.py`
+- `python test_omni_rms.py`
+
+Validation result:
+
+- both scripts pass `py_compile` and end-to-end accuracy in `ocl.venv`
+- the generalized hooks run in one pass and print side-by-side medians / bandwidths
+- the extra probes are useful for A/B ranking, but the generalized `target_items=8`
+  rule remains the default kept path in this tree
+
 | case | rows | D | generalized LWS | stack | mode | median | physical BW | status |
 |---|---:|---:|---:|---:|---|---:|---:|---|
 | tail16 | 4096 | 272 | 32 | 9 | cache | 48.645 us | 91.6 GB/s | tail multiple of subgroup passes |

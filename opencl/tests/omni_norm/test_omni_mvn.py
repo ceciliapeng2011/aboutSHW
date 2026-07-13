@@ -148,19 +148,44 @@ def build(D, eps, variant):
     elif variant == "bucket":
         opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
-    elif variant == "generalized":
-        lws = generalized_lws(D)
+    elif variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12"):
+        if variant == "gen_t16":
+            target_items = 16
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen t16"
+        elif variant == "gen_hybrid":
+            # Heuristic for larger normalized dims on 8Xe: use deeper per-WI work.
+            target_items = 16 if D >= 8192 else 8
+            stack_cap = MAX_REGISTER_STACK
+            tag = f"gen hybrid t{target_items}"
+        elif variant == "gen_stack12":
+            target_items = 8
+            stack_cap = 12
+            tag = "gen stack12"
+        else:
+            target_items = 8
+            stack_cap = MAX_REGISTER_STACK
+            tag = "gen t8"
+
+        lws = generalized_lws(D, target_items=target_items)
         items = D // lws
         stack = (D + lws - 1) // lws
-        reread = stack > MAX_REGISTER_STACK
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={min(stack, MAX_REGISTER_STACK)}"
+        reread = stack > stack_cap
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={min(stack, stack_cap)}"
         if reread:
             opts += " -DMVN_REREAD_INPUT=1"
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
+        mode = "reread" if reread else "cache"
+        disp = f"{tag} stack={stack} cap={stack_cap} {mode}"
     else:  # static specialization (same fused work)
         opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
         src = SHIM + "\n" + MVN_FUSED_DEFS + "\n" + MVN_BODY
-    return src, opts, lws, items
+        disp = f"static stack={stack}"
+    if variant == "ov":
+        disp = f"ov stack={stack}"
+    elif variant == "bucket":
+        disp = f"bucket stack={stack}"
+    return src, opts, lws, items, disp
 
 
 def ref_mvn(x, eps, gamma, beta):
@@ -173,7 +198,7 @@ def ref_mvn(x, eps, gamma, beta):
 
 
 def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
-    src, opts, lws, items = build(D, eps, variant)
+    src, opts, lws, items, disp = build(D, eps, variant)
     kernels = kernel_cache(src, opts)
 
     np.random.seed(0)
@@ -191,7 +216,9 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     beta_pool = [cl.tensor(beta) for _ in range(pool)]
     # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
     # unused by the body but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in ("ov", "bucket", "generalized") else []
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in (
+        "ov", "bucket", "generalized", "gen_t16", "gen_hybrid", "gen_stack12"
+    ) else []
 
     def _args(i):
         slot = i % pool
@@ -215,10 +242,10 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100):
     mn, med, std = _stats_us(cl.finish())
     gbps = physical_bytes_per_call / (med * 1e-6) / 1e9  # physical DRAM BW estimate
     stack = (D + lws - 1) // lws
-    mode = "reread" if variant == "generalized" and stack > MAX_REGISTER_STACK else "cache"
+    mode = "reread" if (variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12") and stack > MAX_REGISTER_STACK) else "cache"
 
-    print(f"  {name:7s} {variant:6s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
-          f"acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
+    print(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
+          f"{disp:28s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
           f"{gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) (OV C6 {ov_ref_us:.0f} us)")
     return ok
 
@@ -238,6 +265,9 @@ def main():
         results.append(run_case(name, rows, D, ref, "ov"))
         results.append(run_case(name, rows, D, ref, "bucket"))
         results.append(run_case(name, rows, D, ref, "generalized"))
+        results.append(run_case(name, rows, D, ref, "gen_t16"))
+        results.append(run_case(name, rows, D, ref, "gen_hybrid"))
+        results.append(run_case(name, rows, D, ref, "gen_stack12"))
         results.append(run_case(name, rows, D, ref, "static"))
     assert all(results), "accuracy check failed"
     print("accuracy: all good")
