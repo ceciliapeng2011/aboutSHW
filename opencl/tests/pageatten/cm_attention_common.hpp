@@ -31,24 +31,24 @@ constexpr float log2e = 1.4426950408889634f;
 //   1 => Q is pre-multiplied by log2e so the online softmax can call cm_exp (== exp2)
 //        directly (Item 13 in OPTIMIZE_PLAN, drops one *log2e off the softmax critical path).
 //   0 => Q keeps the natural-log domain and the softmax multiplies by log2e internally.
-// Set at JIT time (typically via -DCM_Q_SCALED_BY_LOG2=... from the host Python script);
-// defaults to 0. The value MUST match how the kernel actually pre-scales Q -- both the Q
+// Set at JIT time (typically via -DCMFLA_Q_SCALED_BY_LOG2=... from the host Python script);
+// defaults to 1. The value MUST match how the kernel actually pre-scales Q -- both the Q
 // load (via q_prescale) and the softmax templates read this macro, so keeping them in
 // sync is enough to prevent log2e from being applied zero or two times.
-#ifndef CM_Q_SCALED_BY_LOG2
-#define CM_Q_SCALED_BY_LOG2 0
+#ifndef CMFLA_Q_SCALED_BY_LOG2
+#define CMFLA_Q_SCALED_BY_LOG2 1
 #endif
 
 // Single Q pre-scale constant used by every SDPA/PA kernel at Q load time.
-constexpr float q_prescale = CM_Q_SCALED_BY_LOG2 ? (scale_factor * log2e) : scale_factor;
+constexpr float q_prescale = CMFLA_Q_SCALED_BY_LOG2 ? (scale_factor * log2e) : scale_factor;
 
 // JIT const: 1 => use the balanced binary-tree reduction (depth log2(rows)) in the online
 //                 softmax; requires rows to be a power of two.
 //            0 => use the linear-chain reduction (default).
 // Applies uniformly to the SDPA (flashattn) and PA (pageatten) kernel families via the
 // `cm_online_softmax_update` dispatch macro defined below.
-#ifndef CMPA_USE_TREE_SOFTMAX
-#define CMPA_USE_TREE_SOFTMAX 0
+#ifndef CMFLA_USE_TREE_SOFTMAX
+#define CMFLA_USE_TREE_SOFTMAX 0
 #endif
 
 static_assert(q_step == 16 || q_step == 8);
@@ -315,7 +315,7 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     new_max_t = cm_max<float>(new_max_t, cur_max);
 
     // Pt = torch.exp(St - new_max)
-#if CM_Q_SCALED_BY_LOG2
+#if CMFLA_Q_SCALED_BY_LOG2
     for(int r = 0; r < St.n_rows(); r++) St[r] = cm_exp(St[r] - new_max_t);
 #else
     for(int r = 0; r < St.n_rows(); r++) St[r] = cm_exp((St[r] - new_max_t)*log2e);
@@ -326,7 +326,7 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
     for(int r = 2; r < St.n_rows(); r++) row_sum_t = cm_add<float>(row_sum_t, St[r]);
 
     vector<float, cols> max_comp;
-#if CM_Q_SCALED_BY_LOG2
+#if CMFLA_Q_SCALED_BY_LOG2
     max_comp = cm_exp(cur_max - new_max_t);
 #else
     max_comp = cm_exp((cur_max - new_max_t)*log2e);
@@ -357,7 +357,7 @@ CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, col
                 t.row(r) = cm_max<float>(t.row(r), t.row(r + stride));
         new_max_t = cm_max<float>(t.row(0), cur_max);
     }
-#if CM_Q_SCALED_BY_LOG2
+#if CMFLA_Q_SCALED_BY_LOG2
     #pragma unroll
     for (int r = 0; r < rows; r++) St[r] = cm_exp(St[r] - new_max_t);
 #else
@@ -379,7 +379,7 @@ CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, col
     }
 
     vector<float, cols> max_comp;
-#if CM_Q_SCALED_BY_LOG2
+#if CMFLA_Q_SCALED_BY_LOG2
     max_comp = cm_exp(cur_max - new_max_t);
 #else
     max_comp = cm_exp((cur_max - new_max_t) * log2e);
@@ -391,7 +391,7 @@ CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, col
 }
 
 // Dispatch macro used by every SDPA/PA kernel; selects linear vs tree reduction.
-#if CMPA_USE_TREE_SOFTMAX
+#if CMFLA_USE_TREE_SOFTMAX
 #define cm_online_softmax_update(St, cur_max, cur_sum) online_softmax_update_tree(St, cur_max, cur_sum)
 #else
 #define cm_online_softmax_update(St, cur_max, cur_sum) online_softmax_update(St, cur_max, cur_sum)
