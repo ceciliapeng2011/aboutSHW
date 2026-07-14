@@ -225,9 +225,6 @@ void sdpa_kernel_lsc_prefetch(
     if (q_tokens_left > q_step) q_tokens_left = q_step;
 
     if (q_tokens_left > 0) {
-        // Q is pre-scaled by q_prescale; whether that folds in log2e is controlled by the
-        // JIT constant CM_Q_SCALED_BY_LOG2 (see cm_attention_common.hpp). The online-softmax
-        // templates honour the same macro so the pair stays consistent.
         lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dQ(reinterpret_cast<uint*>(q_base), q_tokens_left - 1, head_size*sizeof(half) - 1, q_pitch_bytes - 1, 0, 0);
         #pragma unroll
         for(int k = 0, ri = 0; k < padded_head_size/2; k += REG_K/2, ri++) {

@@ -20,6 +20,9 @@ def get_cm_grf_width():
     return t_info.numpy()[0]
 
 CM_GRF_WIDTH = get_cm_grf_width()
+hw_peak_flops = int(os.environ.get("HW_PEAK_FLOPS", "20"))  # default PTL 4xe XMX FP16 peak
+hw_peak_flops = hw_peak_flops * 1e12  # convert to FLOPS
+print(f"{CM_GRF_WIDTH=}, {hw_peak_flops=}")
 
 def round_up_to_tile(value, tile_size):
     return (value + tile_size - 1) // tile_size * tile_size
@@ -48,12 +51,11 @@ class flash_attn_cm:
         scale_factor = 1.0/(head_size**0.5)
         default_kv_blk = get_default_kv_blk(head_size)
         kv_blk = int(os.environ.get("CMFLA_KV_BLK", str(default_kv_blk)))
-        # Q pre-scale domain: 1 folds log2e into Q so the softmax uses cm_exp (== exp2)
-        # directly (Item 13). Kept as an env-configurable JIT knob so the compile-time
-        # gate in cm_attention_common.hpp can be flipped without editing sources.
-        q_scaled_by_log2 = int(os.environ.get("CM_Q_SCALED_BY_LOG2", "1"))
-        # Softmax reduction shape: 0 = linear chain, 1 = balanced tree (Item 15).
-        use_tree = int(os.environ.get("CMPA_USE_TREE_SOFTMAX", "0"))
+        # Softmax knobs (see cm_attention_common.hpp):
+        #   CMFLA_Q_SCALED_BY_LOG2 = 1 folds log2e into the Q pre-scale (Item 13).
+        #   CMFLA_USE_TREE_SOFTMAX = 1 selects the tree-reduction variant (Item 15).
+        q_scaled_by_log2 = int(os.environ.get("CMFLA_Q_SCALED_BY_LOG2", "1"))
+        use_tree = int(os.environ.get("CMFLA_USE_TREE_SOFTMAX", "0"))
         self.kernels = cl.kernels(src1,
                      (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
                       f' -I{os.path.dirname(os.path.dirname(cwd))}/tests/pageatten'
@@ -64,8 +66,8 @@ class flash_attn_cm:
                       f" -DCMFLA_SCALE_FACTOR={scale_factor}"
                       f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
                       f" -DCMFLA_KV_BLK={kv_blk}"
-                      f" -DCM_Q_SCALED_BY_LOG2={q_scaled_by_log2}"
-                      f" -DCMPA_USE_TREE_SOFTMAX={use_tree}"
+                      f" -DCMFLA_Q_SCALED_BY_LOG2={q_scaled_by_log2}"
+                      f" -DCMFLA_USE_TREE_SOFTMAX={use_tree}"
                       f" -mdump_asm -g2")
                      )
 
@@ -88,14 +90,30 @@ class flash_attn_cm:
         attn_output = torch.from_numpy(t_out.numpy()).to(old_dtype)
         return attn_output
 
-    def __call__(self, q, k, v, cu_seqlens, n_repeats = 1):
+    def __call__(self, q, k, v, cu_seqlens, n_repeats = 1,
+                 t_q=None, t_k=None, t_v=None,
+                 token_offset_q=0, token_offset_k=0, token_offset_v=0,
+                 q_token_pitch=None, k_token_pitch=None, v_token_pitch=None):
+        # t_{q,k,v} / token_offset_{q,k,v} / {q,k,v}_token_pitch let the caller reuse
+        # a shared cl.tensor (e.g. a fused [L, 3, H, S] buffer) and select Q/K/V slices
+        # via element-count offsets and per-token strides. Defaults reproduce the
+        # legacy contiguous [L, H, S] / [L, num_kv_heads, S] layout.
         q_len = q.shape[0]
         kv_len = k.shape[0]
         old_dtype = q.dtype
         assert q_len == kv_len
-        t_q = cl.tensor(q.to(torch.float16).detach().numpy())
-        t_k = cl.tensor(k.to(torch.float16).detach().numpy())
-        t_v = cl.tensor(v.to(torch.float16).detach().numpy())
+        if t_q is None:
+            t_q = cl.tensor(q.to(torch.float16).detach().numpy())
+        if t_k is None:
+            t_k = cl.tensor(k.to(torch.float16).detach().numpy())
+        if t_v is None:
+            t_v = cl.tensor(v.to(torch.float16).detach().numpy())
+        if q_token_pitch is None:
+            q_token_pitch = self.num_heads * self.head_size
+        if k_token_pitch is None:
+            k_token_pitch = self.num_kv_heads * self.head_size
+        if v_token_pitch is None:
+            v_token_pitch = self.num_kv_heads * self.head_size
         t_cu_seqlens = cl.tensor(cu_seqlens.numpy().astype(np.int32))
         t_out = cl.tensor([q.shape[0], self.num_heads, self.head_size], np.dtype(np.float16))
 
@@ -117,9 +135,15 @@ class flash_attn_cm:
 
         GWS = [self.num_heads, wg_count * wg_size]
         LWS = [1, wg_size]
-        print(f"calling {q_step=} {need_wg_mapping=} {wg_count=} {GWS=} {LWS=}")
+        print(f"calling {q_step=} {need_wg_mapping=} {wg_count=} {GWS=} {LWS=}"
+              f" offsets=({token_offset_q},{token_offset_k},{token_offset_v})"
+              f" pitches=({q_token_pitch},{k_token_pitch},{v_token_pitch})")
         for _ in range(n_repeats):
-            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS, t_q, t_k, t_v, t_out, t_cu_seqlens, need_wg_mapping, 0, 0)
+            self.kernels.enqueue("cm_sdpa_vlen", GWS, LWS,
+                                 t_q, t_k, t_v, t_out, t_cu_seqlens,
+                                 need_wg_mapping,
+                                 int(token_offset_q), int(token_offset_k), int(token_offset_v),
+                                 int(q_token_pitch), int(k_token_pitch), int(v_token_pitch))
         attn_output = torch.from_numpy(t_out.numpy()).to(old_dtype)
         return attn_output
 
@@ -220,12 +244,52 @@ def test_flash_attn_cm(seq_len, sub_seq_len, num_heads = 16, num_kv_heads = 16, 
     avg_ms = sum(latency[10:]) / len(latency[10:]) * 1e-6
     num_seqs = len(cu_seqlens) - 1
     real_flops = num_seqs * sub_seq_len * sub_seq_len * 4 * num_heads * head_size
-    hw_peak_flops = 20e12  # PTL 4xe XMX FP16 peak
     utilization = real_flops / (avg_ms * 1e-3) / hw_peak_flops * 100
     print(f" {seq_len=} {sub_seq_len=} average latency: {Colors.BOLD}{Colors.YELLOW}{avg_ms:.3f} ms{Colors.END}"
           f"  |  {real_flops/1e9:.1f} GFLOP"
           f"  |  {Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak")
     return avg_ms, utilization
+
+
+def test_flash_attn_cm_discontinuous(seq_len, sub_seq_len, num_heads = 16, head_size = 80):
+    # Exercise the runtime offset/pitch inputs by allocating a fused [L, 3, H, S] SVM buffer
+    # and pointing Q/K/V at successive [L, H, S] slices along axis 1. Each slice is
+    # discontinuous on the token axis (pitch = 3 * H * S) and shares its base pointer
+    # with the other two, mirroring the in-place-crop layout the kernel documents.
+    cl.profiling(True)
+    torch.manual_seed(0)
+    torch.set_printoptions(linewidth=1024)
+
+    num_kv_heads = num_heads  # fused [L, 3, H, S] requires Q/K/V to share head count
+    cu_seqlens = torch.tensor([i for i in range(0, seq_len, sub_seq_len)] + [seq_len], dtype=torch.int32)
+
+    low = -1
+    high = 2
+    act_dtype = torch.float16
+    qkv = torch.randint(low, high, [seq_len, 3, num_heads, head_size]).to(dtype=act_dtype)
+    qkv[:, 2] = qkv[:, 2] / high  # match test_flash_attn_cm V range
+    q = qkv[:, 0]
+    k = qkv[:, 1]
+    v = qkv[:, 2]
+    assert not q.is_contiguous(), "sanity: split-along-axis-1 view must be discontinuous"
+
+    func = flash_attn_cm.create_instance(num_heads, num_kv_heads, head_size, False)
+    ref = flash_attn_vlen_ref(q, k, v, cu_seqlens)
+
+    t_qkv = cl.tensor(qkv.detach().numpy())
+    fused_pitch = 3 * num_heads * head_size
+    head_span = num_heads * head_size
+    out = func(q, k, v, cu_seqlens,
+               t_q=t_qkv, t_k=t_qkv, t_v=t_qkv,
+               token_offset_q=0,
+               token_offset_k=head_span,
+               token_offset_v=2 * head_span,
+               q_token_pitch=fused_pitch,
+               k_token_pitch=fused_pitch,
+               v_token_pitch=fused_pitch)
+    check_close(ref, out)
+    cl.finish()
+    print(f" discontinuous {seq_len=} {sub_seq_len=} {num_heads=} {head_size=}: {Colors.GREEN}OK{Colors.END}")
 
 
 def test_flash_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80):
@@ -258,81 +322,97 @@ def test_flash_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, he
     #assert 0
 
 if __name__ == "__main__":
-    # test_flash_attn_causal_batch1(seq_len=8192, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    # for seqlen in range(1025, 1055, 1):
-    #     test_flash_attn_causal_batch1(seqlen, num_heads = 28, num_kv_heads = 4, head_size = 128)
-    # test_flash_attn_causal_batch1(113, num_heads = 28, num_kv_heads = 4, head_size = 128)
+    pa_omni_mode = os.getenv("PA_OMNI", "0") == "1"
+    pa_sweep_mode = os.getenv("PA_SWEEP", "0") == "1"
+    if pa_omni_mode:
+        print("Running Omni vs VL SDPA utilization sweep (PTL 4Xe)")
+        
+        # Qwen3-Omni-4B vs Qwen3-VL-4B VLSDPA utilization sweep (PTL 4Xe)
+        # seq_len/sub_seq_len = M_v(total)/M-per-image from perf_analysis_omni_vs_vl.md §4.2b
+        CASES = [
+            ("C1: 448×448×2",   1568,  784),
+            ("C2: 512×384×2",   1536,  768),
+            ("C3: 1024×512×2",  4096,  2048),
+            ("C4: 1260×700×2",  6864,  3432),
+            ("C5: 1280×768×15", 57600, 3840),
+        ]
+        TARGET_EFF = 55.0  # % XMX utilization target
 
-    # test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128, acc_check=False)
-    # test_flash_attn_cm(8192, 8192, acc_check=False)
-    # test_flash_attn_cm(8192, 1024)
-    # test_flash_attn_cm(8192, 64)
-    # test_flash_attn_cm(8190, 64)
-    # test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
+        omni_results = []
+        for label, seq_len, sub_seq_len in CASES:
+            acc_check = seq_len < 50000
+            avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
+                                            num_heads=16, num_kv_heads=16, head_size=72,
+                                            acc_check=acc_check)
+            omni_results.append((label, sub_seq_len, avg_ms, eff))
 
-    # for seqlen in range(1, 1055, 1):
-    #     for sub_seq_len in range(1, 64, 1):
-    #         test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 1, num_kv_heads = 1, head_size = 128)
+        vl_results = []
+        for label, seq_len, sub_seq_len in CASES:
+            acc_check = seq_len < 50000
+            avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
+                                            num_heads=16, num_kv_heads=16, head_size=64,
+                                            acc_check=acc_check)
+            vl_results.append((label, sub_seq_len, avg_ms, eff))
 
-    # Qwen3-Omni-4B vs Qwen3-VL-4B VLSDPA utilization sweep (PTL 4Xe)
-    # seq_len/sub_seq_len = M_v(total)/M-per-image from perf_analysis_omni_vs_vl.md §4.2b
-    CASES = [
-        ("C1: 448×448×2",   1568,  784),
-        ("C2: 512×384×2",   1536,  768),
-        ("C3: 1024×512×2",  4096,  2048),
-        ("C4: 1260×700×2",  6864,  3432),
-        ("C5: 1280×768×15", 57600, 3840),
-    ]
-    TARGET_EFF = 55.0  # % XMX utilization target
+        def print_summary(title, omni_head_size_for_eff):
+            print()
+            print("=" * 112)
+            print(f"  {title}")
+            print(f"  Target: {TARGET_EFF}% XMX FP16 efficiency  |  Peak: 20.07 TFLOPS")
+            print("=" * 112)
+            hdr = (f"  {'Test':<22}  {'M/img':>6}  {'Omni ms':>9}  {'Omni Eff%':>10}  {'Omni vs55%':>11}"
+                f"  {'VL ms':>9}  {'VL Eff%':>8}  {'VL vs55%':>9}  {'Delta Eff':>10}")
+            print(hdr)
+            print("-" * 112)
+            for (label, seq_len, sub_seq_len), (_, m_img, omni_ms, _), (_, _, vl_ms, vl_eff) in zip(
+                    CASES, omni_results, vl_results):
+                num_seqs = seq_len // sub_seq_len
+                real_flops = num_seqs * m_img * m_img * 4 * 16 * omni_head_size_for_eff
+                omni_eff = real_flops / (omni_ms * 1e-3) / hw_peak_flops * 100
+                omni_vs55 = omni_eff / TARGET_EFF * 100
+                vl_vs55   = vl_eff   / TARGET_EFF * 100
+                delta     = vl_eff - omni_eff
+                omni_pass = "✅" if omni_vs55 >= 100 else "❌"
+                vl_pass   = "✅" if vl_vs55   >= 100 else "❌"
+                print(f"  {label:<22}  {m_img:>6}  {omni_ms:>9.2f}  {omni_eff:>9.1f}%  {omni_vs55:>9.1f}% {omni_pass}  {vl_ms:>9.2f}  {vl_eff:>7.1f}%  {vl_vs55:>8.1f}% {vl_pass}  VL+{delta:>5.1f}pp")
+            print("=" * 112)
 
-    omni_results = []
-    for label, seq_len, sub_seq_len in CASES:
-        acc_check = seq_len < 50000
-        avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
-                                         num_heads=16, num_kv_heads=16, head_size=72,
-                                         acc_check=acc_check)
-        omni_results.append((label, sub_seq_len, avg_ms, eff))
+        # Group 1: model-visible useful work. Omni uses HD=72, VL uses HD=64.
+        print_summary(
+            "Group 1: useful-HD utilization — Omni HD=72 vs VL HD=64",
+            omni_head_size_for_eff=72,
+        )
 
-    vl_results = []
-    for label, seq_len, sub_seq_len in CASES:
-        acc_check = seq_len < 50000
-        avg_ms, eff = test_flash_attn_cm(seq_len=seq_len, sub_seq_len=sub_seq_len,
-                                         num_heads=16, num_kv_heads=16, head_size=64,
-                                         acc_check=acc_check)
-        vl_results.append((label, sub_seq_len, avg_ms, eff))
+        # Group 2: executed tile work. Omni HD=72 is rounded to padded HD=80 by the CM kernel.
+        print_summary(
+            "Group 2: padded-HD utilization — Omni executed HD=80 vs VL HD=64",
+            omni_head_size_for_eff=80,
+        )
+    elif pa_sweep_mode:
+        print("Running SDPA accuracy sweep")
+        for seqlen in range(1, 1055, 1):
+            for sub_seq_len in range(1, 64, 1):
+                for head_size in [64, 72, 80, 96, 128, 160, 192]:
+                    if head_size > 128:
+                        print(f"Skipping because head_size > 128 which leads to Segmentation violation in LNL.")
+                        continue
+                    test_flash_attn_cm(seqlen, sub_seq_len, num_heads = 2, num_kv_heads = 1, head_size = head_size, acc_check=True)
+    else:
+        print("Running SDPA functionality sweep")
 
-    def print_summary(title, omni_head_size_for_eff):
-        print()
-        print("=" * 112)
-        print(f"  {title}")
-        print(f"  Target: {TARGET_EFF}% XMX FP16 efficiency  |  Peak: 20.07 TFLOPS")
-        print("=" * 112)
-        hdr = (f"  {'Test':<22}  {'M/img':>6}  {'Omni ms':>9}  {'Omni Eff%':>10}  {'Omni vs55%':>11}"
-               f"  {'VL ms':>9}  {'VL Eff%':>8}  {'VL vs55%':>9}  {'Delta Eff':>10}")
-        print(hdr)
-        print("-" * 112)
-        for (label, seq_len, sub_seq_len), (_, m_img, omni_ms, _), (_, _, vl_ms, vl_eff) in zip(
-                CASES, omni_results, vl_results):
-            num_seqs = seq_len // sub_seq_len
-            real_flops = num_seqs * m_img * m_img * 4 * 16 * omni_head_size_for_eff
-            hw_peak_flops = 20e12
-            omni_eff = real_flops / (omni_ms * 1e-3) / hw_peak_flops * 100
-            omni_vs55 = omni_eff / TARGET_EFF * 100
-            vl_vs55   = vl_eff   / TARGET_EFF * 100
-            delta     = vl_eff - omni_eff
-            omni_pass = "✅" if omni_vs55 >= 100 else "❌"
-            vl_pass   = "✅" if vl_vs55   >= 100 else "❌"
-            print(f"  {label:<22}  {m_img:>6}  {omni_ms:>9.2f}  {omni_eff:>9.1f}%  {omni_vs55:>9.1f}% {omni_pass}  {vl_ms:>9.2f}  {vl_eff:>7.1f}%  {vl_vs55:>8.1f}% {vl_pass}  VL+{delta:>5.1f}pp")
-        print("=" * 112)
+        test_flash_attn_cm(8192, 8192, num_heads = 28, num_kv_heads = 4, head_size = 128, acc_check=False)
+        test_flash_attn_cm(8192, 8192, acc_check=False)
+        test_flash_attn_cm(8192, 1024)
+        test_flash_attn_cm(8192, 64)
+        test_flash_attn_cm(8190, 64)
+        test_flash_attn_cm(8190, 72)
+        test_flash_attn_cm(seq_len=32, sub_seq_len=14, num_heads = 28, num_kv_heads = 4, head_size = 128)
 
-    # Group 1: model-visible useful work. Omni uses HD=72, VL uses HD=64.
-    print_summary(
-        "Group 1: useful-HD utilization — Omni HD=72 vs VL HD=64",
-        omni_head_size_for_eff=72,
-    )
+        # Discontinuous Q/K/V slice of a fused [L, 3, H, S] buffer (token-pitch = 3*H*S).
+        test_flash_attn_cm_discontinuous(seq_len=256, sub_seq_len=64, num_heads=16, head_size=80)
+        test_flash_attn_cm_discontinuous(seq_len=1024, sub_seq_len=256, num_heads=16, head_size=64)
+        test_flash_attn_cm_discontinuous(seq_len=1568, sub_seq_len=784, num_heads=16, head_size=72)
+        test_flash_attn_cm_discontinuous(seq_len=512, sub_seq_len=128, num_heads=8, head_size=128)
 
-    # Group 2: executed tile work. Omni HD=72 is rounded to padded HD=80 by the CM kernel.
-    print_summary(
-        "Group 2: padded-HD utilization — Omni executed HD=80 vs VL HD=64",
-        omni_head_size_for_eff=80,
-    )
+# Usage:
+# HW_PEAK_FLOPS=31 CMFLA_KV_BLK=2 python cmfla.py

@@ -505,9 +505,9 @@ Control: `PA_AB=1 python test_pa.py`. Results are avg latency (ms) with delta vs
   dependency chain (depth log₂(16)=4 vs linear depth 15) helps latency-hide the remaining
   softmax ops behind the dequant memory loads, yielding a 1–5% win.
 
-**Default in `test_pa.py`:** linear softmax (`CMPA_USE_TREE_SOFTMAX=0`) for FP16,
-tree softmax (`CMPA_USE_TREE_SOFTMAX=1`) for INT8 (by-token and by-channel).
-Override via environment variable `CMPA_USE_TREE_SOFTMAX=0|1`.
+**Default in `test_pa.py`:** linear softmax (`CMFLA_USE_TREE_SOFTMAX=0`) for FP16,
+tree softmax (`CMFLA_USE_TREE_SOFTMAX=1`) for INT8 (by-token and by-channel).
+Override via environment variable `CMFLA_USE_TREE_SOFTMAX=0|1`.
 
 ---
 
