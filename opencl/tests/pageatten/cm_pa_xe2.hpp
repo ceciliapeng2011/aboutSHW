@@ -10,10 +10,6 @@
 #define CMPA_WG_SEQ_LEN 0
 #endif
 
-// Softmax algorithm/domain are controlled by the shared JIT constants
-// CMPA_USE_TREE_SOFTMAX and CM_Q_SCALED_BY_LOG2 (declared in cm_attention_common.hpp);
-// call sites use the cm_online_softmax_update() dispatch macro from that header.
-
 #ifndef SPARSE_BLOCK_SIZE
 #error "SPARSE_BLOCK_SIZE must be defined"
 #endif

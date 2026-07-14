@@ -7,8 +7,6 @@
 
 //# CM-compiler is C++17
 static_assert(__cplusplus >= 201703L);
-//# static_assert(__cplusplus >= 202002L);
-//# static_assert(__cplusplus >= 202302L);
 
 #define SystolicDepth 8
 #define RepeatCount 8
@@ -57,7 +55,7 @@ static_assert(q_step == 16 || q_step == 8);
 static_assert(kv_step == 16);
 static_assert(CM_HAS_DPAS);
 
-#define DEBUG_SHOW 1
+#define DEBUG_SHOW 0
 #if !DEBUG_SHOW
 template<typename T, int M, int N>
 void show(const matrix<T, M, N> mat, bool isfloat=true) {
@@ -309,8 +307,6 @@ inline void ugemm_PV1(uint slm_V, matrix_ref<half, REG_N, REG_K> P, vector_ref<f
 }
 
 // Online-softmax update (linear-chain max/sum reduction).
-// The internal *log2e step is compile-time gated on CM_Q_SCALED_BY_LOG2 (see contract at
-// the top of this header) so both this and the tree variant honour the same Q pre-scale.
 template<typename T, int rows, int cols>
 vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_ref<T, cols> cur_max, vector_ref<T, cols> cur_sum) {
     vector<float, cols> new_max_t;
@@ -344,7 +340,6 @@ vector<float, cols> online_softmax_update(matrix_ref<T, rows, cols> St, vector_r
 // Tree-reduction variant: max/sum reductions use a balanced binary tree (depth log2(rows))
 // instead of a linear chain (depth rows-1), shortening the loop-carried dependency chain.
 // Requires rows to be a power of two; the PA kv_step=16 and KV_BLK*kv_step satisfy this.
-// The internal *log2e step is gated on CM_Q_SCALED_BY_LOG2 identically to the linear variant.
 template<typename T, int rows, int cols>
 CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, cols> St,
                                                          vector_ref<T, cols> cur_max,
@@ -395,10 +390,7 @@ CM_INLINE vector<float, cols> online_softmax_update_tree(matrix_ref<T, rows, col
     return max_comp;
 }
 
-// Dispatch macro selecting the reduction shape based on CMPA_USE_TREE_SOFTMAX. Use this
-// in all SDPA/PA kernels instead of calling online_softmax_update{,_tree} directly so
-// the tree/linear choice stays a single JIT knob, paired with CM_Q_SCALED_BY_LOG2 which
-// governs the log2e domain.
+// Dispatch macro used by every SDPA/PA kernel; selects linear vs tree reduction.
 #if CMPA_USE_TREE_SOFTMAX
 #define cm_online_softmax_update(St, cur_max, cur_sum) online_softmax_update_tree(St, cur_max, cur_sum)
 #else
