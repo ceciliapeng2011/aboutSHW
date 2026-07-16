@@ -34,6 +34,8 @@
 # Run inside the llm container (built_ov env):  python test_omni_mvn.py
 
 import os
+import re
+import argparse
 import numpy as np
 import torch
 from clops import cl
@@ -43,6 +45,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_LWS = 1024  # min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
 MAX_REGISTER_STACK = 16
+DEFAULT_LOG_FILE = os.path.join(HERE, "test_omni_mvn.nosummary.log")
+
+
+RECORD_RE = re.compile(
+    r"^\s*(?P<name>\S+)\s+(?P<variant>\S+)\s+dist=(?P<distribution>\S+)\s+"
+    r"rows=.*\|\s+acc=(?P<acc>OK|FAIL)\s+\|\s+med=\s*(?P<med>[0-9.]+).*\|\s+"
+    r"(?P<gbps>[0-9.]+)\s+GB/s"
+)
 
 
 def _pool_size(bytes_per_set):
@@ -68,6 +78,7 @@ def _body(cl_name):
 SHIM = _read("ov_norm_shim.cl")
 MVN_BODY = _body("mvn_gpu_bfyx_opt.cl")
 MVN_WELFORD_BODY = _body("mvn_gpu_bfyx_opt_welford.cl")
+MVN_TWOPASS_BODY = _body("mvn_gpu_bfyx_opt_twopass.cl")
 
 # Fused affine epilogue (OV: MVN, Multiply(gamma), Add(beta)). Mirror the generated
 # macro body from the dumped CL source as closely as possible to reduce the remaining
@@ -140,8 +151,16 @@ def generalized_lws(data_set_size, max_lws=MAX_LWS, target_items=8):
 
 def build(D, eps, variant):
     use_welford = variant.startswith("welford_")
-    base_variant = variant[len("welford_"):] if use_welford else variant
-    kernel_body = MVN_WELFORD_BODY if use_welford else MVN_BODY
+    use_twopass = variant.startswith("twopass_")
+    if use_welford:
+        base_variant = variant[len("welford_"):]
+        kernel_body = MVN_WELFORD_BODY
+    elif use_twopass:
+        base_variant = variant[len("twopass_"):]
+        kernel_body = MVN_TWOPASS_BODY
+    else:
+        base_variant = variant
+        kernel_body = MVN_BODY
 
     items, lws = get_lws(D)
     stack = (D + lws - 1) // lws
@@ -198,6 +217,8 @@ def build(D, eps, variant):
         disp = f"bucket stack={stack}"
     if use_welford:
         disp = f"welford {disp}"
+    elif use_twopass:
+        disp = f"twopass {disp}"
     return src, opts, lws, items, disp
 
 
@@ -240,48 +261,98 @@ def _color(text, color):
     return f"{color}{text}{Colors.END}"
 
 
-def print_pair_summary(records, base_variants, title):
-    print(f"\n=== {title} per-pair summary (base vs welford) ===")
-    print("    pair              base_med(us)  welford_med(us)   delta    base_GB/s  welford_GB/s  bw_delta   acc passrate(base - welford)")
-    for base in base_variants:
-        welford = f"welford_{base}"
-        base_rows = [r for r in records if r["variant"] == base]
-        welford_rows = [r for r in records if r["variant"] == welford]
-        if not base_rows or not welford_rows:
-            continue
+def make_logger(file_obj=None):
+    def _log(msg):
+        print(msg)
+        if file_obj is not None:
+            file_obj.write(msg + "\n")
+    return _log
 
-        base_med = float(np.mean([r["med_us"] for r in base_rows]))
-        welford_med = float(np.mean([r["med_us"] for r in welford_rows]))
-        delta_pct = (welford_med - base_med) / max(base_med, 1e-12) * 100.0
-        delta_str = f"{delta_pct:+6.1f}%"
-        delta_col = Colors.GREEN if delta_pct < 0 else Colors.RED
 
-        base_gbps = float(np.mean([r["gbps"] for r in base_rows]))
-        welford_gbps = float(np.mean([r["gbps"] for r in welford_rows]))
-        bw_delta_pct = (welford_gbps - base_gbps) / max(base_gbps, 1e-12) * 100.0
-        bw_delta_str = f"{bw_delta_pct:+6.1f}%"
-        bw_delta_col = Colors.GREEN if bw_delta_pct > 0 else Colors.RED
+def parse_cached_records(log_file):
+    records = []
+    with open(log_file, "r") as f:
+        for line in f:
+            m = RECORD_RE.match(line.rstrip("\n"))
+            if m is None:
+                continue
+            records.append({
+                "name": m.group("name"),
+                "variant": m.group("variant"),
+                "distribution": m.group("distribution"),
+                "ok": m.group("acc") == "OK",
+                "med_us": float(m.group("med")),
+                "gbps": float(m.group("gbps")),
+            })
+    return records
 
-        base_by_name = {r["name"]: r for r in base_rows}
-        welford_by_name = {r["name"]: r for r in welford_rows}
-        common_names = sorted(set(base_by_name.keys()) & set(welford_by_name.keys()))
-        base_pass = sum(1 for n in common_names if base_by_name[n]["ok"])
-        welford_pass = sum(1 for n in common_names if welford_by_name[n]["ok"])
-        pair_total = len(common_names)
-        acc_str = f"{base_pass}/{pair_total} - {welford_pass}/{pair_total}"
-        acc_col = Colors.GREEN if (base_pass == pair_total and welford_pass == pair_total) else Colors.YELLOW
 
+def print_kernel_summary(records, base_variants):
+    print("\n=== Matrix Summary (shape+distribution x ABI x kernel_impl) ===")
+    print("    dist         shape    ABI              kernel_impl   med(us)   GB/s   acc")
+    impls = (
+        ("optimized", ""),
+        ("welford", "welford_"),
+        ("twopass", "twopass_"),
+    )
+    grouped = sorted({(r["distribution"], r["name"]) for r in records})
+    for distribution, shape in grouped:
+        for base in base_variants:
+            rows = {}
+            for impl_name, prefix in impls:
+                variant = f"{prefix}{base}" if prefix else base
+                rows[impl_name] = next(
+                    (r for r in records
+                     if r["distribution"] == distribution and r["name"] == shape and r["variant"] == variant),
+                    None,
+                )
+            if any(v is None for v in rows.values()):
+                continue
+
+            for impl_name, _ in impls:
+                row = rows[impl_name]
+                acc_col = Colors.GREEN if row["ok"] else Colors.YELLOW
+                acc_str = _color("PASS" if row["ok"] else "FAIL", acc_col)
+                print(
+                    f"    {distribution:12s} {shape:7s} {base:16s} "
+                    f"{impl_name:11s} {row['med_us']:8.3f} {row['gbps']:6.1f} {acc_str:>6s}"
+                )
+
+
+def print_best_per_shape_distribution(records, base_variants):
+    print("\n=== Best Performer per Shape+Distribution ===")
+    print("    dist         shape    best_ABI         best_kernel    med(us)   GB/s   acc")
+
+    def _variant_to_abi_impl(variant):
+        if variant.startswith("welford_"):
+            return variant[len("welford_"):], "welford"
+        if variant.startswith("twopass_"):
+            return variant[len("twopass_"):], "twopass"
+        return variant, "optimized"
+
+    grouped = sorted({(r["distribution"], r["name"]) for r in records})
+    for distribution, shape in grouped:
+        candidates = [r for r in records if r["distribution"] == distribution and r["name"] == shape]
+        # Primary key: higher GB/s. Tie-breaker: lower median latency.
+        best = max(candidates, key=lambda r: (r["gbps"], -r["med_us"]))
+        abi, impl = _variant_to_abi_impl(best["variant"])
+        acc_col = Colors.GREEN if best["ok"] else Colors.YELLOW
+        acc_str = _color("PASS" if best["ok"] else "FAIL", acc_col)
         print(
-            f"    {base:16s} {base_med:12.3f} {welford_med:16.3f} "
-            f"{_color(delta_str, delta_col):>12s} {base_gbps:10.1f} {welford_gbps:13.1f} "
-            f"{_color(bw_delta_str, bw_delta_col):>9s} {'':>3s} {_color(acc_str, acc_col):>9s}"
+            f"    {distribution:12s} {shape:7s} {abi:16s} "
+            f"{impl:11s} {best['med_us']:8.3f} {best['gbps']:6.1f} {acc_str:>6s}"
         )
 
 
-def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distribution="uniform"):
+def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distribution="uniform", logger=print):
     src, opts, lws, items, disp = build(D, eps, variant)
     kernels = kernel_cache(src, opts)
-    base_variant = variant[len("welford_"):] if variant.startswith("welford_") else variant
+    if variant.startswith("welford_"):
+        base_variant = variant[len("welford_"):]
+    elif variant.startswith("twopass_"):
+        base_variant = variant[len("twopass_"):]
+    else:
+        base_variant = variant
 
     np.random.seed(0)
     x = make_input(rows, D, distribution)
@@ -313,11 +384,11 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     ok = np.allclose(cur, ref, atol=2e-2, rtol=2e-2)
     if not ok:
         bad = np.abs(cur.astype(np.float32) - ref.astype(np.float32))
-        print(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
+        logger(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
 
     if distribution == "cancellation":
         neg_ratio, rel_p50, rel_p99 = variance_cancellation_stats(x)
-        print(f"  [{name}/{variant}] cancellation stats: neg_var={neg_ratio:.3%} rel_err p50={rel_p50:.3f} p99={rel_p99:.3f}")
+        logger(f"  [{name}/{variant}] cancellation stats: neg_var={neg_ratio:.3%} rel_err p50={rel_p50:.3f} p99={rel_p99:.3f}")
         # Keep a strict stress guard on the original adversarial shape only.
         if rows == 1716 and D == 4608:
             assert rel_p99 > 0.20, "cancellation distribution is not stressing E[x^2]-E[x]^2 enough"
@@ -333,9 +404,9 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     stack = (D + lws - 1) // lws
     mode = "reread" if (base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12") and stack > MAX_REGISTER_STACK) else "cache"
 
-    print(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
-          f"{disp:28s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
-          f"{gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) (OV C6 {ov_ref_us:.0f} us)")
+    logger(f"  {name:7s} {variant:11s} dist={distribution:12s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
+           f"{disp:28s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
+           f"{gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) (OV C6 {ov_ref_us:.0f} us)")
     return {
         "name": name,
         "variant": variant,
@@ -347,36 +418,56 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
 
 
 def main():
+    parser = argparse.ArgumentParser(description="MVN kernel benchmark harness")
+    parser.add_argument("-f", "--force-rerun", action="store_true", help="Ignore cached log and rerun all benchmark cases")
+    parser.add_argument("-l", "--log-file", default=DEFAULT_LOG_FILE,
+                        help="Path to non-summary benchmark log cache (default: %(default)s)")
+    args = parser.parse_args()
+
     cl.profiling(True)
-    print("=== OV mvn_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 vision encoder ===")
-    print("    ov = exact OV config (fused gamma+beta); static = same work, static shapes")
-    print("    input/output/gamma/beta buffers rotated -> med/min/std us + physical DRAM GB/s")
-    print("    welford_* variants use mvn_gpu_bfyx_opt_welford.cl with the same launch ABI")
-    results = []
-    records = []
     base_variants = ("ov", "bucket", "generalized", "gen_t16", "gen_hybrid", "gen_stack12", "static")
-    all_variants = base_variants + tuple(f"welford_{v}" for v in base_variants)
+    all_variants = (
+        base_variants
+        + tuple(f"welford_{v}" for v in base_variants)
+        + tuple(f"twopass_{v}" for v in base_variants)
+    )
     # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
     cases = [("small", 4096, 257, 0),
              ("vit", 6864, 1152, 833),
              ("wide", 1024, 8192, 0),
              ("merger", 1716, 4608, 910),
              ("huge", 256, 32768, 0)]
-    for name, rows, D, ref in cases:
-        for variant in all_variants:
-            rec = run_case(name, rows, D, ref, variant)
-            results.append(rec["ok"])
-            records.append(rec)
 
-    # Adversarial distribution for the single-pass variance formula:
-    # large mean + tiny fp16 jitter -> catastrophic cancellation in E[x^2]-E[x]^2.
-    for name, rows, D, ref in cases:
-        for variant in all_variants:
-            records.append(run_case(name, rows, D, ref, variant, distribution="cancellation"))
+    if os.path.exists(args.log_file) and not args.force_rerun:
+        print(f"Using cached non-summary log: {args.log_file}")
+        records = parse_cached_records(args.log_file)
+    else:
+        print(f"Writing non-summary log to: {args.log_file}")
+        records = []
+        with open(args.log_file, "w") as log_f:
+            logger = make_logger(log_f)
+            logger("=== OV mvn_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 vision encoder ===")
+            logger("    ov = exact OV config (fused gamma+beta); static = same work, static shapes")
+            logger("    input/output/gamma/beta buffers rotated -> med/min/std us + physical DRAM GB/s")
+            logger("    welford_* variants use mvn_gpu_bfyx_opt_welford.cl with the same launch ABI")
+            logger("    twopass_* variants use mvn_gpu_bfyx_opt_twopass.cl with the same launch ABI")
 
-    print_pair_summary([r for r in records if r["distribution"] == "uniform"], base_variants, "uniform")
-    print_pair_summary([r for r in records if r["distribution"] == "cancellation"], base_variants, "cancellation")
-    assert all(results), "accuracy check failed"
+            for name, rows, D, ref in cases:
+                for variant in all_variants:
+                    records.append(run_case(name, rows, D, ref, variant, logger=logger))
+
+            # Adversarial distribution for the single-pass variance formula:
+            # large mean + tiny fp16 jitter -> catastrophic cancellation in E[x^2]-E[x]^2.
+            for name, rows, D, ref in cases:
+                if not (rows == 1716 and D == 4608):
+                    continue
+                for variant in all_variants:
+                    records.append(run_case(name, rows, D, ref, variant, distribution="cancellation", logger=logger))
+
+    print_kernel_summary(records, base_variants)
+    print_best_per_shape_distribution(records, base_variants)
+    uniform_results = [r["ok"] for r in records if r["distribution"] == "uniform"]
+    assert all(uniform_results), "accuracy check failed"
     print("accuracy: all good")
 
 
