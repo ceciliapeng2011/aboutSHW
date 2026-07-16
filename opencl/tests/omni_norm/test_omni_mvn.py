@@ -344,6 +344,54 @@ def print_best_per_shape_distribution(records, base_variants):
         )
 
 
+def print_requested_combo_view(records):
+    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+    combos = [
+        ("ov + twopass", "twopass_ov"),
+        ("ov + welford", "welford_ov"),
+        ("generalized + optimized", "generalized"),
+        ("gen_t16 + optimized", "gen_t16"),
+        ("gen_stack12 + optimized", "gen_stack12"),
+        ("gen_hybrid + optimized", "gen_hybrid"),
+    ]
+
+    dist_w = 12
+    shape_w = 7
+    col_w = 26
+    row_header = f"{'dist':<{dist_w}s} {'shape':<{shape_w}s}"
+    col_headers = " ".join(f"{name:>{col_w}s}" for name, _ in combos)
+    print(f"    {row_header} {col_headers}")
+    print(f"    {'-' * (dist_w + shape_w + 1)} {'-' * ((col_w + 1) * len(combos) - 1)}")
+
+    grouped = sorted({(r["distribution"], r["name"]) for r in records})
+    for distribution, shape in grouped:
+        raw_values = []
+        for _, variant in combos:
+            row = next((r for r in records
+                        if r["distribution"] == distribution and r["name"] == shape and r["variant"] == variant), None)
+            raw_values.append(row["gbps"] if row is not None else None)
+
+        present = [v for v in raw_values if v is not None]
+        best = max(present) if present else None
+        worst = min(present) if present else None
+
+        values = []
+        for v in raw_values:
+            if v is None:
+                values.append(f"{'-':>{col_w}s}")
+                continue
+
+            cell = f"{v:>{col_w}.1f}"
+            if best is not None and worst is not None and best != worst:
+                if v == best:
+                    cell = _color(cell, Colors.GREEN)
+                elif v == worst:
+                    cell = _color(cell, Colors.RED)
+            values.append(cell)
+
+        print(f"    {distribution:<{dist_w}s} {shape:<{shape_w}s} {' '.join(values)}")
+
+
 def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distribution="uniform", logger=print):
     src, opts, lws, items, disp = build(D, eps, variant)
     kernels = kernel_cache(src, opts)
@@ -466,6 +514,7 @@ def main():
 
     print_kernel_summary(records, base_variants)
     print_best_per_shape_distribution(records, base_variants)
+    print_requested_combo_view(records)
     uniform_results = [r["ok"] for r in records if r["distribution"] == "uniform"]
     assert all(uniform_results), "accuracy check failed"
     print("accuracy: all good")
