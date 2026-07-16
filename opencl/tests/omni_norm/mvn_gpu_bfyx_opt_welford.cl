@@ -86,7 +86,7 @@ KERNEL (mvn_gpu_bfyx_opt)(
 #   if defined EPS_OUTSIDE_SQRT
     float my_variance = native_powr(native_sqrt(variance) + (float)EPSILON, -1.f);
 #   elif defined EPS_INSIDE_SQRT
-    float my_variance = native_powr(variance + (float)EPSILON, -0.5f);
+    float my_variance = native_rsqrt(variance + (float)EPSILON);
 #   endif
 #endif
 
