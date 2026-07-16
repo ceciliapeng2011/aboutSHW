@@ -242,7 +242,7 @@ def _color(text, color):
 
 def print_pair_summary(records, base_variants, title):
     print(f"\n=== {title} per-pair summary (base vs welford) ===")
-    print("    pair              base_med(us)  welford_med(us)   delta    acc passrate(base - welford)")
+    print("    pair              base_med(us)  welford_med(us)   delta    base_GB/s  welford_GB/s  bw_delta   acc passrate(base - welford)")
     for base in base_variants:
         welford = f"welford_{base}"
         base_rows = [r for r in records if r["variant"] == base]
@@ -256,6 +256,12 @@ def print_pair_summary(records, base_variants, title):
         delta_str = f"{delta_pct:+6.1f}%"
         delta_col = Colors.GREEN if delta_pct < 0 else Colors.RED
 
+        base_gbps = float(np.mean([r["gbps"] for r in base_rows]))
+        welford_gbps = float(np.mean([r["gbps"] for r in welford_rows]))
+        bw_delta_pct = (welford_gbps - base_gbps) / max(base_gbps, 1e-12) * 100.0
+        bw_delta_str = f"{bw_delta_pct:+6.1f}%"
+        bw_delta_col = Colors.GREEN if bw_delta_pct > 0 else Colors.RED
+
         base_by_name = {r["name"]: r for r in base_rows}
         welford_by_name = {r["name"]: r for r in welford_rows}
         common_names = sorted(set(base_by_name.keys()) & set(welford_by_name.keys()))
@@ -267,7 +273,8 @@ def print_pair_summary(records, base_variants, title):
 
         print(
             f"    {base:16s} {base_med:12.3f} {welford_med:16.3f} "
-            f"{_color(delta_str, delta_col):>12s} {'':>9s} {_color(acc_str, acc_col):>9s}"
+            f"{_color(delta_str, delta_col):>12s} {base_gbps:10.1f} {welford_gbps:13.1f} "
+            f"{_color(bw_delta_str, bw_delta_col):>9s} {'':>3s} {_color(acc_str, acc_col):>9s}"
         )
 
 
@@ -329,7 +336,14 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     print(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
           f"{disp:28s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
           f"{gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) (OV C6 {ov_ref_us:.0f} us)")
-    return {"name": name, "variant": variant, "distribution": distribution, "ok": ok, "med_us": float(med)}
+    return {
+        "name": name,
+        "variant": variant,
+        "distribution": distribution,
+        "ok": ok,
+        "med_us": float(med),
+        "gbps": float(gbps),
+    }
 
 
 def main():
