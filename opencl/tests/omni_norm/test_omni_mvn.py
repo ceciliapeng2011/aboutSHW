@@ -311,7 +311,9 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     if distribution == "cancellation":
         neg_ratio, rel_p50, rel_p99 = variance_cancellation_stats(x)
         print(f"  [{name}/{variant}] cancellation stats: neg_var={neg_ratio:.3%} rel_err p50={rel_p50:.3f} p99={rel_p99:.3f}")
-        assert rel_p99 > 0.20, "cancellation distribution is not stressing E[x^2]-E[x]^2 enough"
+        # Keep a strict stress guard on the original adversarial shape only.
+        if rows == 1716 and D == 4608:
+            assert rel_p99 > 0.20, "cancellation distribution is not stressing E[x^2]-E[x]^2 enough"
 
     # steady-state stats (warm up first; early launches run at a low GPU clock).
     for i in range(iters):
@@ -341,11 +343,12 @@ def main():
     base_variants = ("ov", "bucket", "generalized", "gen_t16", "gen_hybrid", "gen_stack12", "static")
     all_variants = base_variants + tuple(f"welford_{v}" for v in base_variants)
     # ov_ref_us = per-call device time from C6 CLIntercept trace (mvn_gpu_profile.md).
-    for name, rows, D, ref in [("small", 4096, 257, 0),
-                               ("vit", 6864, 1152, 833),
-                               ("wide", 1024, 8192, 0),
-                               ("merger", 1716, 4608, 910),
-                               ("huge", 256, 32768, 0)]:
+    cases = [("small", 4096, 257, 0),
+             ("vit", 6864, 1152, 833),
+             ("wide", 1024, 8192, 0),
+             ("merger", 1716, 4608, 910),
+             ("huge", 256, 32768, 0)]
+    for name, rows, D, ref in cases:
         for variant in all_variants:
             rec = run_case(name, rows, D, ref, variant)
             results.append(rec["ok"])
@@ -353,8 +356,9 @@ def main():
 
     # Adversarial distribution for the single-pass variance formula:
     # large mean + tiny fp16 jitter -> catastrophic cancellation in E[x^2]-E[x]^2.
-    for variant in all_variants:
-        records.append(run_case("cancel", 1716, 4608, 0, variant, distribution="cancellation", iters=20))
+    for name, rows, D, ref in cases:
+        for variant in all_variants:
+            records.append(run_case(name, rows, D, ref, variant, distribution="cancellation"))
 
     print_pair_summary([r for r in records if r["distribution"] == "uniform"], base_variants, "uniform")
     print_pair_summary([r for r in records if r["distribution"] == "cancellation"], base_variants, "cancellation")
