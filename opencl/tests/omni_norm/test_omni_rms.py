@@ -25,7 +25,8 @@
 #   bucket : cecilia/opt/mvn_rms host ABI with shape_info arg and fixed generalized LWS
 #   qk_specialized : branch ABI + explicit one-subgroup-row specialization for D=128 q/k
 #   hidden_specialized : branch ABI + explicit multi-subgroup-row specialization for D=2560 hidden
-#   generalized : branch ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
+#   gen_t8 : branch ABI + fixed t8 generalized LWS rule
+#   gen_adaptive : shape-aware policy (t8/t16 + adaptive stack cap + adaptive block size)
 #   bucket_tuned : branch ABI + alternative subgroup block / stack tuning probe
 #   static : branch static-shape specialization
 #
@@ -44,6 +45,8 @@ SUB_GROUP_SIZE = 16
 MAX_LWS = 1024  # maxSlmSize = min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
 MAX_REGISTER_STACK = 16
+SHAPE_T16_MIN = 1024
+SHAPE_T16_MAX = 6144
 DEFAULT_LOG_FILE = os.path.join(HERE, "test_omni_rms.nosummary.log")
 
 
@@ -149,6 +152,66 @@ def subgroup_block_size(items):
     return 1
 
 
+def adaptive_subgroup_block_size(items, preferred=8):
+    return min(preferred, subgroup_block_size(items))
+
+
+def adaptive_rms_stack_cap(data_size, base_cap):
+    if data_size < 512 or data_size >= 8192:
+        return min(base_cap, 12)
+    return base_cap
+
+
+def shape_aware_rms_policy(data_size, base_variant):
+    """Return (target_items, preferred_sbs, stack_cap, tag)."""
+    if base_variant == "gen_adaptive":
+        # Adaptive RMS policy summary:
+        # 1) Choose t16 only for wide-like rows in [6144, 16384), where it is typically
+        #    best or tie-best on this platform.
+        # 2) Use t8 elsewhere as the robust default.
+        # 3) Keep preferred subgroup block size at 8, then cap by the kernel-derived limit.
+        # 4) Use a tighter stack cap on <=2048 rows and clamp tiny (<512) / huge (>=8192)
+        #    rows via adaptive_rms_stack_cap() to reduce pressure-driven regressions.
+        # RMS empirical policy on LNL/Xe2:
+        # - t8 is better or tie-best for most small/mid/hidden shapes.
+        # - t16 helps wide-like shapes (e.g. D=8192).
+        if 6144 <= data_size < 16384:
+            target_items = 16
+            stack_cap = adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK)
+            return target_items, 8, stack_cap, "gen adaptive t16-wide"
+
+        target_items = 8
+        # Keep a tighter cap on <=2K rows to reduce sensitivity to pressure.
+        base_cap = 12 if data_size <= 2048 else MAX_REGISTER_STACK
+        stack_cap = adaptive_rms_stack_cap(data_size, base_cap)
+        return target_items, 8, stack_cap, "gen adaptive t8-main"
+    if base_variant == "gen_t8":
+        return 8, 8, adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK), "gen t8"
+    if base_variant == "gen_t16":
+        return 16, 8, MAX_REGISTER_STACK, "gen t16"
+    if base_variant == "gen_hybrid":
+        target_items = 16 if data_size >= 2048 else 8
+        stack_cap = adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK)
+        return target_items, 8, stack_cap, f"gen hybrid t{target_items}"
+    if base_variant == "gen_block4":
+        return 8, 4, adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK), "gen block4"
+    if base_variant == "gen_block2":
+        return 8, 2, adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK), "gen block2"
+    if base_variant == "gen_stack12":
+        return 8, 8, adaptive_rms_stack_cap(data_size, 12), "gen stack12"
+
+    return 8, 8, adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK), "gen t8"
+
+
+def effective_rms_stack_cap(data_size, base_variant):
+    if base_variant in ("gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
+        _, _, stack_cap, _ = shape_aware_rms_policy(data_size, base_variant)
+        return stack_cap
+    if base_variant in ("bucket", "qk_specialized", "hidden_specialized", "static"):
+        return adaptive_rms_stack_cap(data_size, MAX_REGISTER_STACK)
+    return MAX_REGISTER_STACK
+
+
 def build(D, rank, eps, variant):
     use_twopass = variant.startswith("twopass_")
     base_variant = variant[len("twopass_"):] if use_twopass else variant
@@ -199,40 +262,12 @@ def build(D, rank, eps, variant):
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
         disp = f"hidden multi-sg branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
-    elif base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
-        if base_variant == "gen_t16":
-            target_items = 16
-            sbs = 8
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen t16"
-        elif base_variant == "gen_hybrid":
-            target_items = 16 if D >= 2048 else 8
-            sbs = 8
-            stack_cap = MAX_REGISTER_STACK
-            tag = f"gen hybrid t{target_items}"
-        elif base_variant == "gen_block4":
-            target_items = 8
-            sbs = 4
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen block4"
-        elif base_variant == "gen_block2":
-            target_items = 8
-            sbs = 2
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen block2"
-        elif base_variant == "gen_stack12":
-            target_items = 8
-            sbs = 8
-            stack_cap = 12
-            tag = "gen stack12"
-        else:
-            target_items = 8
-            sbs = 8
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen t8"
+    elif base_variant in ("gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
+        target_items, preferred_sbs, stack_cap, tag = shape_aware_rms_policy(D, base_variant)
 
         lws = generalized_lws(D, target_items=target_items)
         items = D // lws
+        sbs = adaptive_subgroup_block_size(items, preferred=preferred_sbs)
         stack, capped_stack, reread = branch_stack(D, lws, stack_cap)
         stack_value = stack if use_twopass else capped_stack
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
@@ -325,32 +360,11 @@ def print_kernel_summary(records, base_variants):
                 )
 
 
-def print_best_per_shape(records):
-    print("\n=== Best Performer per Shape ===")
-    print("    shape    best_ABI             best_kernel    med(us)   GB/s   acc")
-
-    def _variant_to_abi_impl(variant):
-        if variant.startswith("twopass_"):
-            return variant[len("twopass_"):], "twopass"
-        return variant, "optimized"
-
-    grouped = sorted({r["name"] for r in records})
-    for shape in grouped:
-        candidates = [r for r in records if r["name"] == shape]
-        best = max(candidates, key=lambda r: (r["gbps"], -r["med_us"]))
-        abi, impl = _variant_to_abi_impl(best["variant"])
-        acc_col = Colors.GREEN if best["ok"] else Colors.YELLOW
-        acc_str = _color("PASS" if best["ok"] else "FAIL", acc_col)
-        print(
-            f"    {shape:7s} {abi:20s} {impl:11s} "
-            f"{best['med_us']:8.3f} {best['gbps']:6.1f} {acc_str:>6s}"
-        )
-
-
 def print_requested_combo_view(records, output_format="table"):
     combos = [
         ("ov + twopass", "twopass_ov"),
-        ("generalized + optimized", "generalized"),
+        ("gen_t8 + optimized", "gen_t8"),
+        ("gen_adaptive + optimized", "gen_adaptive"),
         ("gen_t16 + optimized", "gen_t16"),
         ("gen_hybrid + optimized", "gen_hybrid"),
         ("gen_stack12 + optimized", "gen_stack12"),
@@ -407,6 +421,19 @@ def print_requested_combo_view(records, output_format="table"):
         print(f"    {shape:<{shape_w}s} {' '.join(values)}")
 
 
+def print_gen_adaptive_policy_summary(cases):
+    print("\n=== gen_adaptive Policy Summary ===")
+    print("    shape     D      target_items  preferred_sbs  stack_cap  tag")
+    seen = set()
+    for name, _, D, _, _ in cases:
+        # q_norm and k_norm share D=128; print each shape once.
+        if (name, D) in seen:
+            continue
+        seen.add((name, D))
+        target_items, preferred_sbs, stack_cap, tag = shape_aware_rms_policy(D, "gen_adaptive")
+        print(f"    {name:7s} {D:6d} {target_items:13d} {preferred_sbs:14d} {stack_cap:10d}  {tag}")
+
+
 def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100, logger=print):
     src, opts, lws, items, disp = build(D, rank, eps, variant)
     kernels = kernel_cache(src, opts)
@@ -430,7 +457,7 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100, logge
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if base_variant in (
-        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "gen_t8", "gen_adaptive",
         "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "bucket_tuned") else []
 
     def _args(i):
@@ -456,9 +483,9 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100, logge
     gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective physical DRAM bandwidth at median
     stack = (D + lws - 1) // lws
     mode = "reread" if (base_variant in (
-        "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "bucket", "qk_specialized", "hidden_specialized", "gen_t8", "gen_adaptive",
         "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "static"
-    ) and stack > MAX_REGISTER_STACK) else "cache"
+    ) and stack > effective_rms_stack_cap(D, base_variant)) else "cache"
 
     logger(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
            f"{disp:40s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
@@ -484,7 +511,7 @@ def main():
 
     cl.profiling(True)
     base_variants = (
-        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "gen_t8", "gen_adaptive",
         "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "bucket_tuned", "static"
     )
     all_variants = base_variants + tuple(f"twopass_{v}" for v in base_variants)
@@ -519,7 +546,7 @@ def main():
                     records.append(run_case(name, rows, D, rank, ref, variant, logger=logger))
 
     print_kernel_summary(records, base_variants)
-    print_best_per_shape(records)
+    print_gen_adaptive_policy_summary(cases)
     print_requested_combo_view(records, output_format=args.combo_format)
     assert all(r["ok"] for r in records), "accuracy check failed"
     print("accuracy: all good")

@@ -23,7 +23,8 @@
 # Variants:
 #   ov     : OV master host ABI (dynamic, shape_info arg, runtime LWS)
 #   bucket : cecilia/opt/mvn_rms host ABI with shape_info arg and fixed generalized LWS
-#   generalized : branch ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
+#   gen_t8 : branch ABI + fixed t8 generalized LWS rule
+#   gen_adaptive : shape-aware policy (t8/t16 + adaptive stack cap)
 #   static : branch static-shape specialization
 #
 # NOTE: the fused epilogue reproduces OV's affine functionally (out = norm*gamma + beta,
@@ -45,6 +46,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_LWS = 1024  # min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
 MAX_REGISTER_STACK = 16
+# Shape buckets derived from current PTL measurements.
+SHAPE_T16_MIN = 1024
+SHAPE_T16_MAX = 6144
 DEFAULT_LOG_FILE = os.path.join(HERE, "test_omni_mvn.nosummary.log")
 
 
@@ -154,6 +158,54 @@ def branch_stack(data_set_size, lws, stack_cap=MAX_REGISTER_STACK):
     return required, min(required, stack_cap), required > stack_cap
 
 
+def adaptive_register_stack_cap(data_set_size, target_items, base_cap=MAX_REGISTER_STACK):
+    # Keep vit/merger-like t16 range on full cap, tighten tiny/very-wide rows.
+    if target_items >= 16 and SHAPE_T16_MIN <= data_set_size <= SHAPE_T16_MAX:
+        return base_cap
+    if data_set_size < 512 or data_set_size >= 8192:
+        return min(base_cap, 12)
+    return base_cap
+
+
+def shape_aware_mvn_policy(data_set_size, base_variant):
+    """Return (target_items, stack_cap, tag) for generalized family variants."""
+    if base_variant == "gen_adaptive":
+        # Adaptive MVN policy summary:
+        # 1) Select t16 only for the empirically strong mid-range window
+        #    [SHAPE_T16_MIN, SHAPE_T16_MAX] (current defaults: 1024..6144).
+        # 2) Use t8 outside that window to avoid regressions on very small/very wide rows.
+        # 3) Derive stack_cap from adaptive_register_stack_cap(): keep full cap for t16 in-window,
+        #    but clamp to 12 on tiny (<512) or very wide (>=8192) rows to reduce register pressure
+        #    and reread sensitivity.
+        target_items = 16 if SHAPE_T16_MIN <= data_set_size <= SHAPE_T16_MAX else 8
+        stack_cap = adaptive_register_stack_cap(data_set_size, target_items)
+        return target_items, stack_cap, f"gen adaptive t{target_items}"
+
+    if base_variant == "gen_t8":
+        stack_cap = adaptive_register_stack_cap(data_set_size, 8)
+        return 8, stack_cap, "gen t8"
+
+    if base_variant == "gen_t16":
+        return 16, MAX_REGISTER_STACK, "gen t16"
+    if base_variant == "gen_stack12":
+        return 8, 12, "gen stack12"
+
+    if base_variant == "gen_hybrid":
+        target_items = 16 if data_set_size >= 8192 else 8
+        stack_cap = 12 if data_set_size >= 8192 else MAX_REGISTER_STACK
+        return target_items, stack_cap, f"gen hybrid t{target_items}"
+
+    stack_cap = adaptive_register_stack_cap(data_set_size, 8)
+    return 8, stack_cap, "gen t8"
+
+
+def effective_stack_cap(data_set_size, base_variant):
+    if base_variant in ("gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_stack12"):
+        _, stack_cap, _ = shape_aware_mvn_policy(data_set_size, base_variant)
+        return stack_cap
+    return MAX_REGISTER_STACK
+
+
 def build(D, eps, variant):
     use_welford = variant.startswith("welford_")
     use_twopass = variant.startswith("twopass_")
@@ -201,24 +253,8 @@ def build(D, eps, variant):
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
         disp = f"bucket branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
-    elif base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12"):
-        if base_variant == "gen_t16":
-            target_items = 16
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen t16"
-        elif base_variant == "gen_hybrid":
-            # Heuristic for larger normalized dims on 8Xe: use deeper per-WI work.
-            target_items = 16 if D >= 8192 else 8
-            stack_cap = MAX_REGISTER_STACK
-            tag = f"gen hybrid t{target_items}"
-        elif base_variant == "gen_stack12":
-            target_items = 8
-            stack_cap = 12
-            tag = "gen stack12"
-        else:
-            target_items = 8
-            stack_cap = MAX_REGISTER_STACK
-            tag = "gen t8"
+    elif base_variant in ("gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_stack12"):
+        target_items, stack_cap, tag = shape_aware_mvn_policy(D, base_variant)
 
         lws = generalized_lws(D, target_items=target_items)
         items = D // lws
@@ -343,36 +379,12 @@ def print_kernel_summary(records, base_variants):
                 )
 
 
-def print_best_per_shape_distribution(records, base_variants):
-    print("\n=== Best Performer per Shape+Distribution ===")
-    print("    dist         shape    best_ABI         best_kernel    med(us)   GB/s   acc")
-
-    def _variant_to_abi_impl(variant):
-        if variant.startswith("welford_"):
-            return variant[len("welford_"):], "welford"
-        if variant.startswith("twopass_"):
-            return variant[len("twopass_"):], "twopass"
-        return variant, "optimized"
-
-    grouped = sorted({(r["distribution"], r["name"]) for r in records})
-    for distribution, shape in grouped:
-        candidates = [r for r in records if r["distribution"] == distribution and r["name"] == shape]
-        # Primary key: higher GB/s. Tie-breaker: lower median latency.
-        best = max(candidates, key=lambda r: (r["gbps"], -r["med_us"]))
-        abi, impl = _variant_to_abi_impl(best["variant"])
-        acc_col = Colors.GREEN if best["ok"] else Colors.YELLOW
-        acc_str = _color("PASS" if best["ok"] else "FAIL", acc_col)
-        print(
-            f"    {distribution:12s} {shape:7s} {abi:16s} "
-            f"{impl:11s} {best['med_us']:8.3f} {best['gbps']:6.1f} {acc_str:>6s}"
-        )
-
-
 def print_requested_combo_view(records, output_format="table"):
     combos = [
         ("ov + twopass", "twopass_ov"),
         ("ov + welford", "welford_ov"),
-        ("generalized + optimized", "generalized"),
+        ("gen_t8 + optimized", "gen_t8"),
+        ("gen_adaptive + optimized", "gen_adaptive"),
         ("gen_t16 + optimized", "gen_t16"),
         ("gen_stack12 + optimized", "gen_stack12"),
         ("gen_hybrid + optimized", "gen_hybrid"),
@@ -431,6 +443,18 @@ def print_requested_combo_view(records, output_format="table"):
         print(f"    {distribution:<{dist_w}s} {shape:<{shape_w}s} {' '.join(values)}")
 
 
+def print_gen_adaptive_policy_summary(cases):
+    print("\n=== gen_adaptive Policy Summary ===")
+    print("    shape     D      target_items  stack_cap  tag")
+    seen = set()
+    for name, _, D, _ in cases:
+        if (name, D) in seen:
+            continue
+        seen.add((name, D))
+        target_items, stack_cap, tag = shape_aware_mvn_policy(D, "gen_adaptive")
+        print(f"    {name:7s} {D:6d} {target_items:13d} {stack_cap:10d}  {tag}")
+
+
 def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distribution="uniform", logger=print):
     src, opts, lws, items, disp = build(D, eps, variant)
     kernels = kernel_cache(src, opts)
@@ -457,7 +481,7 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     # OV arg layout: [shape_info, input, output, gamma, beta]. shape_info = 16 int32,
     # unused by the body but present to match OV's dynamic signature.
     shape_info = [cl.tensor(np.zeros(16, np.int32))] if base_variant in (
-        "ov", "bucket", "generalized", "gen_t16", "gen_hybrid", "gen_stack12"
+        "ov", "bucket", "gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_stack12"
     ) else []
 
     def _args(i):
@@ -489,7 +513,8 @@ def run_case(name, rows, D, ov_ref_us, variant, eps=1e-6, iters=100, distributio
     mn, med, std = _stats_us(cl.finish())
     gbps = physical_bytes_per_call / (med * 1e-6) / 1e9  # physical DRAM BW estimate
     stack = (D + lws - 1) // lws
-    mode = "reread" if (base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12") and stack > MAX_REGISTER_STACK) else "cache"
+    stack_cap = effective_stack_cap(D, base_variant)
+    mode = "reread" if (base_variant in ("gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_stack12") and stack > stack_cap) else "cache"
 
     logger(f"  {name:7s} {variant:11s} dist={distribution:12s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
            f"{disp:28s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} std={std:6.3f} us | "
@@ -514,7 +539,7 @@ def main():
     args = parser.parse_args()
 
     cl.profiling(True)
-    base_variants = ("ov", "bucket", "generalized", "gen_t16", "gen_hybrid", "gen_stack12", "static")
+    base_variants = ("ov", "bucket", "gen_t8", "gen_adaptive", "gen_t16", "gen_hybrid", "gen_stack12", "static")
     all_variants = (
         base_variants
         + tuple(f"welford_{v}" for v in base_variants)
@@ -554,7 +579,7 @@ def main():
                     records.append(run_case(name, rows, D, ref, variant, distribution="cancellation", logger=logger))
 
     print_kernel_summary(records, base_variants)
-    print_best_per_shape_distribution(records, base_variants)
+    print_gen_adaptive_policy_summary(cases)
     print_requested_combo_view(records, output_format=args.combo_format)
     uniform_results = [r["ok"] for r in records if r["distribution"] == "uniform"]
     assert all(uniform_results), "accuracy check failed"
