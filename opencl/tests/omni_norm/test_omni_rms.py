@@ -32,16 +32,26 @@
 # Run inside the llm container (built_ov env):  python test_omni_rms.py
 
 import os
+import re
+import argparse
 import numpy as np
 import torch
 from clops import cl
-from clops.utils import kernel_cache
+from clops.utils import Colors, kernel_cache
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUB_GROUP_SIZE = 16
 MAX_LWS = 1024  # maxSlmSize = min(maxWorkGroupSize=1024, maxLocalMemSize/(2*2B)) on PTL Xe
 CACHE_FLUSH_BYTES = 256 << 20  # rotate through >=256 MiB of buffers to defeat L2/SLC reuse
 MAX_REGISTER_STACK = 16
+DEFAULT_LOG_FILE = os.path.join(HERE, "test_omni_rms.nosummary.log")
+
+
+RECORD_RE = re.compile(
+    r"^\s*(?P<name>\S+)\s+(?P<variant>\S+)\s+rows=.*\|\s+"
+    r"acc=(?P<acc>OK|FAIL)\s+\|\s+med=\s*(?P<med>[0-9.]+).*\|\s+"
+    r"(?P<gbps>[0-9.]+)\s+GB/s"
+)
 
 
 def _pool_size(bytes_per_set):
@@ -53,6 +63,18 @@ def _stats_us(lat_ns):
     """min / median / std (us) from per-call device times (ns)."""
     a = np.sort(np.asarray(lat_ns, dtype=np.float64)) / 1e3
     return a[0], a[len(a) // 2], a.std()
+
+
+def _color(text, color):
+    return f"{color}{text}{Colors.END}"
+
+
+def make_logger(file_obj=None):
+    def _log(msg):
+        print(msg)
+        if file_obj is not None:
+            file_obj.write(msg + "\n")
+    return _log
 
 
 def _read(name):
@@ -145,11 +167,12 @@ def build(D, rank, eps, variant):
     elif base_variant == "bucket":
         lws = generalized_lws(D)
         stack, capped_stack, reread = branch_stack(D, lws)
+        stack_value = stack if use_twopass else capped_stack
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack_value} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
-        if reread:
+        if reread and not use_twopass:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
@@ -157,9 +180,10 @@ def build(D, rank, eps, variant):
     elif base_variant == "qk_specialized":
         lws = generalized_lws(D)
         stack, capped_stack, reread = branch_stack(D, lws)
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+        stack_value = stack if use_twopass else capped_stack
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack_value} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DONE_SUBGROUP_ROW=1")
-        if reread:
+        if reread and not use_twopass:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
@@ -167,9 +191,10 @@ def build(D, rank, eps, variant):
     elif base_variant == "hidden_specialized":
         lws = generalized_lws(D)
         stack, capped_stack, reread = branch_stack(D, lws)
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+        stack_value = stack if use_twopass else capped_stack
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack_value} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
-        if reread:
+        if reread and not use_twopass:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
@@ -209,11 +234,12 @@ def build(D, rank, eps, variant):
         lws = generalized_lws(D, target_items=target_items)
         items = D // lws
         stack, capped_stack, reread = branch_stack(D, lws, stack_cap)
+        stack_value = stack if use_twopass else capped_stack
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack_value} "
                 f"-DSUBGROUP_BLOCK_SIZE={sbs} {row_flag}")
-        if reread:
+        if reread and not use_twopass:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
@@ -231,11 +257,12 @@ def build(D, rank, eps, variant):
     else:  # static specialization (same work)
         lws = generalized_lws(D)
         stack, capped_stack, reread = branch_stack(D, lws)
+        stack_value = stack if use_twopass else capped_stack
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
-        opts = base + (f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+        opts = base + (f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack_value} "
                        f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
-        if reread:
+        if reread and not use_twopass:
             opts += " -DRMS_REREAD_INPUT=1"
         src = SHIM + "\n" + kernel_body
         mode = "reread" if reread else "cache"
@@ -251,9 +278,128 @@ def ref_rms(x, g, eps):
     return (xf * torch.rsqrt(var + eps) * torch.from_numpy(g).float()).half().numpy()
 
 
-def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
+def parse_cached_records(log_file):
+    records = []
+    with open(log_file, "r") as f:
+        for line in f:
+            m = RECORD_RE.match(line.rstrip("\n"))
+            if m is None:
+                continue
+            records.append({
+                "name": m.group("name"),
+                "variant": m.group("variant"),
+                "ok": m.group("acc") == "OK",
+                "med_us": float(m.group("med")),
+                "gbps": float(m.group("gbps")),
+            })
+    return records
+
+
+def print_kernel_summary(records, base_variants):
+    print("\n=== Matrix Summary (shape x ABI x kernel_impl) ===")
+    print("    shape    ABI                  kernel_impl   med(us)   GB/s   acc")
+    impls = (
+        ("optimized", ""),
+        ("twopass", "twopass_"),
+    )
+    grouped = sorted({r["name"] for r in records})
+    for shape in grouped:
+        for base in base_variants:
+            rows = {}
+            for impl_name, prefix in impls:
+                variant = f"{prefix}{base}" if prefix else base
+                rows[impl_name] = next(
+                    (r for r in records if r["name"] == shape and r["variant"] == variant),
+                    None,
+                )
+            if any(v is None for v in rows.values()):
+                continue
+
+            for impl_name, _ in impls:
+                row = rows[impl_name]
+                acc_col = Colors.GREEN if row["ok"] else Colors.YELLOW
+                acc_str = _color("PASS" if row["ok"] else "FAIL", acc_col)
+                print(
+                    f"    {shape:7s} {base:20s} {impl_name:11s} "
+                    f"{row['med_us']:8.3f} {row['gbps']:6.1f} {acc_str:>6s}"
+                )
+
+
+def print_best_per_shape(records):
+    print("\n=== Best Performer per Shape ===")
+    print("    shape    best_ABI             best_kernel    med(us)   GB/s   acc")
+
+    def _variant_to_abi_impl(variant):
+        if variant.startswith("twopass_"):
+            return variant[len("twopass_"):], "twopass"
+        return variant, "optimized"
+
+    grouped = sorted({r["name"] for r in records})
+    for shape in grouped:
+        candidates = [r for r in records if r["name"] == shape]
+        best = max(candidates, key=lambda r: (r["gbps"], -r["med_us"]))
+        abi, impl = _variant_to_abi_impl(best["variant"])
+        acc_col = Colors.GREEN if best["ok"] else Colors.YELLOW
+        acc_str = _color("PASS" if best["ok"] else "FAIL", acc_col)
+        print(
+            f"    {shape:7s} {abi:20s} {impl:11s} "
+            f"{best['med_us']:8.3f} {best['gbps']:6.1f} {acc_str:>6s}"
+        )
+
+
+def print_requested_combo_view(records):
+    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+    combos = [
+        ("ov + twopass", "twopass_ov"),
+        ("generalized + optimized", "generalized"),
+        ("gen_t16 + optimized", "gen_t16"),
+        ("gen_hybrid + optimized", "gen_hybrid"),
+        ("gen_stack12 + optimized", "gen_stack12"),
+        ("bucket_tuned + optimized", "bucket_tuned"),
+    ]
+
+    shape_w = 7
+    col_w = 26
+    row_header = f"{'shape':<{shape_w}s}"
+    col_headers = " ".join(f"{name:>{col_w}s}" for name, _ in combos)
+    print(f"    {row_header} {col_headers}")
+    print(f"    {'-' * shape_w} {'-' * ((col_w + 1) * len(combos) - 1)}")
+
+    grouped = sorted({r["name"] for r in records})
+    for shape in grouped:
+        raw_values = []
+        for _, variant in combos:
+            row = next((r for r in records if r["name"] == shape and r["variant"] == variant), None)
+            raw_values.append(row["gbps"] if row is not None else None)
+
+        present = [v for v in raw_values if v is not None]
+        best = max(present) if present else None
+        worst = min(present) if present else None
+
+        values = []
+        for v in raw_values:
+            if v is None:
+                values.append(f"{'-':>{col_w}s}")
+                continue
+
+            cell = f"{v:>{col_w}.1f}"
+            if best is not None and worst is not None and best != worst:
+                if v == best:
+                    cell = _color(cell, Colors.GREEN)
+                elif v == worst:
+                    cell = _color(cell, Colors.RED)
+            values.append(cell)
+
+        print(f"    {shape:<{shape_w}s} {' '.join(values)}")
+
+
+def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100, logger=print):
     src, opts, lws, items, disp = build(D, rank, eps, variant)
     kernels = kernel_cache(src, opts)
+    if variant.startswith("twopass_"):
+        base_variant = variant[len("twopass_"):]
+    else:
+        base_variant = variant
 
     np.random.seed(0)
     x = np.random.uniform(-2.0, 2.0, [rows, D]).astype(np.float16)
@@ -269,7 +415,7 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     gamma_pool = [cl.tensor(g) for _ in range(pool)]
     # OV arg layout: [shape_info, input, gamma, output]. shape_info = 16 int32 (64 B),
     # unused by the body (HAS_PADDING=0) but present to match OV's dynamic signature.
-    shape_info = [cl.tensor(np.zeros(16, np.int32))] if variant in (
+    shape_info = [cl.tensor(np.zeros(16, np.int32))] if base_variant in (
         "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized",
         "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "bucket_tuned") else []
 
@@ -284,7 +430,7 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
     ok = np.allclose(cur, ref, atol=1e-2, rtol=1e-2)
     if not ok:
         bad = np.abs(cur.astype(np.float32) - ref.astype(np.float32))
-        print(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
+        logger(f"  [{name}/{variant}] MAX ABS ERR = {bad.max():.4f}")
 
     # steady-state stats (warm up first; early launches run at a low GPU clock).
     for i in range(iters):
@@ -294,43 +440,72 @@ def run_case(name, rows, D, rank, ov_ref_us, variant, eps=1e-6, iters=100):
         kernels.enqueue("rms_gpu_bfyx_opt", [lws, rows], [lws, 1], *_args(i))
     mn, med, std = _stats_us(cl.finish())
     gbps = bytes_per_set / (med * 1e-6) / 1e9  # effective physical DRAM bandwidth at median
+    stack = (D + lws - 1) // lws
+    mode = "reread" if (base_variant in (
+        "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "static"
+    ) and stack > MAX_REGISTER_STACK) else "cache"
 
-    print(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} "
-          f"{disp:22s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
-          f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}, gamma={'cold' if cold_gamma else 'hot'}) "
-          f"(OV C6 {ov_ref_us:.0f} us)")
-    return ok
+    logger(f"  {name:7s} {variant:11s} rows={rows:6d} D={D:4d} | LWS={lws:4d} items={items} | "
+           f"{disp:40s} | acc={'OK ' if ok else 'FAIL'} | med={med:8.3f} min={mn:8.3f} "
+           f"std={std:6.3f} us | {gbps:6.1f} GB/s (pool={pool}, stack={stack}, mode={mode}) "
+           f"(OV C6 {ov_ref_us:.0f} us)")
+    return {
+        "name": name,
+        "variant": variant,
+        "ok": ok,
+        "med_us": float(med),
+        "gbps": float(gbps),
+    }
 
 
 def main():
+    parser = argparse.ArgumentParser(description="RMS kernel benchmark harness")
+    parser.add_argument("-f", "--force-rerun", action="store_true", help="Ignore cached log and rerun all benchmark cases")
+    parser.add_argument("-l", "--log-file", default=DEFAULT_LOG_FILE,
+                        help="Path to non-summary benchmark log cache (default: %(default)s)")
+    args = parser.parse_args()
+
     cl.profiling(True)
-    print("=== OV rms_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 Thinker prefill (T=2556) ===")
-    print("    ov = exact OV config; static = same work, static-shape specialization")
-    print("    buffers rotated (cold cache) -> med/min/std us + effective DRAM GB/s")
-    results = []
+    base_variants = (
+        "ov", "bucket", "qk_specialized", "hidden_specialized", "generalized",
+        "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12", "bucket_tuned", "static"
+    )
+    all_variants = base_variants + tuple(f"twopass_{v}" for v in base_variants)
     # ov_ref_us = per-call device time from C6 CLIntercept trace (rms_gpu_profile.md).
-    for name, rows, D, rank, ref in [("tail16", 4096, 272, 3, 0),
-                                     ("hidden", 2556, 2560, 3, 722),
-                                     ("q_norm", 2556 * 32, 128, 4, 1267),
-                                     ("k_norm", 2556 * 8, 128, 4, 319),
-                                     ("mid", 2048, 1152, 3, 0),
-                                     ("wide", 1024, 8192, 3, 0),
-                                     ("huge", 256, 32768, 3, 0)]:
-        results.append(run_case(name, rows, D, rank, ref, "ov"))
-        results.append(run_case(name, rows, D, rank, ref, "bucket"))
-        if D == 2560:
-            results.append(run_case(name, rows, D, rank, ref, "hidden_specialized"))
-        if D == 128:
-            results.append(run_case(name, rows, D, rank, ref, "qk_specialized"))
-        results.append(run_case(name, rows, D, rank, ref, "generalized"))
-        results.append(run_case(name, rows, D, rank, ref, "gen_t16"))
-        results.append(run_case(name, rows, D, rank, ref, "gen_hybrid"))
-        results.append(run_case(name, rows, D, rank, ref, "gen_block4"))
-        results.append(run_case(name, rows, D, rank, ref, "gen_block2"))
-        results.append(run_case(name, rows, D, rank, ref, "gen_stack12"))
-        results.append(run_case(name, rows, D, rank, ref, "bucket_tuned"))
-        results.append(run_case(name, rows, D, rank, ref, "static"))
-    assert all(results), "accuracy check failed"
+    cases = [("tail16", 4096, 272, 3, 0),
+             ("hidden", 2556, 2560, 3, 722),
+             ("q_norm", 2556 * 32, 128, 4, 1267),
+             ("k_norm", 2556 * 8, 128, 4, 319),
+             ("mid", 2048, 1152, 3, 0),
+             ("wide", 1024, 8192, 3, 0),
+             ("huge", 256, 32768, 3, 0)]
+
+    if os.path.exists(args.log_file) and not args.force_rerun:
+        print(f"Using cached non-summary log: {args.log_file}")
+        records = parse_cached_records(args.log_file)
+    else:
+        print(f"Writing non-summary log to: {args.log_file}")
+        records = []
+        with open(args.log_file, "w") as log_f:
+            logger = make_logger(log_f)
+            logger("=== OV rms_gpu_bfyx_opt.cl — Qwen3-Omni-4B C6 Thinker prefill (T=2556) ===")
+            logger("    ov = exact OV config; static = same work, static-shape specialization")
+            logger("    buffers rotated (cold cache) -> med/min/std us + effective DRAM GB/s")
+            logger("    twopass_* variants use rms_gpu_bfyx_opt_twopass.cl with the same launch ABI")
+
+            for name, rows, D, rank, ref in cases:
+                for variant in all_variants:
+                    if variant.endswith("qk_specialized") and D != 128:
+                        continue
+                    if variant.endswith("hidden_specialized") and D != 2560:
+                        continue
+                    records.append(run_case(name, rows, D, rank, ref, variant, logger=logger))
+
+    print_kernel_summary(records, base_variants)
+    print_best_per_shape(records)
+    print_requested_combo_view(records)
+    assert all(r["ok"] for r in records), "accuracy check failed"
     print("accuracy: all good")
 
 
