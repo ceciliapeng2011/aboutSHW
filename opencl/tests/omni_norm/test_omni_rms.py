@@ -386,6 +386,8 @@ def print_requested_combo_view(records, output_format="table"):
         return
 
     print("\n=== Focused Combo Matrix (GB/s Only) ===")
+    tie_eps = 0.05  # 0.1 GB/s display precision => values within +/-0.05 are treated as ties.
+    print(f"    tie rule: |value - row_best| <= {tie_eps:.2f} GB/s (rounded-equal at 0.1 GB/s)")
 
     shape_w = 7
     col_w = 26
@@ -411,10 +413,12 @@ def print_requested_combo_view(records, output_format="table"):
                 continue
 
             cell = f"{v:>{col_w}.1f}"
-            if best is not None and worst is not None and best != worst:
-                if v == best:
+            if best is not None and worst is not None:
+                is_tie_best = abs(v - best) <= tie_eps
+                is_tie_worst = abs(v - worst) <= tie_eps
+                if is_tie_best:
                     cell = _color(cell, Colors.GREEN)
-                elif v == worst:
+                elif best != worst and is_tie_worst:
                     cell = _color(cell, Colors.RED)
             values.append(cell)
 
