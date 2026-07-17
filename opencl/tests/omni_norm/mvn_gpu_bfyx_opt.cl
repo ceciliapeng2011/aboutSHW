@@ -1,21 +1,20 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// mvn_gpu_bfyx_opt — optimized (MAP-Elites search, PTL 4Xe). ~1.16x gmean vs the verbatim
-// OV kernel on the Qwen3-Omni-4B C6 vision-encoder MVN shapes (vit 1.17x, merger 1.15x).
-// Changes vs baseline (all correctness-gated):
-//   1. Read the input from global memory ONCE into registers (baseline read it 3x: once each
-//      for the mean pass, the variance pass, and the normalize pass).
-//   2. Single-pass mean+variance via sum and sum-of-squares (variance = E[x^2] - E[x]^2), so the
-//      variance no longer needs a second data pass.
-//   3. Drop work_group_broadcast: every WI derives mean/inv from the two reduced scalars.
-//   4. Keep the well-optimized built-in work_group_reduce_add and add NO sub-group-size constraint
-//      — forcing REQD_SUB_GROUP_SIZE or a manual SLM reduction was measured to REGRESS on this HW.
-//   5. Bound the register cache: MVN_STACK_SIZE is ceil(D/LWS) for cached shapes, while
-//      MVN_REREAD_INPUT avoids a large per-WI register array for larger normalized dims.
-
 #include "include/batch_headers/fetch_data.cl"
 
+// Generalized MVN optimization:
+// - The host selector chooses LWS as the largest power of two that keeps at least 8
+//   normalized elements per work-item. On PTL this selects the measured roofline LWS
+//   values for Qwen3-Omni C6 (`D=1152 -> LWS=128`, `D=4608 -> LWS=512`) without
+//   hardcoding those shapes.
+// - Each work-item handles `ceil(DATA_SET_SIZE / LWS)` values. The fast path caches
+//   those values in registers so input is read once, while mean and variance are both
+//   accumulated in the same pass (`sum` and `sum_of_squares`).
+// - `MVN_STACK_SIZE` is therefore shape-dependent and must be provided by JIT. The
+//   selector keeps the register-cache path only while the stack is small enough to avoid
+//   excessive register pressure; larger stacks define `MVN_REREAD_INPUT=1`, which skips
+//   the register array and rereads input for the output pass.
 #ifndef MVN_STACK_SIZE
 #define MVN_STACK_SIZE 16
 #endif
@@ -24,7 +23,11 @@
 #define MVN_REREAD_INPUT 0
 #endif
 
-#if !IS_DYNAMIC
+#ifndef LWS_IS_STATIC
+#define LWS_IS_STATIC 0
+#endif
+
+#if LWS_IS_STATIC
 __attribute__((reqd_work_group_size(LWS, 1, 1)))
 #endif
 KERNEL (mvn_gpu_bfyx_opt)(
@@ -39,7 +42,7 @@ KERNEL (mvn_gpu_bfyx_opt)(
     const uint workers_per_data_set = LWS;          // how many WI participates in processing of one data set
     const uint in_data_set_idx = get_global_id(0);  // this WI's id in group of items processing single data set
     const uint data_set_size = DATA_SET_SIZE;       // how many elements are in one data set
-    // const uint data_sets_count = DATA_SETS_COUNT;   // how many data sets are in the processing payload
+    // DATA_SETS_COUNT is still emitted by the host selector for the shared MVN JIT ABI.
     const uint items_num = data_set_size / workers_per_data_set;
     const uint leftovers = data_set_size % workers_per_data_set;
 
@@ -69,11 +72,11 @@ KERNEL (mvn_gpu_bfyx_opt)(
 #if NORMALIZE_VARIANCE == 0
     for (uint i = 0; i < iters_num; ++i) {
         uint iteration_in_data_set_offset = i * workers_per_data_set;
-    #if MVN_REREAD_INPUT
+#if MVN_REREAD_INPUT
         float v = (float)input[my_data_offset + iteration_in_data_set_offset];
-    #else
+#else
         float v = data[i];
-    #endif
+#endif
         ACTIVATION_TYPE result = TO_ACTIVATION_TYPE(v) - TO_ACTIVATION_TYPE(my_sum_mean);
 #   if HAS_FUSED_OPS
         FUSED_OPS;
@@ -95,11 +98,11 @@ KERNEL (mvn_gpu_bfyx_opt)(
 
     for (uint i = 0; i < iters_num; ++i) {
         uint iteration_in_data_set_offset = i * workers_per_data_set;
-    #if MVN_REREAD_INPUT
+#if MVN_REREAD_INPUT
         float v = (float)input[my_data_offset + iteration_in_data_set_offset];
-    #else
+#else
         float v = data[i];
-    #endif
+#endif
         ACTIVATION_TYPE result = (TO_ACTIVATION_TYPE(v) - TO_ACTIVATION_TYPE(my_sum_mean)) * TO_ACTIVATION_TYPE(my_inv);
 #   if HAS_FUSED_OPS
         FUSED_OPS;

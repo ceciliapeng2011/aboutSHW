@@ -1,24 +1,26 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// rms_gpu_bfyx_opt — optimized (MAP-Elites search, PTL 4Xe). ~1.70x gmean vs the verbatim
-// OV kernel on the Qwen3-Omni-4B C6 Thinker RMS shapes (hidden 1.43x, q_norm 1.86x, k_norm 1.84x).
-// Changes vs baseline (all correctness-gated):
-//   1. Vectorized load/store CASCADE (block8 -> block4 -> block2 -> scalar) so the coalesced
-//      sub-group block path fires for ANY items_num, not only multiples of the JIT block size
-//      (the original path was dead for these shapes: lws==SUB_GROUP_SIZE and items<block size).
-//   2. Square via multiply and native_rsqrt (drop native_powr(x,2)/powr(sqrt,-1)).
-//   3. Single-sub-group rows (q/k, lws==SUB_GROUP_SIZE) skip SLM + all barriers entirely.
-//   4. Multi-sub-group rows (hidden) reduce partials with ONE barrier (every sub-group reduces
-//      redundantly) instead of the original log-tree of barriers.
-//   5. Bound the register cache: STACK_SIZE is ceil(D/LWS) for cached shapes, while
-//      RMS_REREAD_INPUT avoids a large per-WI register array for larger normalized dims.
-
 #include "include/fetch_utils.cl"
 #include "include/batch_headers/sub_group_block_read.cl"
 #include "include/batch_headers/sub_group_block_write.cl"
 
-#define USE_BLOCK_WRITE 1
+// Check alignment restrictions for using block writes on output.
+#define USE_BLOCK_WRITE (((OUTPUT_TYPE_SIZE * OUTPUT_FEATURE_PITCH) & 0xF) == 0)
+
+// Generalized RMS optimization:
+// - The host selector chooses LWS as the largest power of two that keeps at least 8
+//   normalized elements per work-item, clamped to SUB_GROUP_SIZE. This gives the measured
+//   roofline choices for Qwen3-Omni C6 without hardcoding shapes (`D=128 -> LWS=16`,
+//   `D=2560 -> LWS=256`).
+// - `ONE_SUBGROUP_ROW` is emitted when one subgroup covers a row. It removes SLM and all
+//   barriers because `sub_group_reduce_add` already has the whole row reduction.
+// - `MULTI_SUBGROUP_ROW` is emitted when multiple subgroups cover a row. Each subgroup
+//   writes one partial sum to SLM, then every subgroup redundantly reduces those partials,
+//   so only one barrier is needed and no broadcast barrier is required.
+// - `STACK_SIZE` is `ceil(DATA_SIZE / LWS)`. The fast path caches input in registers and
+//   reads it once; `RMS_REREAD_INPUT=1` skips that register array for larger stacks and
+//   rereads input during the output pass to avoid excessive register pressure.
 
 #ifndef ONE_SUBGROUP_ROW
 #define ONE_SUBGROUP_ROW 0
@@ -30,6 +32,28 @@
 
 #ifndef RMS_REREAD_INPUT
 #define RMS_REREAD_INPUT 0
+#endif
+
+#ifndef HAS_FUSED_OPS
+#define HAS_FUSED_OPS 0
+#endif
+
+#ifndef HAS_FUSED_OPS_DECLS
+#define HAS_FUSED_OPS_DECLS 0
+#endif
+
+#if SUBGROUP_BLOCK_SIZE == 1
+#define BLOCK_READ(ptr, offset) DT_INPUT_BLOCK_READ(ptr, offset)
+#define BLOCK_WRITE(ptr, offset, val) DT_OUTPUT_BLOCK_WRITE(ptr, offset, val)
+#define ACC_TYPE ACCUMULATOR_TYPE
+#define TO_ACC_TYPE(x) TO_ACCUMULATOR_TYPE(x)
+#define OUTPUT_VEC_TYPE OUTPUT_TYPE
+#else
+#define BLOCK_READ(ptr, offset) CAT(DT_INPUT_BLOCK_READ, SUBGROUP_BLOCK_SIZE)(ptr, offset)
+#define BLOCK_WRITE(ptr, offset, val) CAT(DT_OUTPUT_BLOCK_WRITE, SUBGROUP_BLOCK_SIZE)(ptr, offset, val)
+#define ACC_TYPE MAKE_VECTOR_TYPE(ACCUMULATOR_TYPE, SUBGROUP_BLOCK_SIZE)
+#define TO_ACC_TYPE(x) CAT(convert_, ACC_TYPE)(x)
+#define OUTPUT_VEC_TYPE MAKE_VECTOR_TYPE(OUTPUT_TYPE, SUBGROUP_BLOCK_SIZE)
 #endif
 
 REQD_SUB_GROUP_SIZE(SUB_GROUP_SIZE)
@@ -87,45 +111,47 @@ KERNEL(rms_gpu_bfyx_opt)(
     ACCUMULATOR_TYPE rms = ACCUMULATOR_VAL_ZERO;
 
 #if !ONE_SUBGROUP_ROW
+    // slm_buf is a tiny work-group shared scratchpad that stores one partial RMS sum per subgroup, allowing all subgroups
+    // to combine their results after a single barrier and obtain the final row-wide RMS normalization factor.
     __local ACCUMULATOR_TYPE slm_buf[SLM_SIZE];
 #endif
 
-    // ---- vectorized load cascade: block8 -> block4 -> block2 -> scalar ----
     uint i = 0;
     if (workers_per_data >= SUB_GROUP_SIZE)
     {
         const uint ibase = input_data_offset + subgroup_offset;
         for (; i + 8 <= items_num; i += 8) {
-            half8 v = DT_INPUT_BLOCK_READ8(input, ibase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT0_TYPE, 8) v = DT_INPUT_BLOCK_READ8(input, ibase + i * sgs);
             unroll_for (int j = 0; j < 8; j++) {
-                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
-                rms += t * t;
+                ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += tmp * tmp;
 #if !RMS_REREAD_INPUT
-                data[i + j] = t;
+                data[i + j] = tmp;
 #endif
             }
         }
         for (; i + 4 <= items_num; i += 4) {
-            half4 v = DT_INPUT_BLOCK_READ4(input, ibase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT0_TYPE, 4) v = DT_INPUT_BLOCK_READ4(input, ibase + i * sgs);
             unroll_for (int j = 0; j < 4; j++) {
-                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
-                rms += t * t;
+                ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += tmp * tmp;
 #if !RMS_REREAD_INPUT
-                data[i + j] = t;
+                data[i + j] = tmp;
 #endif
             }
         }
         for (; i + 2 <= items_num; i += 2) {
-            half2 v = DT_INPUT_BLOCK_READ2(input, ibase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT0_TYPE, 2) v = DT_INPUT_BLOCK_READ2(input, ibase + i * sgs);
             unroll_for (int j = 0; j < 2; j++) {
-                ACCUMULATOR_TYPE t = TO_ACCUMULATOR_TYPE(v[j]);
-                rms += t * t;
+                ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(v[j]);
+                rms += tmp * tmp;
 #if !RMS_REREAD_INPUT
-                data[i + j] = t;
+                data[i + j] = tmp;
 #endif
             }
         }
     }
+
     for (; i < items_num; i++)
     {
         ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs]);
@@ -135,7 +161,7 @@ KERNEL(rms_gpu_bfyx_opt)(
 #endif
     }
 
-    if (local_data_idx < leftovers)
+    if (leftovers != 0 && local_data_idx < leftovers)
     {
         ACCUMULATOR_TYPE tmp = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + local_data_idx]);
         rms += tmp * tmp;
@@ -147,10 +173,8 @@ KERNEL(rms_gpu_bfyx_opt)(
     rms = sub_group_reduce_add(rms);
 
 #if ONE_SUBGROUP_ROW
-    // Compile-time q/k path: one sub-group covers the whole row, so no SLM or barrier exists.
     rms = native_rsqrt(rms / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
 #elif MULTI_SUBGROUP_ROW
-    // Compile-time hidden path: multiple sub-groups per row, one SLM reduction barrier.
     if (get_sub_group_local_id() == 0)
         slm_buf[get_sub_group_id()] = rms;
 
@@ -162,22 +186,24 @@ KERNEL(rms_gpu_bfyx_opt)(
     p = sub_group_reduce_add(p);
     rms = native_rsqrt(p / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
 #else
-    if (get_num_sub_groups() == 1) {
-        // single sub-group covers the whole row: no SLM / no barrier needed.
-        rms = native_rsqrt(rms / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
-    } else {
-        if (get_sub_group_local_id() == 0)
-            slm_buf[get_sub_group_id()] = rms;
+    if (get_sub_group_local_id() == 0)
+        slm_buf[get_sub_group_id()] = rms;
 
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint offset = get_num_sub_groups() / 2; offset > 0; offset /= 2) {
+        if (in_data_idx < offset) {
+            slm_buf[in_data_idx] += slm_buf[in_data_idx + offset];
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
-        // every sub-group redundantly reduces the partials -> no broadcast barrier (1 total).
-        const uint nsg = get_num_sub_groups();
-        ACCUMULATOR_TYPE p = ACCUMULATOR_VAL_ZERO;
-        for (uint k = get_sub_group_local_id(); k < nsg; k += sgs)
-            p += slm_buf[k];
-        p = sub_group_reduce_add(p);
-        rms = native_rsqrt(p / data_size + TO_ACCUMULATOR_TYPE(EPSILON));
     }
+
+    if (in_data_idx == 0) {
+        rms = slm_buf[0] / data_size;
+        slm_buf[0] = native_powr(sqrt(rms + TO_ACCUMULATOR_TYPE(EPSILON)), -1);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    rms = slm_buf[0];
 #endif
 
     #if HAS_FUSED_OPS
@@ -200,41 +226,19 @@ KERNEL(rms_gpu_bfyx_opt)(
         #endif
     #endif
 
-#if HAS_FUSED_OPS
-    // general/fused path: scalar (fused-ops not used by the Omni RMS config)
-    for (i = 0; i < items_num; i++)
-    {
-    #if RMS_REREAD_INPUT
-        ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs]);
-    #else
-        ACCUMULATOR_TYPE data_value = data[i];
-    #endif
-#if ELEMENTWISE_AFFINE
-        ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[subgroup_offset + get_sub_group_local_id() + i * sgs]);
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value * temp);
-#else
-        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data_value);
-#endif
-        LAST_DIM = subgroup_offset + get_sub_group_local_id() + i * sgs;
-        FUSED_OPS;
-        normalized = FUSED_OPS_RESULT;
-        output[output_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs] = normalized;
-    }
-#else
-    // ---- vectorized store cascade: block8 -> block4 -> block2 -> scalar ----
     i = 0;
-    if (workers_per_data >= SUB_GROUP_SIZE)
+    if ((workers_per_data > SUB_GROUP_SIZE) && USE_BLOCK_WRITE && !HAS_FUSED_OPS)
     {
         const uint obase = output_data_offset + subgroup_offset;
         const uint gbase = subgroup_offset;
         for (; i + 8 <= items_num; i += 8) {
 #if ELEMENTWISE_AFFINE
-            half8 g = DT_INPUT_BLOCK_READ8(gamma, gbase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT1_TYPE, 8) g = DT_INPUT_BLOCK_READ8(gamma, gbase + i * sgs);
 #endif
-            half8 o;
+            MAKE_VECTOR_TYPE(OUTPUT_TYPE, 8) o;
             unroll_for (int j = 0; j < 8; j++) {
 #if RMS_REREAD_INPUT
-                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
+                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + (i + j) * sgs]);
 #else
                 ACCUMULATOR_TYPE data_value = data[i + j];
 #endif
@@ -248,12 +252,12 @@ KERNEL(rms_gpu_bfyx_opt)(
         }
         for (; i + 4 <= items_num; i += 4) {
 #if ELEMENTWISE_AFFINE
-            half4 g = DT_INPUT_BLOCK_READ4(gamma, gbase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT1_TYPE, 4) g = DT_INPUT_BLOCK_READ4(gamma, gbase + i * sgs);
 #endif
-            half4 o;
+            MAKE_VECTOR_TYPE(OUTPUT_TYPE, 4) o;
             unroll_for (int j = 0; j < 4; j++) {
 #if RMS_REREAD_INPUT
-                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
+            ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + (i + j) * sgs]);
 #else
                 ACCUMULATOR_TYPE data_value = data[i + j];
 #endif
@@ -267,12 +271,12 @@ KERNEL(rms_gpu_bfyx_opt)(
         }
         for (; i + 2 <= items_num; i += 2) {
 #if ELEMENTWISE_AFFINE
-            half2 g = DT_INPUT_BLOCK_READ2(gamma, gbase + i * sgs);
+            MAKE_VECTOR_TYPE(INPUT1_TYPE, 2) g = DT_INPUT_BLOCK_READ2(gamma, gbase + i * sgs);
 #endif
-            half2 o;
+            MAKE_VECTOR_TYPE(OUTPUT_TYPE, 2) o;
             unroll_for (int j = 0; j < 2; j++) {
 #if RMS_REREAD_INPUT
-                ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[obase + get_sub_group_local_id() + (i + j) * sgs]);
+            ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + subgroup_offset + get_sub_group_local_id() + (i + j) * sgs]);
 #else
                 ACCUMULATOR_TYPE data_value = data[i + j];
 #endif
@@ -285,6 +289,7 @@ KERNEL(rms_gpu_bfyx_opt)(
             DT_OUTPUT_BLOCK_WRITE2(output, obase + i * sgs, o);
         }
     }
+
     for (; i < items_num; i++)
     {
     #if RMS_REREAD_INPUT
@@ -300,9 +305,7 @@ KERNEL(rms_gpu_bfyx_opt)(
 #endif
         output[output_data_offset + subgroup_offset + get_sub_group_local_id() + i * sgs] = normalized;
     }
-#endif
-
-        if (local_data_idx < leftovers)
+    if (leftovers != 0 && local_data_idx < leftovers)
     {
     #if RMS_REREAD_INPUT
         ACCUMULATOR_TYPE data_value = TO_ACCUMULATOR_TYPE(input[input_data_offset + workers_per_data * items_num + local_data_idx]);

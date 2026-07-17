@@ -21,14 +21,13 @@
 #   k_norm : per-head key   RMSNorm (GQA,  8 kv-heads)     [2556*8,  128]   D=128,  rank 4
 #
 # Variants:
-#   ov     : exact OV config (dynamic, shape_info arg, runtime LWS)      -> matches OV us
-#   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS    -> step 1/3 probe
-#   qk_specialized : bucket + compile-time one-subgroup row path for D=128 q/k
-#   hidden_specialized : bucket + compile-time multi-subgroup row path for D=2560 hidden
-#   generalized : dynamic ABI + generalized LWS rule + subgroup-row specialization;
-#                 cached when stack<=16, reread fallback otherwise
-#   bucket_tuned : bucket + static stack/subgroup constants              -> step 4 probe
-#   static : same work, static-shape specialization (compile-const LWS)  -> optimization target
+#   ov     : OV master host ABI (dynamic, shape_info arg, runtime LWS)
+#   bucket : cecilia/opt/mvn_rms host ABI with shape_info arg and fixed generalized LWS
+#   qk_specialized : branch ABI + explicit one-subgroup-row specialization for D=128 q/k
+#   hidden_specialized : branch ABI + explicit multi-subgroup-row specialization for D=2560 hidden
+#   generalized : branch ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
+#   bucket_tuned : branch ABI + alternative subgroup block / stack tuning probe
+#   static : branch static-shape specialization
 #
 # Run inside the llm container (built_ov env):  python test_omni_rms.py
 
@@ -68,6 +67,7 @@ def _body(cl_name):
 
 SHIM = _read("ov_norm_shim.cl")
 RMS_BODY = _body("rms_gpu_bfyx_opt.cl")
+RMS_TWOPASS_BODY = _body("rms_gpu_bfyx_opt_twopass.cl")
 
 # Dynamic (=OV) defs: OV passes a shape_info buffer as the leading kernel arg and uses a
 # runtime local size. HAS_PADDING=0 (tensors are :nopad), so shape_info is not read by
@@ -91,7 +91,7 @@ RMS_SHAPE_ARG_DEFS = r"""
 
 
 def get_item_num_and_lws(data_size, max_lws=MAX_LWS):
-    """Port of rms_kernel_bfyx_opt.cpp::get_item_num_and_lws (f16: local_mem_per_wi=4)."""
+    """Port of OV master rms_kernel_bfyx_opt.cpp::get_item_num_and_lws()."""
     lws, items = 1, data_size
     while (items > 8 or lws < items) and (2 * lws <= max_lws):
         lws *= 2
@@ -100,12 +100,21 @@ def get_item_num_and_lws(data_size, max_lws=MAX_LWS):
 
 
 def generalized_lws(data_size, max_lws=MAX_LWS, target_items=8):
-    """Largest power-of-two LWS that keeps at least target_items per WI."""
+    """Port of cecilia/opt/mvn_rms get_generalized_lws()."""
     lws = SUB_GROUP_SIZE
     limit = max(SUB_GROUP_SIZE, min(max_lws, data_size // target_items))
     while 2 * lws <= limit:
         lws *= 2
     return lws
+
+
+def branch_stack(data_size, lws, stack_cap=MAX_REGISTER_STACK):
+    required = (data_size + lws - 1) // lws
+    return required, min(required, stack_cap), required > stack_cap
+
+
+def branch_slm_size(max_lws=MAX_LWS):
+    return max(1, max_lws // SUB_GROUP_SIZE)
 
 
 def subgroup_block_size(items):
@@ -119,54 +128,74 @@ def subgroup_block_size(items):
 
 
 def build(D, rank, eps, variant):
-    items, lws = get_item_num_and_lws(D)
+    use_twopass = variant.startswith("twopass_")
+    base_variant = variant[len("twopass_"):] if use_twopass else variant
+    kernel_body = RMS_TWOPASS_BODY if use_twopass else RMS_BODY
+
+    items, master_lws = get_item_num_and_lws(D)
     base = (f"-DELEMENTWISE_AFFINE=1 -DSUB_GROUP_SIZE={SUB_GROUP_SIZE} "
             f"-DINPUT_RANK={rank} -DDATA_SIZE={D} -DEPSILON={eps}")
-    if variant == "ov":
+    if base_variant == "ov":
         # dynamic: SBS=8, STACK_SIZE=ceil_div(D,lws), SLM_SIZE=maxSlmSize; LWS runtime.
+        lws = master_lws
         stack = (D + lws - 1) // lws
         opts = base + f" -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
-        src = SHIM + "\n" + RMS_DYN_DEFS + "\n" + RMS_BODY
-        disp = f"dyn sbs=8 stack={stack} LWS=rt"
-    elif variant == "bucket":
-        stack = (D + lws - 1) // lws
-        opts = base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} -DSUBGROUP_BLOCK_SIZE=8"
-        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
-        disp = f"bucket sbs=8 stack={stack} LWS={lws}"
-    elif variant == "qk_specialized":
-        stack = (D + lws - 1) // lws
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+        src = SHIM + "\n" + RMS_DYN_DEFS + "\n" + kernel_body
+        disp = f"ov master sbs=8 stack={stack} LWS=rt"
+    elif base_variant == "bucket":
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
+        row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+                f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
+        if reread:
+            opts += " -DRMS_REREAD_INPUT=1"
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
+        mode = "reread" if reread else "cache"
+        disp = f"bucket branch {row_kind} sbs=8 stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
+    elif base_variant == "qk_specialized":
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DONE_SUBGROUP_ROW=1")
-        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
-        disp = f"qk one-sg stack={stack} LWS={lws}"
-    elif variant == "hidden_specialized":
-        stack = (D + lws - 1) // lws
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={stack} "
+        if reread:
+            opts += " -DRMS_REREAD_INPUT=1"
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
+        mode = "reread" if reread else "cache"
+        disp = f"qk one-sg branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
+    elif base_variant == "hidden_specialized":
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
                 f"-DSUBGROUP_BLOCK_SIZE=8 -DMULTI_SUBGROUP_ROW=1")
-        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
-        disp = f"hidden multi-sg stack={stack} LWS={lws}"
-    elif variant in ("generalized", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
-        if variant == "gen_t16":
+        if reread:
+            opts += " -DRMS_REREAD_INPUT=1"
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
+        mode = "reread" if reread else "cache"
+        disp = f"hidden multi-sg branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
+    elif base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_block4", "gen_block2", "gen_stack12"):
+        if base_variant == "gen_t16":
             target_items = 16
             sbs = 8
             stack_cap = MAX_REGISTER_STACK
             tag = "gen t16"
-        elif variant == "gen_hybrid":
+        elif base_variant == "gen_hybrid":
             target_items = 16 if D >= 2048 else 8
             sbs = 8
             stack_cap = MAX_REGISTER_STACK
             tag = f"gen hybrid t{target_items}"
-        elif variant == "gen_block4":
+        elif base_variant == "gen_block4":
             target_items = 8
             sbs = 4
             stack_cap = MAX_REGISTER_STACK
             tag = "gen block4"
-        elif variant == "gen_block2":
+        elif base_variant == "gen_block2":
             target_items = 8
             sbs = 2
             stack_cap = MAX_REGISTER_STACK
             tag = "gen block2"
-        elif variant == "gen_stack12":
+        elif base_variant == "gen_stack12":
             target_items = 8
             sbs = 8
             stack_cap = 12
@@ -179,31 +208,40 @@ def build(D, rank, eps, variant):
 
         lws = generalized_lws(D, target_items=target_items)
         items = D // lws
-        stack = (D + lws - 1) // lws
-        reread = stack > stack_cap
+        stack, capped_stack, reread = branch_stack(D, lws, stack_cap)
         row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
         row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
-        opts = (base + f" -DLWS={lws} -DSLM_SIZE={MAX_LWS} -DSTACK_SIZE={min(stack, stack_cap)} "
+        opts = (base + f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
                 f"-DSUBGROUP_BLOCK_SIZE={sbs} {row_flag}")
         if reread:
             opts += " -DRMS_REREAD_INPUT=1"
-        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
         disp = f"{tag} {row_kind} sbs={sbs} stack={stack} cap={stack_cap} {mode} LWS={lws}"
-    elif variant == "bucket_tuned":
+    elif base_variant == "bucket_tuned":
+        lws = generalized_lws(D)
+        items = D // lws
         sbs = subgroup_block_size(items)
         stack = items + 1
-        opts = base + (f" -DLWS={lws} -DSLM_SIZE={lws} -DSTACK_SIZE={stack} "
-                       f"-DSUBGROUP_BLOCK_SIZE={sbs}")
-        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + RMS_BODY
-        disp = f"bucket sbs={sbs} stack={stack} LWS={lws}"
+        row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
+        opts = base + (f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={stack} "
+                       f"-DSUBGROUP_BLOCK_SIZE={sbs} {row_flag}")
+        src = SHIM + "\n" + RMS_SHAPE_ARG_DEFS + "\n" + kernel_body
+        disp = f"bucket tuned sbs={sbs} stack={stack} LWS={lws}"
     else:  # static specialization (same work)
-        sbs = subgroup_block_size(items)
-        stack = items + 1
-        opts = base + (f" -DLWS={lws} -DSLM_SIZE={lws} -DSTACK_SIZE={stack} "
-                       f"-DSUBGROUP_BLOCK_SIZE={sbs}")
-        src = SHIM + "\n" + RMS_BODY
-        disp = f"sbs={sbs} stack={stack} LWS={lws}"
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        row_flag = "-DONE_SUBGROUP_ROW=1" if lws == SUB_GROUP_SIZE else "-DMULTI_SUBGROUP_ROW=1"
+        row_kind = "one-sg" if lws == SUB_GROUP_SIZE else "multi-sg"
+        opts = base + (f" -DLWS={lws} -DSLM_SIZE={branch_slm_size()} -DSTACK_SIZE={capped_stack} "
+                       f"-DSUBGROUP_BLOCK_SIZE=8 {row_flag}")
+        if reread:
+            opts += " -DRMS_REREAD_INPUT=1"
+        src = SHIM + "\n" + kernel_body
+        mode = "reread" if reread else "cache"
+        disp = f"static branch {row_kind} sbs=8 stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
+    if use_twopass:
+        disp = f"twopass {disp}"
     return src, opts, lws, items, disp
 
 

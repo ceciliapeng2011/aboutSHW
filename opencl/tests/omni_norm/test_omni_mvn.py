@@ -21,10 +21,10 @@
 #   merger : patch-Merger LayerNorm  [1716, 4608]   D=4608
 #
 # Variants:
-#   ov     : exact OV config (dynamic, shape_info arg, fused gamma+beta, runtime LWS)
-#   bucket : dynamic shape_info ABI, but bucket-specialized fixed LWS + reqd_work_group_size
-#   generalized : dynamic ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
-#   static : same work, static-shape specialization
+#   ov     : OV master host ABI (dynamic, shape_info arg, runtime LWS)
+#   bucket : cecilia/opt/mvn_rms host ABI with shape_info arg and fixed generalized LWS
+#   generalized : branch ABI + generalized LWS rule; cached when stack<=16, reread fallback otherwise
+#   static : branch static-shape specialization
 #
 # NOTE: the fused epilogue reproduces OV's affine functionally (out = norm*gamma + beta,
 # from the 5-arg layout + exec-graph Multiply/Add). OV auto-generates its FUSED_OPS macro
@@ -132,7 +132,7 @@ MVN_SHAPE_ARG_DEFS = r"""
 
 
 def get_lws(data_set_size, max_lws=MAX_LWS):
-    """Port of mvn_kernel_bfyx_opt.cpp::SetDefault LWS loop (f16: local_mem_per_wi=4)."""
+    """Port of OV master mvn_kernel_bfyx_opt.cpp::SetDefault LWS loop."""
     lws, items = 1, data_set_size
     while (items > 8 or lws < items) and (2 * lws <= max_lws):
         lws *= 2
@@ -141,12 +141,17 @@ def get_lws(data_set_size, max_lws=MAX_LWS):
 
 
 def generalized_lws(data_set_size, max_lws=MAX_LWS, target_items=8):
-    """Largest power-of-two LWS that keeps at least target_items per WI."""
+    """Port of cecilia/opt/mvn_rms get_generalized_lws()."""
     lws = 1
     limit = max(1, min(max_lws, data_set_size // target_items))
     while 2 * lws <= limit:
         lws *= 2
     return lws
+
+
+def branch_stack(data_set_size, lws, stack_cap=MAX_REGISTER_STACK):
+    required = (data_set_size + lws - 1) // lws
+    return required, min(required, stack_cap), required > stack_cap
 
 
 def build(D, eps, variant):
@@ -162,22 +167,40 @@ def build(D, eps, variant):
         base_variant = variant
         kernel_body = MVN_BODY
 
-    items, lws = get_lws(D)
-    stack = (D + lws - 1) // lws
+    items, master_lws = get_lws(D)
+    master_stack = (D + master_lws - 1) // master_lws
     base = (f"-DNORMALIZE_VARIANCE=1 -DEPS_INSIDE_SQRT -DEPSILON={eps} "
             f"-DDATA_SET_SIZE={D} -DDATA_SETS_COUNT=0")
     if base_variant == "ov":
-        # Welford kernel declares local arrays sized by LWS; OpenCL requires that
-        # size expression to be compile-time constant (runtime get_local_size is invalid).
+        lws = master_lws
+        stack, capped_stack, reread = branch_stack(D, lws)
+        # OV master keeps runtime LWS for the dynamic ABI. The welford probe still needs
+        # a literal LWS because its local arrays are sized by that macro.
         if use_welford:
-            opts = base + f" -DIS_DYNAMIC=1 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
+            opts = base + f" -DIS_DYNAMIC=1 -DLWS={master_lws}"
             src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
-        else:
-            opts = base + f" -DIS_DYNAMIC=1 -DMVN_STACK_SIZE={stack}"
+            mode = "cache"
+        elif use_twopass:
+            opts = base + " -DIS_DYNAMIC=1"
             src = SHIM + "\n" + MVN_DYN_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
+            mode = "cache"
+        else:
+            opts = base + f" -DIS_DYNAMIC=1 -DMVN_STACK_SIZE={capped_stack}"
+            if reread:
+                opts += " -DMVN_REREAD_INPUT=1"
+            src = SHIM + "\n" + MVN_DYN_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
+            mode = "reread" if reread else "cache"
+        disp = f"ov master stack={master_stack} LWS=rt"
     elif base_variant == "bucket":
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        dynamic_flag = "-DIS_DYNAMIC=0" if use_twopass else "-DIS_DYNAMIC=1"
+        opts = base + f" {dynamic_flag} -DLWS={lws} -DLWS_IS_STATIC=1 -DMVN_STACK_SIZE={capped_stack}"
+        if reread:
+            opts += " -DMVN_REREAD_INPUT=1"
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
+        mode = "reread" if reread else "cache"
+        disp = f"bucket branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
     elif base_variant in ("generalized", "gen_t16", "gen_hybrid", "gen_stack12"):
         if base_variant == "gen_t16":
             target_items = 16
@@ -199,22 +222,23 @@ def build(D, eps, variant):
 
         lws = generalized_lws(D, target_items=target_items)
         items = D // lws
-        stack = (D + lws - 1) // lws
-        reread = stack > stack_cap
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={min(stack, stack_cap)}"
+        stack, capped_stack, reread = branch_stack(D, lws, stack_cap)
+        dynamic_flag = "-DIS_DYNAMIC=0" if use_twopass else "-DIS_DYNAMIC=1"
+        opts = base + f" {dynamic_flag} -DLWS={lws} -DLWS_IS_STATIC=1 -DMVN_STACK_SIZE={capped_stack}"
         if reread:
             opts += " -DMVN_REREAD_INPUT=1"
         src = SHIM + "\n" + MVN_SHAPE_ARG_DEFS + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
         mode = "reread" if reread else "cache"
         disp = f"{tag} stack={stack} cap={stack_cap} {mode}"
     else:  # static specialization (same fused work)
-        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DMVN_STACK_SIZE={stack}"
+        lws = generalized_lws(D)
+        stack, capped_stack, reread = branch_stack(D, lws)
+        opts = base + f" -DIS_DYNAMIC=0 -DLWS={lws} -DLWS_IS_STATIC=1 -DMVN_STACK_SIZE={capped_stack}"
+        if reread:
+            opts += " -DMVN_REREAD_INPUT=1"
         src = SHIM + "\n" + MVN_FUSED_DEFS + "\n" + kernel_body
-        disp = f"static stack={stack}"
-    if base_variant == "ov":
-        disp = f"ov stack={stack}"
-    elif base_variant == "bucket":
-        disp = f"bucket stack={stack}"
+        mode = "reread" if reread else "cache"
+        disp = f"static branch stack={stack} cap={MAX_REGISTER_STACK} {mode} LWS={lws}"
     if use_welford:
         disp = f"welford {disp}"
     elif use_twopass:
