@@ -347,8 +347,7 @@ def print_best_per_shape(records):
         )
 
 
-def print_requested_combo_view(records):
-    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+def print_requested_combo_view(records, output_format="table"):
     combos = [
         ("ov + twopass", "twopass_ov"),
         ("generalized + optimized", "generalized"),
@@ -358,6 +357,22 @@ def print_requested_combo_view(records):
         ("bucket_tuned + optimized", "bucket_tuned"),
     ]
 
+    grouped = sorted({r["name"] for r in records})
+
+    if output_format in ("csv", "tsv"):
+        sep = "," if output_format == "csv" else "\t"
+        headers = ["shape"] + [name for name, _ in combos]
+        print(sep.join(headers))
+        for shape in grouped:
+            fields = [shape]
+            for _, variant in combos:
+                row = next((r for r in records if r["name"] == shape and r["variant"] == variant), None)
+                fields.append("" if row is None else f"{row['gbps']:.1f}")
+            print(sep.join(fields))
+        return
+
+    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+
     shape_w = 7
     col_w = 26
     row_header = f"{'shape':<{shape_w}s}"
@@ -365,7 +380,6 @@ def print_requested_combo_view(records):
     print(f"    {row_header} {col_headers}")
     print(f"    {'-' * shape_w} {'-' * ((col_w + 1) * len(combos) - 1)}")
 
-    grouped = sorted({r["name"] for r in records})
     for shape in grouped:
         raw_values = []
         for _, variant in combos:
@@ -464,6 +478,8 @@ def main():
     parser.add_argument("-f", "--force-rerun", action="store_true", help="Ignore cached log and rerun all benchmark cases")
     parser.add_argument("-l", "--log-file", default=DEFAULT_LOG_FILE,
                         help="Path to non-summary benchmark log cache (default: %(default)s)")
+    parser.add_argument("-t", "--combo-format", choices=("table", "csv", "tsv"), default="table",
+                        help="Focused combo matrix output format (default: %(default)s)")
     args = parser.parse_args()
 
     cl.profiling(True)
@@ -504,7 +520,7 @@ def main():
 
     print_kernel_summary(records, base_variants)
     print_best_per_shape(records)
-    print_requested_combo_view(records)
+    print_requested_combo_view(records, output_format=args.combo_format)
     assert all(r["ok"] for r in records), "accuracy check failed"
     print("accuracy: all good")
 

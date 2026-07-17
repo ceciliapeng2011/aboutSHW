@@ -368,8 +368,7 @@ def print_best_per_shape_distribution(records, base_variants):
         )
 
 
-def print_requested_combo_view(records):
-    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+def print_requested_combo_view(records, output_format="table"):
     combos = [
         ("ov + twopass", "twopass_ov"),
         ("ov + welford", "welford_ov"),
@@ -379,6 +378,23 @@ def print_requested_combo_view(records):
         ("gen_hybrid + optimized", "gen_hybrid"),
     ]
 
+    grouped = sorted({(r["distribution"], r["name"]) for r in records})
+
+    if output_format in ("csv", "tsv"):
+        sep = "," if output_format == "csv" else "\t"
+        headers = ["dist", "shape"] + [name for name, _ in combos]
+        print(sep.join(headers))
+        for distribution, shape in grouped:
+            fields = [distribution, shape]
+            for _, variant in combos:
+                row = next((r for r in records
+                            if r["distribution"] == distribution and r["name"] == shape and r["variant"] == variant), None)
+                fields.append("" if row is None else f"{row['gbps']:.1f}")
+            print(sep.join(fields))
+        return
+
+    print("\n=== Focused Combo Matrix (GB/s Only) ===")
+
     dist_w = 12
     shape_w = 7
     col_w = 26
@@ -387,7 +403,6 @@ def print_requested_combo_view(records):
     print(f"    {row_header} {col_headers}")
     print(f"    {'-' * (dist_w + shape_w + 1)} {'-' * ((col_w + 1) * len(combos) - 1)}")
 
-    grouped = sorted({(r["distribution"], r["name"]) for r in records})
     for distribution, shape in grouped:
         raw_values = []
         for _, variant in combos:
@@ -494,6 +509,8 @@ def main():
     parser.add_argument("-f", "--force-rerun", action="store_true", help="Ignore cached log and rerun all benchmark cases")
     parser.add_argument("-l", "--log-file", default=DEFAULT_LOG_FILE,
                         help="Path to non-summary benchmark log cache (default: %(default)s)")
+    parser.add_argument("-t", "--combo-format", choices=("table", "csv", "tsv"), default="table",
+                        help="Focused combo matrix output format (default: %(default)s)")
     args = parser.parse_args()
 
     cl.profiling(True)
@@ -538,7 +555,7 @@ def main():
 
     print_kernel_summary(records, base_variants)
     print_best_per_shape_distribution(records, base_variants)
-    print_requested_combo_view(records)
+    print_requested_combo_view(records, output_format=args.combo_format)
     uniform_results = [r["ok"] for r in records if r["distribution"] == "uniform"]
     assert all(uniform_results), "accuracy check failed"
     print("accuracy: all good")
