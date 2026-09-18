@@ -27,6 +27,8 @@ import test_sdpa_prefill as prefill
 import test_sdpa_decode as decode
 import test_sdpa_prefill_xattn as xattn_test
 import dense_xattn_adapter as xa
+# test_sdpa_prefill_xattn's import above already put pageatten/ on sys.path.
+from generate_block_mask import generate_block_mask_with_ratio
 
 torch.manual_seed(0)
 
@@ -246,6 +248,97 @@ def bench_xattn_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
     return result
 
 
+def fake_block_mask(num_heads, seq_len, sparse_block_size, density, is_causal, batch=1, seed=42):
+    """Synthetic block mask for XAttention perf sweeps -- learned from pageatten/test_pa.py's own
+    perf-sweep technique (generate_block_mask_with_ratio), which "fakes" a block mask at a
+    directly-requested density instead of deriving density indirectly from an xattn_thresh run
+    through the real GPU scoring pipeline. Bypasses xattn_gemm_qk/find_block.hpp entirely, so it
+    also sidesteps that pipeline's known reliability issues (seq_len=32768 crash, seq_len>=8192
+    mask non-determinism, occasional hangs under repeated invocation -- see bench_xattn_prefill's
+    __main__ comment) and lets the sweep run at any seq_len/density combination cheaply.
+
+    Causal: reuses generate_block_mask_with_ratio directly (single trunk spanning the whole
+    sequence, trunk_sz=seq_len) -- same sink-column/local-diagonal/last-row-visible structure
+    PA's own sweep uses to keep the fake mask shape "XAttention-like" rather than pure noise.
+    generate_block_mask_with_ratio unconditionally intersects with the lower-triangular region
+    (adjust_true_ratio_tril), which is only a valid constraint for a causal mask.
+
+    Non-causal: PA's helper can't be reused as-is (causal papers over that tril constraint), and
+    XAttention's own scoring pipeline can't even produce a *correct* non-causal mask today
+    (find_block.hpp's non-causal branch has a pre-existing sort-precision bug -- see
+    test_sdpa_prefill_xattn.py's module docstring) -- so a synthetic mask is the only way to
+    perf-test non-causal XAttention prefill at all right now. Falls back to an i.i.d.
+    Bernoulli(density) draw over the full [num_heads, num_q_blocks, num_k_blocks] grid, no tril
+    restriction.
+
+    Returns (mask, effective_density): mask is [batch, num_heads, num_q_blocks, num_k_blocks]
+    bool, the exact block_mask ABI run_prefill_sparse/cm_sdpa_opt_prefill.cm expects.
+    effective_density is measured directly off the returned mask (mask.float().mean()), matching
+    how bench_xattn_prefill derives density from a real GPU-computed mask -- NOT
+    generate_block_mask_with_ratio's own returned density (which doubles the causal case for a
+    different total_flops convention than flops_for() uses here).
+    """
+    num_q_blocks = (seq_len + sparse_block_size - 1) // sparse_block_size
+    num_k_blocks = num_q_blocks
+    if is_causal:
+        y, _ = generate_block_mask_with_ratio(
+            num_heads, seq_len, seq_len, sparse_block_size, density, is_causal=True)
+        mask = y[0].unsqueeze(0).expand(batch, -1, -1, -1).contiguous()
+    else:
+        g = torch.Generator().manual_seed(seed)
+        mask = torch.rand(batch, num_heads, num_q_blocks, num_k_blocks, generator=g) < density
+    mask = mask.to(torch.bool)
+    effective_density = mask.float().mean().item()
+    return mask, effective_density
+
+
+def bench_xattn_prefill_synthetic(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
+                                   sparse_block_size=256, density=0.5, is_causal=True,
+                                   batch=1, n_warmup=10, n_iters=50):
+    """Same kernel/dispatch as bench_xattn_prefill, but the block mask is faked at a requested
+    density (see fake_block_mask) instead of GPU-scored by the real XAttention pipeline -- this is
+    what makes a clean density sweep (and non-causal coverage) possible in the first place."""
+    q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_size)
+    mask, effective_density = fake_block_mask(num_heads, seq_len, sparse_block_size, density,
+                                               is_causal, batch=batch)
+
+    kernel = xattn_test.build_sparse_prefill_kernel(num_heads, num_kv_heads, head_size,
+                                                     is_causal, sparse_block_size)
+
+    t_q = cl.tensor(q.to(torch.float16).numpy())
+    t_k = cl.tensor(k.to(torch.float16).numpy())
+    t_v = cl.tensor(v.to(torch.float16).numpy())
+    t_out = cl.tensor(np.zeros([batch, num_heads, seq_len, head_size], dtype=np.float16))
+    t_mask = cl.tensor(mask.numpy())
+
+    q_step = prefill.get_cm_grf_width() // 32
+    wg_size = 16
+    wg_seq_len = wg_size * q_step
+    wg_count = (seq_len + wg_seq_len - 1) // wg_seq_len
+    GWS = [1, batch * num_heads, wg_count * wg_size]
+    LWS = [1, 1, wg_size]
+    num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
+    args = [t_q, t_k, t_v, t_out, seq_len, seq_len, t_mask, num_q_blocks, num_k_blocks]
+
+    cl.finish()
+    for _ in range(n_warmup):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    cl.finish()
+    for _ in range(n_iters):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    lat_ms = [ns * 1e-6 for ns in cl.finish()]
+
+    total_flops = flops_for(num_heads, seq_len, seq_len, head_size,
+                             causal_savings=is_causal, density=effective_density) * batch
+    label = (f"xattn*   seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
+             f"block={sparse_block_size} causal={is_causal} density(req/eff)="
+             f"{density:.2f}/{effective_density:.3f} (fake mask)")
+    result = report(label, total_flops, lat_ms)
+    del t_q, t_k, t_v, t_out, t_mask
+    gc.collect()
+    return result
+
+
 def run_case(fn, *args, **kwargs):
     try:
         fn(*args, **kwargs)
@@ -288,3 +381,20 @@ if __name__ == "__main__":
     for sparse_block_size in (256, 128):
         for thresh in (0.99, 0.9, 0.6, 0.3):
             run_case(bench_xattn_prefill, 4096, sparse_block_size=sparse_block_size, thresh=thresh)
+
+    print("\n=== Stage 3a: SDPA prefill + XAttention (fake mask, density sweep, causal) ===")
+    # fake_block_mask sidesteps the real scoring pipeline's reliability issues above entirely, so
+    # this sweep can cover a much wider seq_len range and an exact, repeatable density grid instead
+    # of density being an indirect function of xattn_thresh.
+    for seq_len in [4096, 8192, 16384, 32768]:
+        for density in (0.99, 0.9, 0.6, 0.3, 0.1):
+            run_case(bench_xattn_prefill_synthetic, seq_len, density=density, is_causal=True)
+
+    print("\n=== Stage 3a: SDPA prefill + XAttention (fake mask, density sweep, non-causal) ===")
+    # XAttention's own scoring pipeline cannot correctly produce a non-causal mask at all today
+    # (find_block.hpp's non-causal branch has a pre-existing sort-precision bug -- see
+    # test_sdpa_prefill_xattn.py's module docstring), so the fake mask is the only way to
+    # perf-test this configuration right now.
+    for seq_len in [4096, 8192, 16384, 32768]:
+        for density in (0.99, 0.9, 0.6, 0.3, 0.1):
+            run_case(bench_xattn_prefill_synthetic, seq_len, density=density, is_causal=False)
