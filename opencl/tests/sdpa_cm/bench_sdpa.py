@@ -16,6 +16,7 @@ Usage: HW_PEAK_FLOPS=31 HW_PEAK_BW_GBS=100 python bench_sdpa.py
 """
 import gc
 import os
+import sys
 
 import numpy as np
 import torch
@@ -29,6 +30,14 @@ import test_sdpa_prefill_xattn as xattn_test
 import dense_xattn_adapter as xa
 # test_sdpa_prefill_xattn's import above already put pageatten/ on sys.path.
 from generate_block_mask import generate_block_mask_with_ratio
+
+# flashattn/cm_sdpa_vlen.cm's host wrapper -- used by bench_vlen_prefill to cross-check sdpa_cm's
+# TRANSPOSE_ORDER_SWAPPED dense prefill against what is architecturally the same kernel body
+# (sdpa_kernel_lsc_prefetch) reached through cm_sdpa_vlen's varlen/runtime-pitch ABI instead of
+# cm_sdpa_opt_prefill's compile-time-order ABI. See bench_prefill_vs_vlen's docstring.
+if prefill.FLASHATTN_DIR not in sys.path:
+    sys.path.insert(0, prefill.FLASHATTN_DIR)
+import cmfla
 
 torch.manual_seed(0)
 
@@ -116,16 +125,28 @@ def report_bw(label, kv_bytes, kv_ms, inter_bytes, inter_ms):
 
 
 def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causal=True,
-                   batch=1, n_warmup=10, n_iters=50):
+                   batch=1, n_warmup=10, n_iters=50, order=None):
+    # order=None -> identity layout ([B,H,S,D], OCL SDPA's default). Pass
+    # prefill.TRANSPOSE_ORDER_SWAPPED to benchmark the {0,2,1,3}-fused heads<->seq layout
+    # ([B,S,H,D]) instead -- applied uniformly to Q/K/V/output, matching a real transpose-fused
+    # subgraph end-to-end. Same total bytes moved either way; only the LSC block-load/store pitch
+    # differs (see cm_sdpa_opt_common.hpp) -- this measures whether that pitch difference itself
+    # costs anything.
+    if order is None:
+        order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_size)
-    order = prefill.TRANSPOSE_ORDER_IDENTITY
     kernel = prefill.build_prefill_kernel(num_heads, num_kv_heads, head_size, is_causal,
                                            order, order, order, order)
 
-    t_q = cl.tensor(q.to(torch.float16).numpy())
-    t_k = cl.tensor(k.to(torch.float16).numpy())
-    t_v = cl.tensor(v.to(torch.float16).numpy())
-    t_out = cl.tensor(np.zeros([batch, num_heads, seq_len, head_size], dtype=np.float16))
+    q_phys = prefill.to_physical(q, order)
+    k_phys = prefill.to_physical(k, order)
+    v_phys = prefill.to_physical(v, order)
+    t_q = cl.tensor(q_phys.to(torch.float16).numpy())
+    t_k = cl.tensor(k_phys.to(torch.float16).numpy())
+    t_v = cl.tensor(v_phys.to(torch.float16).numpy())
+    out_shape = ([batch, seq_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
+                 else [batch, num_heads, seq_len, head_size])
+    t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
 
     q_step = prefill.get_cm_grf_width() // 32
     wg_size = 16
@@ -144,7 +165,9 @@ def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causa
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
 
     total_flops = flops_for(num_heads, seq_len, seq_len, head_size, causal_savings=is_causal) * batch
-    label = f"prefill  seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} causal={is_causal}"
+    order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
+    label = (f"prefill  seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
+             f"causal={is_causal} order={order_tag}")
     result = report(label, total_flops, lat_ms)
     del t_q, t_k, t_v, t_out
     gc.collect()
@@ -229,20 +252,32 @@ def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
 
 
 def bench_cross_attn(q_len, kv_len, num_heads=12, num_kv_heads=12, head_size=128,
-                      batch=1, n_warmup=10, n_iters=50):
+                      batch=1, n_warmup=10, n_iters=50, order=None, op_name="cross"):
     """Dense, non-causal, q_len != kv_len -- e.g. FlashVSR's cross-attention (long video-chunk Q
     against a short fixed-length text-context K/V). bench_prefill assumes q_len==kv_len, so this
     is a thin variant calling prefill.make_qkv/build_prefill_kernel directly with independent
-    lengths, same dispatch/timing structure otherwise."""
+    lengths, same dispatch/timing structure otherwise. order: see bench_prefill's docstring.
+
+    op_name: label prefix only (no computational difference) -- self-attention's REAL
+    streaming-KV-cache shape (q_len != kv_len, see plan doc's "Streaming KV-cache mechanism"
+    section) is the exact same dense/non-causal/q_len!=kv_len computation as cross-attention, so
+    this function is reused as-is for that case too, just with op_name="self" to keep the printed
+    label honest about which op it represents."""
+    if order is None:
+        order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size)
-    order = prefill.TRANSPOSE_ORDER_IDENTITY
     kernel = prefill.build_prefill_kernel(num_heads, num_kv_heads, head_size, False,
                                            order, order, order, order)
 
-    t_q = cl.tensor(q.to(torch.float16).numpy())
-    t_k = cl.tensor(k.to(torch.float16).numpy())
-    t_v = cl.tensor(v.to(torch.float16).numpy())
-    t_out = cl.tensor(np.zeros([batch, num_heads, q_len, head_size], dtype=np.float16))
+    q_phys = prefill.to_physical(q, order)
+    k_phys = prefill.to_physical(k, order)
+    v_phys = prefill.to_physical(v, order)
+    t_q = cl.tensor(q_phys.to(torch.float16).numpy())
+    t_k = cl.tensor(k_phys.to(torch.float16).numpy())
+    t_v = cl.tensor(v_phys.to(torch.float16).numpy())
+    out_shape = ([batch, q_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
+                 else [batch, num_heads, q_len, head_size])
+    t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
 
     q_step = prefill.get_cm_grf_width() // 32
     wg_size = 16
@@ -261,11 +296,95 @@ def bench_cross_attn(q_len, kv_len, num_heads=12, num_kv_heads=12, head_size=128
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
 
     total_flops = flops_for(num_heads, q_len, kv_len, head_size, causal_savings=False) * batch
-    label = f"cross    q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size}"
+    order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
+    label = (f"{op_name:<8} q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} "
+             f"hd={head_size} order={order_tag}")
     result = report(label, total_flops, lat_ms)
     del t_q, t_k, t_v, t_out
     gc.collect()
     return result
+
+
+def bench_vlen_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
+                        n_warmup=10, n_iters=50, kv_blk=None):
+    """flashattn/cm_sdpa_vlen.cm at a single sequence (cu_seqlens=[0, seq_len], need_wg_mapping
+    handled internally by flash_attn_cm.__call__), always non-causal, addressing [seq_len,
+    num_heads, head_size] (heads inner) -- see bench_prefill_vs_vlen's docstring for why this is
+    architecturally the same kernel body as sdpa_cm's TRANSPOSE_ORDER_SWAPPED dense prefill at
+    batch=1. Reuses flash_attn_cm's own warmup/n_repeats convention (cmfla.py's
+    test_flash_attn_cm) rather than bench_prefill's raw kernel.enqueue loop, since flash_attn_cm
+    owns kernel compilation/dispatch internally.
+
+    kv_blk, if given, forces CMFLA_KV_BLK for this instance (cmfla.py reads it from the
+    CMFLA_KV_BLK env var at __init__ time, defaulting to get_default_kv_blk(head_size) --
+    2 at head_size=128). flash_attn_cm.create_instance is functools.cache'd on
+    (num_heads, num_kv_heads, head_size, is_causal), which doesn't include kv_blk, so a forced
+    build bypasses the cache and instantiates flash_attn_cm directly to avoid returning a stale
+    cached kernel built with a different KV_BLK."""
+    if kv_blk is None:
+        func = cmfla.flash_attn_cm.create_instance(num_heads, num_kv_heads, head_size, False)
+    else:
+        prev = os.environ.get("CMFLA_KV_BLK")
+        os.environ["CMFLA_KV_BLK"] = str(kv_blk)
+        try:
+            func = cmfla.flash_attn_cm(num_heads, num_kv_heads, head_size, False)
+        finally:
+            if prev is None:
+                del os.environ["CMFLA_KV_BLK"]
+            else:
+                os.environ["CMFLA_KV_BLK"] = prev
+    low, high = -2, 3
+    q = torch.randint(low, high, [seq_len, num_heads, head_size]).to(torch.float16)
+    k = torch.randint(low, high, [seq_len, num_kv_heads, head_size]).to(torch.float16)
+    v = (torch.randint(low, high, [seq_len, num_kv_heads, head_size]).to(torch.float16) / high)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+    func(q, k, v, cu_seqlens)  # trigger compile
+    cl.finish()
+    for _ in range(n_warmup):
+        func(q, k, v, cu_seqlens)
+    cl.finish()
+    func(q, k, v, cu_seqlens, n_iters)
+    lat_ms = [ns * 1e-6 for ns in cl.finish()]
+
+    total_flops = flops_for(num_heads, seq_len, seq_len, head_size, causal_savings=False)
+    kv_blk_tag = f" kv_blk={kv_blk}" if kv_blk is not None else ""
+    label = f"vlen     seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} (cm_sdpa_vlen, 1 seq{kv_blk_tag})"
+    return report(label, total_flops, lat_ms)
+
+
+def bench_prefill_vs_vlen(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
+                           n_warmup=10, n_iters=50):
+    """Cross-check: sdpa_cm's cm_sdpa_opt_prefill with TRANSPOSE_ORDER_SWAPPED (Q/K/V/output),
+    dense, non-causal, batch=1 vs. flashattn's cm_sdpa_vlen.cm at a single sequence. Both reduce
+    to the exact same compute body (cm_sdpa_common.hpp's sdpa_kernel_lsc_prefetch) with the same
+    per-token pitch (num_heads*head_size elements, heads inner) -- cm_sdpa_opt_prefill reaches it
+    via a compile-time TRANSPOSE_ORDER template constant, cm_sdpa_vlen via a runtime
+    q_token_pitch/k_token_pitch/v_token_pitch argument (cmfla.py:111-116) plus cu_seqlens-driven
+    work-group mapping instead of a q_len/kv_len pair. Despite that architectural equivalence, an
+    earlier run showed cm_sdpa_vlen consistently slower -- traced to cmfla.py defaulting
+    CMFLA_KV_BLK=2 at head_size=128 vs. sdpa_cm's build never setting it (falls back to 1). This
+    also runs vlen a second time with CMFLA_KV_BLK forced to 1, to isolate the pure ABI/dispatch
+    overhead (compile-time vs. runtime pitch, host wrapper cost, cu_seqlens indirection) from that
+    KV_BLK configuration difference. Prints all three results and both latency ratios."""
+    swapped_avg_ms, swapped_util = bench_prefill(seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                                                  head_size=head_size, is_causal=False,
+                                                  n_warmup=n_warmup, n_iters=n_iters,
+                                                  order=prefill.TRANSPOSE_ORDER_SWAPPED)
+    vlen_avg_ms, vlen_util = bench_vlen_prefill(seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                                                 head_size=head_size, n_warmup=n_warmup, n_iters=n_iters)
+    vlen_kv1_avg_ms, vlen_kv1_util = bench_vlen_prefill(seq_len, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                                                         head_size=head_size, n_warmup=n_warmup, n_iters=n_iters,
+                                                         kv_blk=1)
+    ratio = swapped_avg_ms / vlen_avg_ms if vlen_avg_ms > 0 else float("nan")
+    ratio_kv1 = swapped_avg_ms / vlen_kv1_avg_ms if vlen_kv1_avg_ms > 0 else float("nan")
+    print(f"[perf] compare  seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
+          f"| swapped/vlen latency ratio={ratio:.3f} "
+          f"(swapped={swapped_avg_ms:.3f}ms/{swapped_util:.1f}%, vlen={vlen_avg_ms:.3f}ms/{vlen_util:.1f}%) "
+          f"| swapped/vlen(kv_blk=1) ratio={ratio_kv1:.3f} "
+          f"(vlen_kv1={vlen_kv1_avg_ms:.3f}ms/{vlen_kv1_util:.1f}%)")
+    return (swapped_avg_ms, swapped_util, vlen_avg_ms, vlen_util, ratio,
+            vlen_kv1_avg_ms, vlen_kv1_util, ratio_kv1)
 
 
 def bench_xattn_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
@@ -363,21 +482,30 @@ def fake_block_mask(num_heads, seq_len, sparse_block_size, density, is_causal, b
 
 def bench_xattn_prefill_synthetic(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
                                    sparse_block_size=256, density=0.5, is_causal=True,
-                                   batch=1, n_warmup=10, n_iters=50):
+                                   batch=1, n_warmup=10, n_iters=50, order=None):
     """Same kernel/dispatch as bench_xattn_prefill, but the block mask is faked at a requested
     density (see fake_block_mask) instead of GPU-scored by the real XAttention pipeline -- this is
-    what makes a clean density sweep (and non-causal coverage) possible in the first place."""
+    what makes a clean density sweep (and non-causal coverage) possible in the first place.
+    order: see bench_prefill's docstring (applied to Q/K/V/output uniformly)."""
+    if order is None:
+        order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_size)
     mask, effective_density = fake_block_mask(num_heads, seq_len, sparse_block_size, density,
                                                is_causal, batch=batch)
 
     kernel = xattn_test.build_sparse_prefill_kernel(num_heads, num_kv_heads, head_size,
-                                                     is_causal, sparse_block_size)
+                                                     is_causal, sparse_block_size,
+                                                     order, order, order, order)
 
-    t_q = cl.tensor(q.to(torch.float16).numpy())
-    t_k = cl.tensor(k.to(torch.float16).numpy())
-    t_v = cl.tensor(v.to(torch.float16).numpy())
-    t_out = cl.tensor(np.zeros([batch, num_heads, seq_len, head_size], dtype=np.float16))
+    q_phys = prefill.to_physical(q, order)
+    k_phys = prefill.to_physical(k, order)
+    v_phys = prefill.to_physical(v, order)
+    t_q = cl.tensor(q_phys.to(torch.float16).numpy())
+    t_k = cl.tensor(k_phys.to(torch.float16).numpy())
+    t_v = cl.tensor(v_phys.to(torch.float16).numpy())
+    out_shape = ([batch, seq_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
+                 else [batch, num_heads, seq_len, head_size])
+    t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
     t_mask = cl.tensor(mask.numpy())
 
     q_step = prefill.get_cm_grf_width() // 32
@@ -399,9 +527,83 @@ def bench_xattn_prefill_synthetic(seq_len, num_heads=32, num_kv_heads=8, head_si
 
     total_flops = flops_for(num_heads, seq_len, seq_len, head_size,
                              causal_savings=is_causal, density=effective_density) * batch
+    order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
     label = (f"xattn*   seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
-             f"block={sparse_block_size} causal={is_causal} density(req/eff)="
+             f"block={sparse_block_size} causal={is_causal} order={order_tag} density(req/eff)="
              f"{density:.2f}/{effective_density:.3f} (fake mask)")
+    result = report(label, total_flops, lat_ms)
+    del t_q, t_k, t_v, t_out, t_mask
+    gc.collect()
+    return result
+
+
+def fake_block_mask_qkv(num_heads, q_len, kv_len, sparse_block_size, density, batch=1, seed=42):
+    """q_len != kv_len variant of fake_block_mask -- needed for FlashVSR's REAL streaming
+    KV-cache self-attention shape (see plan doc's "Streaming KV-cache mechanism" section: steady
+    -state q_len=19,200 vs. kv_len=76,800 = 3 cached + 1 current temporal groups). Non-causal only
+    (fake_block_mask's causal branch pulls generate_block_mask_with_ratio, which assumes a single
+    square trunk spanning one seq_len and does not generalize to independent q/k block counts;
+    FlashVSR's self-attention call is always is_causal=False anyway -- see bench_sdpa.py's
+    FlashVSR-config __main__ section comment -- so this omission costs nothing here)."""
+    num_q_blocks = (q_len + sparse_block_size - 1) // sparse_block_size
+    num_k_blocks = (kv_len + sparse_block_size - 1) // sparse_block_size
+    g = torch.Generator().manual_seed(seed)
+    mask = (torch.rand(batch, num_heads, num_q_blocks, num_k_blocks, generator=g) < density).to(torch.bool)
+    effective_density = block_mask_density(mask, is_causal=False)
+    return mask, effective_density
+
+
+def bench_xattn_prefill_synthetic_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size=128,
+                                       sparse_block_size=256, density=0.5,
+                                       batch=1, n_warmup=10, n_iters=50, order=None):
+    """q_len != kv_len variant of bench_xattn_prefill_synthetic -- same kernel/dispatch, but Q and
+    K/V get independent lengths (fake_block_mask_qkv) instead of a shared seq_len. Non-causal
+    only, see fake_block_mask_qkv's docstring. Needed for FlashVSR's real streaming-KV-cache
+    self-attention shape sparse benchmark (steady-state q_len=19,200/kv_len=76,800)."""
+    if order is None:
+        order = prefill.TRANSPOSE_ORDER_IDENTITY
+    q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size)
+    mask, effective_density = fake_block_mask_qkv(num_heads, q_len, kv_len, sparse_block_size,
+                                                   density, batch=batch)
+
+    kernel = xattn_test.build_sparse_prefill_kernel(num_heads, num_kv_heads, head_size,
+                                                     False, sparse_block_size,
+                                                     order, order, order, order)
+
+    q_phys = prefill.to_physical(q, order)
+    k_phys = prefill.to_physical(k, order)
+    v_phys = prefill.to_physical(v, order)
+    t_q = cl.tensor(q_phys.to(torch.float16).numpy())
+    t_k = cl.tensor(k_phys.to(torch.float16).numpy())
+    t_v = cl.tensor(v_phys.to(torch.float16).numpy())
+    out_shape = ([batch, q_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
+                 else [batch, num_heads, q_len, head_size])
+    t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
+    t_mask = cl.tensor(mask.numpy())
+
+    q_step = prefill.get_cm_grf_width() // 32
+    wg_size = 16
+    wg_seq_len = wg_size * q_step
+    wg_count = (q_len + wg_seq_len - 1) // wg_seq_len
+    GWS = [1, batch * num_heads, wg_count * wg_size]
+    LWS = [1, 1, wg_size]
+    num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
+    args = [t_q, t_k, t_v, t_out, q_len, kv_len, t_mask, num_q_blocks, num_k_blocks]
+
+    cl.finish()
+    for _ in range(n_warmup):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    cl.finish()
+    for _ in range(n_iters):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    lat_ms = [ns * 1e-6 for ns in cl.finish()]
+
+    total_flops = flops_for(num_heads, q_len, kv_len, head_size,
+                             causal_savings=False, density=effective_density) * batch
+    order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
+    label = (f"xattn*   q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} "
+             f"hd={head_size} block={sparse_block_size} causal=False order={order_tag} "
+             f"density(req/eff)={density:.2f}/{effective_density:.3f} (fake mask)")
     result = report(label, total_flops, lat_ms)
     del t_q, t_k, t_v, t_out, t_mask
     gc.collect()
@@ -473,16 +675,68 @@ if __name__ == "__main__":
     # token count L = f*h*w: steady-state chunk (f=2) = 19200, warm-up chunk (f=6) = 57600.
     # cross-attention kv_len=512 is FlashVSR's fixed text-context length. Self-attention's own
     # kernel call is always non-causal -- temporal causality is handled entirely by a Python-side
-    # FIFO KV-cache outside the attention op (this benchmark does not model that cache's extra KV
-    # tokens -- q_len==kv_len==current-chunk-only, a lower bound on real self-attention cost).
+    # FIFO KV-cache outside the attention op. The q_len==kv_len==current-chunk-only cases below
+    # are KEPT AS-IS as a "no cache" reference point, but are a lower bound on real self-attention
+    # cost: they don't model that FIFO cache's extra KV tokens. See plan doc's "Streaming KV-cache
+    # mechanism" section / wan_video_dit.py SelfAttention.forward, lines 317-382, for the actual
+    # mechanism (kv_ratio=3.0 default -> kv_len=3 window-groups cap, concat-before-attention,
+    # trim-by-one-group-after) -- the CORRECTED steady-state self-attention shape it produces is
+    # q_len=19,200 / kv_len=76,800 (3 cached + 1 current temporal groups), benchmarked separately
+    # below via bench_cross_attn (dense, op_name="self") / bench_xattn_prefill_synthetic_qkv
+    # (sparse). Warm-up is unaffected (pre_cache is None on the first call) -- kv_len==q_len==57,600
+    # already reflects the real warm-up shape exactly, no correction needed there.
     # Sparse density=0.3 below is illustrative (FlashVSR's real local-window+top-k selection
     # algorithm is not ported here -- see test_flashvsr_configs.py's module docstring), not a
     # literal derivation of FlashVSR's kv_ratio/topk_ratio/local_range geometry.
     FLASHVSR_CHUNK_TOKENS = [19200, 57600]
+    # Transpose-order sweep: identity ([B,H,S,D], OCL SDPA's default) vs. swapped ([B,S,H,D],
+    # the {0,2,1,3}-fused heads<->seq layout a transpose-fusable subgraph could hand the kernel
+    # instead) -- see cm_sdpa_opt_common.hpp / test_sdpa_prefill.py's TRANSPOSE_ORDER_* constants.
+    # Both orders move identical bytes; only the LSC block pitch differs.
+    ORDERS = [prefill.TRANSPOSE_ORDER_IDENTITY, prefill.TRANSPOSE_ORDER_SWAPPED]
+    for order in ORDERS:
+        for seq_len in FLASHVSR_CHUNK_TOKENS:
+            run_case(bench_prefill, seq_len, num_heads=12, num_kv_heads=12, head_size=128,
+                      is_causal=False, order=order)
+    for order in ORDERS:
+        for seq_len in FLASHVSR_CHUNK_TOKENS:
+            run_case(bench_xattn_prefill_synthetic, seq_len, num_heads=12, num_kv_heads=12, head_size=128,
+                      sparse_block_size=128, density=0.3, is_causal=False, order=order)
+    for order in ORDERS:
+        for q_len in FLASHVSR_CHUNK_TOKENS:
+            run_case(bench_cross_attn, q_len, kv_len=512, num_heads=12, num_kv_heads=12,
+                      head_size=128, order=order)
+
+    print("\n=== FlashVSR configs: self-attention, CORRECTED steady-state streaming-cache shape ===")
+    # Real steady-state chunk (every self-attention call after warm-up): q_len=19,200 (this
+    # chunk's own 1 temporal group), kv_len=76,800 (stabilized cache of 3 groups + this chunk's own
+    # 1 group = 4 groups total) -- see the comment above FLASHVSR_CHUNK_TOKENS and the plan doc's
+    # "Streaming KV-cache mechanism" section. Warm-up itself needs no correction (already
+    # q_len==kv_len==57,600 above, exact). op_name="self" on bench_cross_attn: identical
+    # dense/non-causal/q_len!=kv_len computation to cross-attention, just relabeled.
+    STEADY_Q_LEN, STEADY_KV_LEN_REAL = 19200, 76800
+    for order in ORDERS:
+        run_case(bench_cross_attn, STEADY_Q_LEN, kv_len=STEADY_KV_LEN_REAL, num_heads=12,
+                  num_kv_heads=12, head_size=128, order=order, op_name="self")
+    for order in ORDERS:
+        run_case(bench_xattn_prefill_synthetic_qkv, STEADY_Q_LEN, STEADY_KV_LEN_REAL,
+                  num_heads=12, num_kv_heads=12, head_size=128, sparse_block_size=128,
+                  density=0.3, order=order)
+
+    print("\n=== Cross-check: sdpa_cm prefill (swapped, dense) vs. flashattn cm_sdpa_vlen (1 seq) ===")
+    # Both reduce to the same compute body (cm_sdpa_common.hpp's sdpa_kernel_lsc_prefetch) at the
+    # same per-token pitch -- see bench_prefill_vs_vlen's docstring. Sweep covers:
+    #   - a generic seq_len range at GQA (32/8) and MHA (32/32), head_size=128, matching Stage 1a's
+    #     own sweep grid, to see whether the ABI/dispatch gap (if any) holds across scale.
+    #   - FlashVSR's real DiT config (MHA heads=12/12, head_size=128) at both its real chunk token
+    #     counts (steady=19200, warm-up=57600), the case this comparison was actually asked for.
+    VLEN_CMP_SEQ_LENS = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    print("--- GQA heads=32/8 hd=128 ---")
+    for seq_len in VLEN_CMP_SEQ_LENS:
+        run_case(bench_prefill_vs_vlen, seq_len, num_heads=32, num_kv_heads=8, head_size=128)
+    print("--- MHA heads=32/32 hd=128 ---")
+    for seq_len in VLEN_CMP_SEQ_LENS:
+        run_case(bench_prefill_vs_vlen, seq_len, num_heads=32, num_kv_heads=32, head_size=128)
+    print("--- FlashVSR config: MHA heads=12/12 hd=128, real chunk token counts ---")
     for seq_len in FLASHVSR_CHUNK_TOKENS:
-        run_case(bench_prefill, seq_len, num_heads=12, num_kv_heads=12, head_size=128, is_causal=False)
-    for seq_len in FLASHVSR_CHUNK_TOKENS:
-        run_case(bench_xattn_prefill_synthetic, seq_len, num_heads=12, num_kv_heads=12, head_size=128,
-                  sparse_block_size=128, density=0.3, is_causal=False)
-    for q_len in FLASHVSR_CHUNK_TOKENS:
-        run_case(bench_cross_attn, q_len, kv_len=512, num_heads=12, num_kv_heads=12, head_size=128)
+        run_case(bench_prefill_vs_vlen, seq_len, num_heads=12, num_kv_heads=12, head_size=128)
