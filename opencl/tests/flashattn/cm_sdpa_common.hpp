@@ -187,7 +187,8 @@ void sdpa_kernel_lsc(
     }
 }
 
-template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused, int wg_local_size>
+template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused, int wg_local_size,
+         bool has_attn_mask = false, int sparse_block_size = 1>
 void sdpa_kernel_lsc_prefetch(
     int wg_local_id,
     int q_start,
@@ -200,9 +201,26 @@ void sdpa_kernel_lsc_prefetch(
     svmptr_t q_base [[type("svmptr_t")]],
     svmptr_t k_base [[type("svmptr_t")]],
     svmptr_t v_base [[type("svmptr_t")]],
-    svmptr_t o_base [[type("svmptr_t")]]) {
+    svmptr_t o_base [[type("svmptr_t")]],
+    // Defaults to today's heads-inner-per-token layout (unchanged behavior for existing callers,
+    // e.g. cm_sdpa_vlen.cm). Pass head_size*sizeof(half) instead for a heads-outer ([B,H,S,D])
+    // output layout, mirroring how k_pitch_bytes/v_pitch_bytes already let callers pick a layout.
+    uint o_pitch_bytes = num_heads * head_size * sizeof(half),
+    // Runtime Q pre-scale, defaulting to the compile-time q_prescale (== scale_factor*log2e or
+    // scale_factor, per CMFLA_Q_SCALED_BY_LOG2) so existing callers see identical behavior.
+    // Pass a value derived from a runtime `scale` input instead to override CMFLA_SCALE_FACTOR.
+    float q_prescale_rt = q_prescale,
+    // Optional additive attn_mask [Sq,Sk] (only read when has_attn_mask=true); mask values are
+    // added to the raw St score pre-scaled by q_prescale_rt, matching how Q itself is pre-scaled
+    // (sdpa_opt.cl's load_attn_mask semantics).
+    svmptr_t mask_base [[type("svmptr_t")]] = 0,
+    uint mask_pitch_bytes = 0,
+    // XAttention block-sparsity mask (only read when sparse_block_size>1): one bool per
+    // sparse_block_size-sized KV chunk for this (batch,head,q_block) row, 1=keep/0=skip. Already
+    // offset by the caller to point at this work-item's row -- see cm_sdpa_opt_prefill.cm.
+    svmptr_t sparse_mask_base [[type("svmptr_t")]] = 0) {
 
-    constexpr uint o_pitch = (num_heads * head_size * sizeof(half));
+    uint o_pitch = o_pitch_bytes;
     // round up head_size to multiple of 16
     // block_2d_desc will automatically handle the tailing block
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
@@ -229,12 +247,17 @@ void sdpa_kernel_lsc_prefetch(
         #pragma unroll
         for(int k = 0, ri = 0; k < padded_head_size/2; k += REG_K/2, ri++) {
             cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale);
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale_rt);
         }
     }
 
     lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size*sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
     lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size*sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
+    // Mask surface is [Sq,Sk] (q rows outer, kv cols inner) -- same row range (q_tokens_left,
+    // starting at this tile's q_start via the caller's pointer offset) as b2dQ above, so a plain
+    // (non-transpose) load followed by an on-chip Transpose2DMatrix gives the [kv,q] layout St
+    // needs, without requiring an LSC hardware-transpose descriptor for the mask.
+    lsc::block_2d_desc<half, 1, q_step, kv_step> b2dMask(mask_base, q_tokens_left - 1, kv_len*sizeof(half) - 1, mask_pitch_bytes - 1, 0, 0);
 
     static_assert(wg_local_size == 16);
     lsc::block_2d_desc<half, 1, kv_step/wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size*sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
@@ -262,6 +285,20 @@ void sdpa_kernel_lsc_prefetch(
     }
 
     for(int kv_base = 0; kv_base < kv_stop; kv_base += BLK_ROWS) {
+        // ---- XAttention block-sparsity: skip this whole KV_BLK chunk (no load, no DPAS) when
+        // its sparse_block_size-sized bucket is masked out. causal_left still has to be
+        // decremented by the chunk's nominal length so later (non-skipped) chunks see the right
+        // causal offset -- mirrors cm_pa_xe2.hpp's skip_compute bookkeeping exactly.
+        if constexpr (sparse_block_size > 1) {
+            constexpr int sb_shift = (sparse_block_size == 128) ? 7 : (sparse_block_size == 256) ? 8 : -1;
+            static_assert(sb_shift > 0, "sparse_block_size must be 128 or 256");
+            static_assert (sparse_block_size % BLK_ROWS == 0,
+                "sparse_block_size must be a multiple of KV_BLK*kv_step so a chunk never straddles a sparse block");
+            if (sparse_mask_base && !((const bool*)sparse_mask_base)[(uint)kv_base >> sb_shift]) {
+                if constexpr (use_causal_mask) causal_left -= BLK_ROWS;
+                continue;
+            }
+        }
         //# St = K @ Q^T for KV_BLK stacked sub-tiles -> [KV_BLK*kv_step, q_step]
         matrix<float, BLK_ROWS, q_step> St;
         auto St2 = St.format<float, KV_BLK*num_K, REG_M*REG_N>();
@@ -296,6 +333,24 @@ void sdpa_kernel_lsc_prefetch(
                         St2.row(b*num_K + k),
                         rQ[ri].format<int32_t>(),
                         Kmat[k].format<int32_t>());
+                }
+            }
+        }
+
+        // ---- optional additive attn_mask, added in the same [kv,q] domain St lives in ----
+        if constexpr (has_attn_mask) {
+            #pragma unroll
+            for(int b = 0; b < KV_BLK; b++) {
+                int kv_pos = kv_base + b*kv_step;
+                matrix<half, q_step, kv_step> Mraw;
+                cm_load<lsc::Normal>(Mraw.format<half>(), b2dMask.set_block_x(kv_pos));
+                matrix<half, kv_step, q_step> Mt;
+                Transpose2DMatrix(Mraw.select<q_step, 1, kv_step, 1>(0, 0), Mt);
+                auto Stb = St.select<kv_step, 1, q_step, 1>(b*kv_step, 0);
+                #pragma unroll
+                for(int r = 0; r < kv_step; r++) {
+                    vector<float, q_step> mrow = Mt.row(r);
+                    Stb.row(r) = cm_add<float>(Stb.row(r), cm_mul<float>(mrow, q_prescale_rt));
                 }
             }
         }

@@ -1,0 +1,63 @@
+/*******************************************************************************
+ * Copyright (c) 2018-2026 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+//
+// Finalization kernel for cm_sdpa_opt_decode.cm's split-KV partitions: combines each
+// (batch,head)'s per-partition (exp_sums, max_logits, tmp_out) into the final [B,H,1,D] output
+// via the standard log-sum-exp merge (exact regardless of how KV was partitioned):
+//   global_max = max_p(max_logits[p])
+//   weight_p   = exp(max_logits[p] - global_max) * exp_sums[p]
+//   output     = sum_p(weight_p * tmp_out[p]) / sum_p(weight_p)
+// max_logits/exp_sums live in the same q_prescale-scaled domain cm_sdpa_opt_decode.cm's online
+// softmax already uses (CMFLA_Q_SCALED_BY_LOG2's cm_exp-is-exp2 convention), so no extra log2e
+// factor is applied here -- consistent with that kernel's own cur_max/max_comp handling.
+#include <cm/cm.h>
+#include <cm/cmtl.h>
+
+namespace KERNEL_NAME {
+
+_GENX_MAIN_ void KERNEL_NAME(
+    float* exp_sums [[type("svmptr_t")]],    // [B,Hq,1,num_partitions]
+    float* max_logits [[type("svmptr_t")]],  // [B,Hq,1,num_partitions]
+    half* tmp_out [[type("svmptr_t")]],      // [B,Hq,1,num_partitions,D]
+    half* output [[type("svmptr_t")]],       // [B,Hq,1,D]
+    int num_partitions) {
+    constexpr int head_size = CMFLA_HEAD_SIZE;
+
+    auto bh = cm_group_id(1);  // 0 .. batch*num_heads-1
+
+    uint base = (uint)bh * num_partitions;
+    float global_max = max_logits[base];
+    for (int p = 1; p < num_partitions; p++)
+        global_max = cm_max<float>(global_max, max_logits[base + p]);
+
+    float total = 0.0f;
+    for (int p = 0; p < num_partitions; p++)
+        total += cm_exp(max_logits[base + p] - global_max) * exp_sums[base + p];
+
+    vector<float, head_size> acc = 0.0f;
+    for (int p = 0; p < num_partitions; p++) {
+        float w = cm_exp(max_logits[base + p] - global_max) * exp_sums[base + p] / total;
+        vector<half, head_size> chunk;
+        cm_svm_block_read<half, head_size>((svmptr_t)(tmp_out + (uint64_t)(base + p) * head_size), chunk);
+        vector<float, head_size> chunk_f = chunk;
+        acc = cm_add<float>(acc, cm_mul<float>(chunk_f, w));
+    }
+
+    vector<half, head_size> out_f16 = cm_mul<float>(acc, 1.0f);
+    cm_svm_block_write<half, head_size>((svmptr_t)(output + (uint64_t)bh * head_size), out_f16);
+}
+
+}  // namespace KERNEL_NAME

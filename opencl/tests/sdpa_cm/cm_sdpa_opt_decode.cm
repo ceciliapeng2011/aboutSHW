@@ -1,0 +1,209 @@
+/*******************************************************************************
+ * Copyright (c) 2018-2026 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+//
+// SDPA (scaled_dot_product_attention) CM decode (single-token generate) kernel, matching OCL
+// sdpa_opt's SDPAOptGeneratorSingleToken ABI: dense [B,H,1,D] query, dense [B,Hkv,Sk,D] key/value,
+// split-KV partitions with per-partition exp_sums/max_logits/tmp_out outputs consumed by the
+// paired finalization kernel (cm_sdpa_opt_decode_finalization.cm).
+//
+// Reuses cm_attention_common.hpp's DPAS precision (CM_PRECISION_HF), Q pre-scale constants
+// (q_prescale/log2e), and the LSC transpose/VNNI load *mechanisms* already proven in
+// cm_sdpa_common.hpp's sdpa_kernel_lsc_prefetch (prefill) -- but NOT that function's macros
+// (REG_M/RepeatCount there are fixed at 8 for the 16-query-row prefill tiling). Decode processes
+// a single query row, so the DPAS roles are swapped relative to prefill: here Q is the natural
+// (RepeatCount=1) "A" operand and K is the transpose-loaded VNNI "B" operand for Q@K^T, while V
+// is VNNI-loaded exactly as in prefill for P@V (P has 1 row here, no St->P transpose is needed
+// since a single query's score vector is already laid out [1,kv] -- the same shape P@V wants).
+#include "cm_sdpa_common.hpp"
+#include "cm_sdpa_opt_common.hpp"
+
+#ifndef HAS_ATTN_MASK_INPUT
+#define HAS_ATTN_MASK_INPUT 0
+#endif
+#ifndef HAS_SCALE_INPUT
+#define HAS_SCALE_INPUT 0
+#endif
+#ifndef CMFLA_KV_PARTITION_SIZE
+#define CMFLA_KV_PARTITION_SIZE 256
+#endif
+
+namespace KERNEL_NAME {
+
+#include "cm_sdpa_common.hpp"
+#include "cm_sdpa_opt_common.hpp"
+
+_GENX_MAIN_ void KERNEL_NAME(
+    half* query [[type("svmptr_t")]],
+    half* key [[type("svmptr_t")]],
+    half* value [[type("svmptr_t")]],
+#if HAS_ATTN_MASK_INPUT
+    half* attn_mask [[type("svmptr_t")]],  // [1,1,1,kv_len], additive, pre-scale units;
+                                            // host must pad the buffer to a multiple of REG_N
+                                            // elements so the fixed-width tail read never runs
+                                            // past the allocation.
+#endif
+#if HAS_SCALE_INPUT
+    float scale,  // overrides CMFLA_SCALE_FACTOR when set
+#endif
+    float* exp_sums [[type("svmptr_t")]],    // [B,Hq,1,num_partitions]
+    float* max_logits [[type("svmptr_t")]],  // [B,Hq,1,num_partitions]
+    half* tmp_out [[type("svmptr_t")]],      // [B,Hq,1,num_partitions,D]
+    int kv_len) {
+    constexpr int num_heads = CMFLA_NUM_HEADS;
+    constexpr int num_kv_heads = CMFLA_NUM_KV_HEADS;
+    constexpr int head_size = CMFLA_HEAD_SIZE;
+    constexpr int group_size = num_heads / num_kv_heads;
+    constexpr int KV_PARTITION_SIZE = CMFLA_KV_PARTITION_SIZE;
+    constexpr int padded_head_size = (head_size + REG_K - 1) / REG_K * REG_K;
+    static_assert(padded_head_size % REG_N == 0);
+
+    auto bh = cm_group_id(1);           // 0 .. batch*num_heads-1
+    auto b = bh / num_heads;
+    auto h = bh % num_heads;
+    auto hkv = h / group_size;
+    auto p = cm_group_id(2);            // partition index; one WG per partition (LWS=[1,1,1])
+
+    int kv_start = p * KV_PARTITION_SIZE;
+    if (kv_start >= kv_len) return;
+    int kv_count = kv_len - kv_start;
+    if (kv_count > KV_PARTITION_SIZE) kv_count = KV_PARTITION_SIZE;
+    int num_partitions = (kv_len + KV_PARTITION_SIZE - 1) / KV_PARTITION_SIZE;
+
+#if HAS_SCALE_INPUT
+#if CMFLA_Q_SCALED_BY_LOG2
+    float q_prescale_rt = scale * log2e;
+#else
+    float q_prescale_rt = scale;
+#endif
+#else
+    float q_prescale_rt = q_prescale;
+#endif
+
+    uint k_seq_pitch = get_seq_pitch_bytes<K_TRANSPOSE_ORDER>(kv_len, num_kv_heads, head_size);
+    uint v_seq_pitch = get_seq_pitch_bytes<V_TRANSPOSE_ORDER>(kv_len, num_kv_heads, head_size);
+
+    uint q_batch_off = (uint)b * get_batch_byte_stride(1, num_heads, head_size);
+    uint k_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, head_size);
+    uint v_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, head_size);
+
+    uint q_off = q_batch_off + get_head_byte_offset<Q_TRANSPOSE_ORDER>(h, 1, head_size);
+    uint k_off = k_batch_off + get_head_byte_offset<K_TRANSPOSE_ORDER>(hkv, kv_len, head_size)
+                 + (uint)kv_start * k_seq_pitch;
+    uint v_off = v_batch_off + get_head_byte_offset<V_TRANSPOSE_ORDER>(hkv, kv_len, head_size)
+                 + (uint)kv_start * v_seq_pitch;
+
+    half* q_ptr = (half*)((uint8_t*)query + q_off);
+    svmptr_t k_base = reinterpret_cast<svmptr_t>((uint8_t*)key + k_off);
+    svmptr_t v_base = reinterpret_cast<svmptr_t>((uint8_t*)value + v_off);
+
+    // Q: single row, natural layout (the DPAS "A"/RepeatCount=1 operand for Q@K^T), pre-scaled.
+    matrix<half, padded_head_size/REG_K, REG_K> rQ = 0;
+    #pragma unroll
+    for (int k = 0, ri = 0; k < head_size; k += REG_K, ri++) {
+        cm_svm_block_read<half, REG_K>((svmptr_t)(q_ptr + k), rQ[ri].format<half>());
+        rQ[ri] = cm_mul<half>(rQ[ri], (half)q_prescale_rt);
+    }
+
+    // K descriptor: transposed load (natural HBM [kv,head_dim] -> register [head_dim,kv] VNNI),
+    // giving the DPAS "B" operand for Q@K^T -- same load mechanism as prefill's b2dQ, just
+    // pointed at K with a REG_N-wide (16 kv positions) block instead of a REG_N-wide q tile.
+    lsc::block_2d_desc<uint, 1, REG_N, REG_K/2> b2dK(reinterpret_cast<uint*>(k_base), kv_count - 1, head_size*sizeof(half) - 1, k_seq_pitch - 1, 0, 0);
+    // V descriptor: VNNI load, identical usage to prefill's b2dV.
+    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_count - 1, head_size*sizeof(half) - 1, v_seq_pitch - 1, 0, 0);
+
+#if HAS_ATTN_MASK_INPUT
+    half* mask_ptr = (half*)((uint8_t*)attn_mask) + kv_start;
+#endif
+
+    float cur_max = -3.4e38f;
+    float cur_sum = 0.0f;
+    matrix<float, padded_head_size/REG_N, REG_N> rO = 0;
+
+    for (int kv_pos = 0; kv_pos < kv_count; kv_pos += REG_N) {
+        b2dK.set_block_y(kv_pos);
+        vector<float, REG_N> St;
+        matrix<half, padded_head_size/REG_K, REG_K*REG_N> rK;
+        #pragma unroll
+        for (int k = 0, ri = 0; k < padded_head_size/2; k += REG_K/2, ri++) {
+            cm_load<lsc::Transpose>(rK[ri].format<uint>(), b2dK.set_block_x(k));
+        }
+        St = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, 1, float>(
+                0, rK[0].format<int32_t>(), rQ[0].format<int32_t>());
+        #pragma unroll
+        for (int ri = 1; ri < padded_head_size/REG_K; ri++) {
+            St = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, 1, float>(
+                    St, rK[ri].format<int32_t>(), rQ[ri].format<int32_t>());
+        }
+
+        int valid = kv_count - kv_pos;
+        if (valid < REG_N) {
+            #pragma unroll
+            for (int c = 0; c < REG_N; c++) if (c >= valid) St[c] = -3.4e38f;
+        }
+
+#if HAS_ATTN_MASK_INPUT
+        {
+            vector<half, REG_N> Mvec;
+            cm_svm_block_read<half, REG_N>((svmptr_t)(mask_ptr + kv_pos), Mvec.format<half>());
+            vector<float, REG_N> Mf = Mvec;
+            St = cm_add<float>(St, cm_mul<float>(Mf, q_prescale_rt));
+        }
+#endif
+
+        float row_max = St[0];
+        #pragma unroll
+        for (int c = 1; c < REG_N; c++) row_max = cm_max<float>(row_max, St[c]);
+        float new_max = cm_max<float>(cur_max, row_max);
+
+        vector<half, REG_N> P = cm_exp(St - new_max);
+        float row_sum = cm_sum<float>(P);
+        float max_comp = cm_exp(cur_max - new_max);
+        cur_sum = cur_sum * max_comp + row_sum;
+        cur_max = new_max;
+
+        if (kv_pos > 0) {
+            #pragma unroll
+            for (int ci = 0; ci < padded_head_size/REG_N; ci++)
+                rO[ci] = cm_mul<float>(rO[ci], max_comp);
+        }
+
+        b2dV.set_block_y(kv_pos);
+        #pragma unroll
+        for (int ci = 0; ci < padded_head_size/REG_N; ci++) {
+            matrix<half, REG_K/2, REG_N*2> Vmat;
+            cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci*REG_N));
+            rO[ci] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, 1, float>(
+                        rO[ci].format<float>(), Vmat.format<int32_t>(), P.format<int32_t>());
+        }
+    }
+
+    uint out_idx = (uint)bh * num_partitions + p;
+    exp_sums[out_idx] = cur_sum;
+    max_logits[out_idx] = cur_max;
+
+    // tmp_out stores this partition's ALREADY-NORMALIZED partial output (rO/cur_sum);
+    // exp_sums/max_logits carry the local softmax denominator/max so the finalization kernel
+    // can re-weight and combine partitions via the standard log-sum-exp merge.
+    half* tmp_out_ptr = tmp_out + (uint64_t)out_idx * head_size;
+    float inv_sum = 1.0f / cur_sum;
+    #pragma unroll
+    for (int k = 0, ci = 0; k < head_size; k += REG_N, ci++) {
+        vector<half, REG_N> o_f16 = cm_mul<float>(rO[ci].format<float>(), inv_sum);
+        cm_svm_block_write<half, REG_N>((svmptr_t)(tmp_out_ptr + k), o_f16);
+    }
+}
+
+}  // namespace KERNEL_NAME
