@@ -71,6 +71,16 @@ _GENX_MAIN_ void KERNEL_NAME(
     //#   key [kv_len, num_heads, S]
     //# value [kv_len, num_heads, S]
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 *16;
+#if USE_LSC == 1 && USE_LSC_PREFETCH
+    // sdpa_kernel_lsc_prefetch (the path actually taken below) never touches slm_K/slm_V --
+    // those SLM buffers only matter to the non-prefetch sdpa_kernel_lsc/sdpa_kernel variants.
+    // Declaring them here anyway costs nothing at runtime but reserves 32KB of per-work-group
+    // SLM quota that's never read or written, capping how many work-groups the GPU can schedule
+    // concurrently per subslice for no benefit -- this disproportionately hurt GQA shapes (whose
+    // speedup depends on sibling Q-heads sharing a KV head staying concurrently resident to reuse
+    // cache lines), while leaving MHA roughly unaffected. Skip the declaration on this path.
+    uint slm_K = 0, slm_V = 0;
+#else
     constexpr uint K_SLM_SIZE = (4*kv_step * padded_head_size * sizeof(half));
     constexpr uint V_SLM_SIZE = (4*kv_step * padded_head_size * sizeof(half));
     constexpr uint Q_SLM_SIZE = 0;//(q_step * padded_head_size * sizeof(half)) * local_size;
@@ -79,6 +89,7 @@ _GENX_MAIN_ void KERNEL_NAME(
 
     auto slm_K = cm_slm_alloc(K_SLM_SIZE);
     auto slm_V = cm_slm_alloc(V_SLM_SIZE);
+#endif
 
     auto h = cm_group_id(0);
     auto hkv = h / (num_heads/num_kv_heads);
