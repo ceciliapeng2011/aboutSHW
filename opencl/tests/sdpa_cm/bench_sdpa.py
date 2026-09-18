@@ -228,6 +228,46 @@ def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
     return result
 
 
+def bench_cross_attn(q_len, kv_len, num_heads=12, num_kv_heads=12, head_size=128,
+                      batch=1, n_warmup=10, n_iters=50):
+    """Dense, non-causal, q_len != kv_len -- e.g. FlashVSR's cross-attention (long video-chunk Q
+    against a short fixed-length text-context K/V). bench_prefill assumes q_len==kv_len, so this
+    is a thin variant calling prefill.make_qkv/build_prefill_kernel directly with independent
+    lengths, same dispatch/timing structure otherwise."""
+    q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size)
+    order = prefill.TRANSPOSE_ORDER_IDENTITY
+    kernel = prefill.build_prefill_kernel(num_heads, num_kv_heads, head_size, False,
+                                           order, order, order, order)
+
+    t_q = cl.tensor(q.to(torch.float16).numpy())
+    t_k = cl.tensor(k.to(torch.float16).numpy())
+    t_v = cl.tensor(v.to(torch.float16).numpy())
+    t_out = cl.tensor(np.zeros([batch, num_heads, q_len, head_size], dtype=np.float16))
+
+    q_step = prefill.get_cm_grf_width() // 32
+    wg_size = 16
+    wg_seq_len = wg_size * q_step
+    wg_count = (q_len + wg_seq_len - 1) // wg_seq_len
+    GWS = [1, batch * num_heads, wg_count * wg_size]
+    LWS = [1, 1, wg_size]
+    args = [t_q, t_k, t_v, t_out, q_len, kv_len]
+
+    cl.finish()
+    for _ in range(n_warmup):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    cl.finish()
+    for _ in range(n_iters):
+        kernel.enqueue("cm_sdpa_opt_prefill", GWS, LWS, *args)
+    lat_ms = [ns * 1e-6 for ns in cl.finish()]
+
+    total_flops = flops_for(num_heads, q_len, kv_len, head_size, causal_savings=False) * batch
+    label = f"cross    q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size}"
+    result = report(label, total_flops, lat_ms)
+    del t_q, t_k, t_v, t_out
+    gc.collect()
+    return result
+
+
 def bench_xattn_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
                          sparse_block_size=256, thresh=0.9, is_causal=True,
                          batch=1, n_warmup=10, n_iters=50):
@@ -423,3 +463,26 @@ if __name__ == "__main__":
     for seq_len in [4096, 8192, 16384, 32768]:
         for density in (0.99, 0.9, 0.6, 0.3, 0.1):
             run_case(bench_xattn_prefill_synthetic, seq_len, density=density, is_causal=False)
+
+    print("\n=== FlashVSR configs: DiT self-/cross-attention (MHA heads=12/12 hd=128) ===")
+    # Shapes from /home/ceciliapeng/repos/reports/flashvsr_v1.1_full_inference_pipeline.md, for the
+    # real requested case: a 320x480 (portrait) source upsampled by FlashVSR's fixed 4x scale to a
+    # 1280x1920 target (compute_scaled_and_target_dims in infer_flashvsr_v1.1_full.py -- lands
+    # exactly on multiples of 128 for this resolution, no flooring loss). VAE 8x spatial downsample
+    # -> latent 160x240 -> patchify (2x2) -> post-patchify token grid h*w = 80*120 = 9600. Chunk
+    # token count L = f*h*w: steady-state chunk (f=2) = 19200, warm-up chunk (f=6) = 57600.
+    # cross-attention kv_len=512 is FlashVSR's fixed text-context length. Self-attention's own
+    # kernel call is always non-causal -- temporal causality is handled entirely by a Python-side
+    # FIFO KV-cache outside the attention op (this benchmark does not model that cache's extra KV
+    # tokens -- q_len==kv_len==current-chunk-only, a lower bound on real self-attention cost).
+    # Sparse density=0.3 below is illustrative (FlashVSR's real local-window+top-k selection
+    # algorithm is not ported here -- see test_flashvsr_configs.py's module docstring), not a
+    # literal derivation of FlashVSR's kv_ratio/topk_ratio/local_range geometry.
+    FLASHVSR_CHUNK_TOKENS = [19200, 57600]
+    for seq_len in FLASHVSR_CHUNK_TOKENS:
+        run_case(bench_prefill, seq_len, num_heads=12, num_kv_heads=12, head_size=128, is_causal=False)
+    for seq_len in FLASHVSR_CHUNK_TOKENS:
+        run_case(bench_xattn_prefill_synthetic, seq_len, num_heads=12, num_kv_heads=12, head_size=128,
+                  sparse_block_size=128, density=0.3, is_causal=False)
+    for q_len in FLASHVSR_CHUNK_TOKENS:
+        run_case(bench_cross_attn, q_len, kv_len=512, num_heads=12, num_kv_heads=12, head_size=128)
