@@ -122,7 +122,7 @@ def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causa
 
 
 def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
-                  kv_partition_size=256, n_warmup=10, n_iters=50):
+                  kv_partition_size=256, n_warmup=10, n_iters=50, max_mem_bytes=8e9):
     q, k, v = decode.make_decode_qkv(batch, num_heads, num_kv_heads, kv_len, head_size)
     order = decode.TRANSPOSE_ORDER_IDENTITY
     decode_kernel = decode.build_decode_kernel(num_heads, num_kv_heads, head_size,
@@ -130,33 +130,51 @@ def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
                                                 kv_partition_size=kv_partition_size)
     reduce_kernel = decode.build_finalization_kernel(head_size)
 
-    t_q = cl.tensor(q.to(torch.float16).numpy())
-    t_k = cl.tensor(k.to(torch.float16).numpy())
-    t_v = cl.tensor(v.to(torch.float16).numpy())
     num_partitions = (kv_len + kv_partition_size - 1) // kv_partition_size
     bh = batch * num_heads
-    t_exp_sums = cl.tensor(np.zeros([bh * num_partitions], dtype=np.float32))
-    t_max_logits = cl.tensor(np.zeros([bh * num_partitions], dtype=np.float32))
-    t_tmp_out = cl.tensor(np.zeros([bh * num_partitions * head_size], dtype=np.float16))
-    t_out = cl.tensor(np.zeros([batch, num_heads, 1, head_size], dtype=np.float16))
-
     GWS = [1, bh, num_partitions]
     LWS = [1, 1, 1]
-    args1 = [t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, kv_len]
     GWS2 = [1, bh, 1]
     LWS2 = [1, 1, 1]
-    args2 = [t_exp_sums, t_max_logits, t_tmp_out, t_out, num_partitions]
 
-    def run_once():
-        decode_kernel.enqueue("cm_sdpa_opt_decode", GWS, LWS, *args1)
-        reduce_kernel.enqueue("cm_sdpa_opt_decode_reduce", GWS2, LWS2, *args2)
+    # Decode is memory-bandwidth-bound, so reusing one K/V buffer across every iteration is wrong:
+    # after the first read it stays resident in GPU cache (the whole K+V is only a few MB at small
+    # kv_len), and every later iteration reports cache bandwidth instead of DRAM bandwidth --
+    # exactly why kv_len=1024/2048 originally showed an implausible 150-170 GB/s. Fix: allocate an
+    # independent K/V copy per iteration (round-robin, capped by max_mem_bytes) so each kernel
+    # launch touches fresh memory, mirroring test_pa_decoding.py's _run_bandwidth_measurement
+    # (all_layers / "j = i % len(all_layers)") exactly.
+    q_np = q.to(torch.float16).numpy()
+    k_np = k.to(torch.float16).numpy()
+    v_np = v.to(torch.float16).numpy()
+    per_layer_bytes = q_np.nbytes + k_np.nbytes + v_np.nbytes
+    total_iters = n_warmup + n_iters
+    num_layers = max(1, min(total_iters, int(max_mem_bytes // per_layer_bytes)))
+
+    layers = []
+    for _ in range(num_layers):
+        t_q = cl.tensor(q_np)
+        t_k = cl.tensor(k_np)
+        t_v = cl.tensor(v_np)
+        t_exp_sums = cl.tensor(np.zeros([bh * num_partitions], dtype=np.float32))
+        t_max_logits = cl.tensor(np.zeros([bh * num_partitions], dtype=np.float32))
+        t_tmp_out = cl.tensor(np.zeros([bh * num_partitions * head_size], dtype=np.float16))
+        t_out = cl.tensor(np.zeros([batch, num_heads, 1, head_size], dtype=np.float16))
+        layers.append((t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, t_out))
+
+    def run_once(layer):
+        t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, t_out = layer
+        decode_kernel.enqueue("cm_sdpa_opt_decode", GWS, LWS,
+                               t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, kv_len)
+        reduce_kernel.enqueue("cm_sdpa_opt_decode_reduce", GWS2, LWS2,
+                               t_exp_sums, t_max_logits, t_tmp_out, t_out, num_partitions)
 
     cl.finish()
-    for _ in range(n_warmup):
-        run_once()
+    for i in range(n_warmup):
+        run_once(layers[i % num_layers])
     cl.finish()
-    for _ in range(n_iters):
-        run_once()
+    for i in range(n_iters):
+        run_once(layers[(n_warmup + i) % num_layers])
     raw_ns = cl.finish()
     # [decode, reduce, decode, reduce, ...] -- same event-pairing convention as
     # test_pa_decoding.py's _run_bandwidth_measurement.
@@ -173,9 +191,9 @@ def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
     # test_pa_decoding.py's intermedia_size = batch*heads*partitions*(head_size+1)*4 (fp32).
     inter_bytes = batch * num_heads * num_partitions * (head_size + 1) * 4
 
-    label = f"decode   kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size}"
+    label = f"decode   kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} layers={num_layers}"
     result = report_bw(label, kv_bytes, decode_ms, inter_bytes, reduce_ms)
-    del t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, t_out
+    del layers
     gc.collect()
     return result
 
