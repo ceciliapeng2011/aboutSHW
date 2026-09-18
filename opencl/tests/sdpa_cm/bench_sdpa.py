@@ -390,26 +390,22 @@ if __name__ == "__main__":
         run_case(bench_decode, kv_len)
 
     print("\n=== Stage 3a: SDPA prefill + XAttention (sparse, causal) ===")
-    # Capped at seq_len=4096, the exact shape test_sdpa_prefill_xattn.py's own correctness suite
-    # validates (test_mask_matches_cpu_reference/test_sparse_output_accuracy). Benchmarking at
-    # larger scale, or repeatedly re-invoking the scoring pipeline within one long-running process,
-    # surfaced pre-existing reliability issues in the shared, unmodified x_attn/gemm_qk.cm +
-    # find_block.hpp pipeline (not touched by Stage 3a's wiring, out of scope to fix here):
-    # (1) a hard GPU-side crash (CL_SUCCESS failure inside find_block) at seq_len=32768 for
-    #     thresh<0.99 (reproduced standalone);
-    # (2) the mask density is not run-to-run deterministic at seq_len>=8192 for identical inputs
-    #     (observed 0.33 vs 0.31 across two otherwise-identical invocations) -- likely an
-    #     uninitialized-buffer read in the shared scoring kernels;
-    # (3) repeatedly invoking the scoring pipeline (multiple thresholds/block sizes back to back,
-    #     whether after the prefill/decode sections above or in a dedicated fresh process) has been
-    #     observed to hang indefinitely rather than error out cleanly, of unconfirmed root cause
-    #     (accumulated device-memory pressure is one candidate).
-    # See the report for details; flagged for follow-up, not fixed here. run_case() below skips
-    # cases that raise, but cannot recover from a genuine hang -- if this section stalls, interrupt
-    # and rely on the one validated data point already captured in earlier runs.
+    # Previously capped at seq_len=4096 and guarded against a hard GPU crash at seq_len=32768,
+    # non-deterministic mask density at seq_len>=8192, and hangs under repeated invocation. Root
+    # cause (fixed in x_attn/test_find_block.py + find_block.hpp): find_block's DEBUG_ACC kq_sum
+    # buffer was allocated as np.float16 on the host while the kernel writes SOFTMAX_TYPE (always
+    # 'float', 4 bytes) elements into it -- a 2x undersized buffer whose out-of-bounds device
+    # writes scaled with num_heads * q_block_pad * k_block_pad: silent corruption of unrelated
+    # buffers at smaller sizes (explaining the density non-determinism) and a hard page fault once
+    # the overflow walked past mapped memory at larger sizes (explaining the crash; the hang was
+    # the GPU/driver recovering from that fault). find_block.hpp's causal branch also destructively
+    # overwrote its score buffer in place, made reentrant as a secondary robustness fix (harmless
+    # for this loop's fresh-buffer-per-call pattern, but required for n_repeats>1 perf testing).
+    # Verified: full seq_len range + all thresholds/block sizes now run clean with no crash/hang.
     for sparse_block_size in (256, 128):
         for thresh in (0.99, 0.9, 0.6, 0.3):
-            run_case(bench_xattn_prefill, 4096, sparse_block_size=sparse_block_size, thresh=thresh)
+            for seq_len in (4096, 8192, 16384, 32768):
+                run_case(bench_xattn_prefill, seq_len, sparse_block_size=sparse_block_size, thresh=thresh)
 
     print("\n=== Stage 3a: SDPA prefill + XAttention (fake mask, density sweep, causal) ===")
     # fake_block_mask sidesteps the real scoring pipeline's reliability issues above entirely, so

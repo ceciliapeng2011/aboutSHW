@@ -242,8 +242,6 @@ CM_INLINE void find(uint slm, int m_block,
     SOFTMAX_TYPE s_causal = score_p[causal_start_index + m_block];
     float s_sum = s_0;
     if (causal_start_index + m_block) s_sum += s_causal;
-    score_p[0] = SOFTMAX_TYPE(-1);
-    score_p[causal_start_index + m_block] = SOFTMAX_TYPE(-1);
     uchar* block_mask_p = (uchar*)block_mask;
     auto sorted_value_p = (SOFTMAX_TYPE*)sorted_value;
     auto sorted_index_p = (ushort*)sorted_index;
@@ -272,7 +270,11 @@ CM_INLINE void find(uint slm, int m_block,
         float best_score = -1.f;
         int best_idx = -1;
         for (int k_idx = 1; k_idx <= (int)(causal_start_index + m_block); k_idx++) {
-            if (score_p[k_idx] > best_score) {
+            // Skip already-picked indices via block_mask_p instead of clobbering score_p:
+            // score_p aliases kq_exp_partial_sum, which callers may read again (e.g. a
+            // repeated find_block dispatch against the same gemm_qk output), so the
+            // selection scratch state must not destroy the original scores.
+            if (!block_mask_p[k_idx] && score_p[k_idx] > best_score) {
                 best_score = score_p[k_idx];
                 best_idx = k_idx;
             }
@@ -283,7 +285,6 @@ CM_INLINE void find(uint slm, int m_block,
         sorted_index_p[j] = static_cast<ushort>(best_idx);
         sorted_value_p[j] = best_score;
         block_mask_p[best_idx] = 1;
-        score_p[best_idx] = SOFTMAX_TYPE(-1);
         sum_cur += best_score;
     }
 #if DEBUG_ACC == 1

@@ -94,7 +94,13 @@ class xattn_find_block:
         q_block_input = q_stride_pad // sum_per_n_token_in_block
         q_block_pad = div_up(q_len, self.xattn_block_size)
 
-        t_kq_sum = cl.tensor(np.zeros([batch, num_heads, q_block_input, k_block_pad], dtype=np.float16))
+        # kq_sum must match the kernel's SOFTMAX_TYPE element size (find_block.hpp writes
+        # DEBUG_ACC data as SOFTMAX_TYPE, not always half) -- a hardcoded float16 buffer here
+        # is half the size the kernel writes, causing out-of-bounds device writes that scale
+        # with num_heads * q_block_pad * k_block_pad (silent corruption at small sizes,
+        # hard GPU faults once the overflow walks past mapped memory at large sizes).
+        kq_sum_dtype = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+        t_kq_sum = cl.tensor(np.zeros([batch, num_heads, q_block_input, k_block_pad], dtype=kq_sum_dtype))
 
         # mask shape: [div_up(q_len, xattn_block_size), rnd_up(k_stride, WG_N) / sum_per_n_token_in_block]
         t_mask = cl.tensor(np.zeros([batch, self.num_heads, q_block_pad, k_block_pad], np.int8))
@@ -501,7 +507,9 @@ def run_find_multi_subseq(xattn_block_size, xattn_thresh, HQ=32, HK=8, HEAD_SIZE
         max_q_stride_pad = max(ref['q_stride_pad'] for ref in per_subseq_refs)
         max_k_block_pad = max(ref['k_block_pad'] for ref in per_subseq_refs)
         kq_sum_size = num_subseqs * HQ * (max_q_stride_pad // (xattn_block_size // STRIDE)) * max_k_block_pad
-        t_kq_sum = cl.tensor(np.zeros(kq_sum_size, np.float16))
+        # See the single-subseq __call__ above: kq_sum's dtype must track SOFTMAX_TYPE.
+        kq_sum_dtype = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+        t_kq_sum = cl.tensor(np.zeros(kq_sum_size, kq_sum_dtype))
 
         params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, t_wg_map, xattn_thresh, t_kq_sum]
         cl.finish()
@@ -679,7 +687,9 @@ def run_find_multi_subseq_with_decode(xattn_block_size, xattn_thresh, HQ=32, HK=
         max_q_stride_pad = max(ref['q_stride_pad'] for ref in per_subseq_refs)
         max_k_block_pad = max(ref['k_block_pad'] for ref in per_subseq_refs)
         kq_sum_size = num_subseqs * HQ * (max_q_stride_pad // (xattn_block_size // STRIDE)) * max_k_block_pad
-        t_kq_sum = cl.tensor(np.zeros(kq_sum_size, np.float16))
+        # See the single-subseq __call__ above: kq_sum's dtype must track SOFTMAX_TYPE.
+        kq_sum_dtype = np.float16 if SOFTMAX_TYPE == 'half' else np.float32
+        t_kq_sum = cl.tensor(np.zeros(kq_sum_size, kq_sum_dtype))
 
         params = [t_kq_max_wg, t_kq_exp_partial_sum, t_mask, t_meta, t_wg_map, xattn_thresh, t_kq_sum]
         cl.finish()
