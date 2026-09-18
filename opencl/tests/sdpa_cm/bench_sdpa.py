@@ -1,12 +1,18 @@
 """
 Performance vs. roofline for the SDPA-CM kernels (Stage 1a prefill, Stage 2a decode,
-Stage 3a XAttention-sparse prefill), following pageatten/test_pa.py's exact methodology:
-FLOPs = 2 GEMMs (Q@K^T, P@V) each counted as 2*M*N*K (mul+add), causal self-attention halves
-that (only the lower triangle is computed), and XAttention sparsity scales it further by the
-GPU-measured block-mask density. MFU/utilization formulas and HW_PEAK_FLOPS env convention are
-copied verbatim from test_pa.py so numbers are directly comparable to PA's own roofline reports.
+Stage 3a XAttention-sparse prefill).
 
-Usage: HW_PEAK_FLOPS=31 python bench_sdpa.py
+Prefill/XAttention are compute-bound: FLOPs = 2 GEMMs (Q@K^T, P@V) each counted as 2*M*N*K
+(mul+add), causal self-attention halves that (only the lower triangle is computed), and
+XAttention sparsity scales it further by the GPU-measured block-mask density. MFU/utilization
+formulas and the HW_PEAK_FLOPS env convention are copied verbatim from pageatten/test_pa.py.
+
+Decode is memory-bandwidth-bound instead (a single query token reads the entire KV cache once,
+negligible compute) -- pageatten/test_pa_decoding.py's _run_bandwidth_measurement() roofs it
+against DRAM bandwidth (GB/s), not TFLOPS, and that convention (kv_bytes/time == GB/s, HW_PEAK_BW_GBS
+env var) is mirrored here rather than reusing the FLOPs-based roofline.
+
+Usage: HW_PEAK_FLOPS=31 HW_PEAK_BW_GBS=100 python bench_sdpa.py
 """
 import gc
 import os
@@ -28,6 +34,12 @@ torch.manual_seed(0)
 hw_peak_flops = int(os.environ.get("HW_PEAK_FLOPS", "20"))
 hw_peak_flops = hw_peak_flops * 1e12
 print(f"{hw_peak_flops=}")
+
+# Decode is memory-bandwidth-bound (single query token reads the whole KV cache once, negligible
+# compute), not compute-bound -- pageatten/test_pa_decoding.py's _run_bandwidth_measurement()
+# roofs it against DRAM bandwidth (GB/s), not TFLOPS, for exactly this reason. Mirrored here.
+hw_peak_bw_gbs = float(os.environ.get("HW_PEAK_BW_GBS", "100"))
+print(f"{hw_peak_bw_gbs=}")
 
 
 def flops_for(num_heads, q_len, kv_len, head_size, causal_savings, density=1.0):
@@ -54,6 +66,23 @@ def report(label, total_flops, lat_ms):
         f"{Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak"
     )
     return total_avg, utilization
+
+
+def report_bw(label, kv_bytes, kv_ms, inter_bytes, inter_ms):
+    # bytes / ms * 1e-6 == bytes/ns == GB/s (1 GB/s = 1e9 bytes/1e9 ns = 1 byte/ns), matching
+    # test_pa_decoding.py's kvcache_size*num_runs/total_ns convention exactly.
+    kv_bw = kv_bytes / (kv_ms * 1e6) if kv_ms > 0 else 0.0
+    inter_bw = inter_bytes / (inter_ms * 1e6) if inter_ms > 0 else 0.0
+    utilization = kv_bw / hw_peak_bw_gbs * 100 if hw_peak_bw_gbs > 0 else 0.0
+    print(
+        f"[perf] {label} | "
+        f"KV-read BW {Colors.BOLD}{Colors.GREEN}{kv_bw:,.1f}{Colors.END} GB/s "
+        f"(reduce {inter_bw:,.1f} GB/s), "
+        f"latency(ms): decode={Colors.BOLD}{Colors.YELLOW}{kv_ms:.3f}{Colors.END} "
+        f"reduce={Colors.BOLD}{Colors.YELLOW}{inter_ms:.3f}{Colors.END}, "
+        f"{Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_bw_gbs:.0f} GB/s roofline"
+    )
+    return kv_bw, utilization
 
 
 def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causal=True,
@@ -129,11 +158,23 @@ def bench_decode(kv_len, num_heads=32, num_kv_heads=8, head_size=128, batch=1,
     for _ in range(n_iters):
         run_once()
     raw_ns = cl.finish()
-    per_iter_ms = [(raw_ns[2 * i] + raw_ns[2 * i + 1]) * 1e-6 for i in range(n_iters)]
+    # [decode, reduce, decode, reduce, ...] -- same event-pairing convention as
+    # test_pa_decoding.py's _run_bandwidth_measurement.
+    decode_ns_total = sum(raw_ns[2 * i] for i in range(n_iters))
+    reduce_ns_total = sum(raw_ns[2 * i + 1] for i in range(n_iters))
+    decode_ms = decode_ns_total * 1e-6 / n_iters
+    reduce_ms = reduce_ns_total * 1e-6 / n_iters
 
-    total_flops = flops_for(num_heads, 1, kv_len, head_size, causal_savings=False) * batch
+    # Bandwidth roofline (memory-bound, not compute-bound): one full K+V read per decode step,
+    # dense/no padding (unlike PA's block-cache, which pads kv_len up to a block-size multiple).
+    # kv_cache_quant_utils-style byte layout: fp16 K+V, 2 bytes/elem, 2 tensors.
+    kv_bytes = kv_len * num_kv_heads * head_size * 2 * 2 * batch
+    # Intermediate exp_sums/max_logits/tmp_out traffic the reduce kernel reads, mirroring
+    # test_pa_decoding.py's intermedia_size = batch*heads*partitions*(head_size+1)*4 (fp32).
+    inter_bytes = batch * num_heads * num_partitions * (head_size + 1) * 4
+
     label = f"decode   kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size}"
-    result = report(label, total_flops, per_iter_ms)
+    result = report_bw(label, kv_bytes, decode_ms, inter_bytes, reduce_ms)
     del t_q, t_k, t_v, t_exp_sums, t_max_logits, t_tmp_out, t_out
     gc.collect()
     return result
