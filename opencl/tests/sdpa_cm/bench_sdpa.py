@@ -53,6 +53,34 @@ def flops_for(num_heads, q_len, kv_len, head_size, causal_savings, density=1.0):
     return flops * density
 
 
+def block_mask_density(mask, is_causal):
+    """Fraction of True entries among the blocks the kernel actually VISITS.
+
+    For non-causal, every block is visited, so this is just mask.mean() over the full square.
+
+    For causal, only ~half the [num_q_blocks, num_k_blocks] square (k_block <= q_block) is ever
+    visited -- the kernel's own kv_stop truncation skips the rest outright, it never even loads
+    them. mask.mean() over the FULL square (as bench_sdpa.py originally computed it) therefore
+    reports roughly HALF the density of the visited region alone, and feeding that into
+    flops_for(causal_savings=True, density=...) double-discounts the causal saving: once via the
+    *0.5 causal_savings factor, once again via the density itself already being ~halved by the
+    all-zero future-block half of the square. Net effect: causal total_flops (and hence
+    utilization) was under-reported by roughly 2x, which is what made non-causal utilization look
+    implausibly higher than causal's at matched requested density instead of the expected exactly
+    2x (same mask pattern, non-causal computes the full square instead of just the lower
+    triangle -- see bench_xattn_prefill_synthetic's docstring/plan-doc results for the fixed
+    numbers). Fix: measure density only over the causally-reachable region.
+    """
+    mask = mask.to(torch.bool)
+    if not is_causal:
+        return mask.float().mean().item()
+    B, H, num_q_blocks, num_k_blocks = mask.shape
+    tril = torch.tril(torch.ones(num_q_blocks, num_k_blocks, dtype=torch.bool))
+    visited_true = (mask & tril).sum().item()
+    visited_total = tril.sum().item() * B * H
+    return visited_true / visited_total if visited_total > 0 else 0.0
+
+
 def report(label, total_flops, lat_ms):
     total_avg = sum(lat_ms) / len(lat_ms)
     total_min = min(lat_ms)
@@ -207,7 +235,7 @@ def bench_xattn_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128,
     mask, num_q_blocks, num_k_blocks = xa.build_sparse_mask(
         q.to(torch.float16), k.to(torch.float16), num_heads, num_kv_heads, head_size,
         sparse_block_size, is_causal, thresh)
-    density = mask.float().mean().item()
+    density = block_mask_density(mask, is_causal)
     # Release gemm_qk/find_block's large intermediate device buffers (t_query alone is
     # num_heads*head_size*2*seq_len*2 bytes, e.g. 512MB at seq_len=32768) before allocating the
     # SDPA kernel's own tensors -- avoids cumulative device-memory pressure across many cases.
@@ -273,10 +301,11 @@ def fake_block_mask(num_heads, seq_len, sparse_block_size, density, is_causal, b
 
     Returns (mask, effective_density): mask is [batch, num_heads, num_q_blocks, num_k_blocks]
     bool, the exact block_mask ABI run_prefill_sparse/cm_sdpa_opt_prefill.cm expects.
-    effective_density is measured directly off the returned mask (mask.float().mean()), matching
-    how bench_xattn_prefill derives density from a real GPU-computed mask -- NOT
-    generate_block_mask_with_ratio's own returned density (which doubles the causal case for a
-    different total_flops convention than flops_for() uses here).
+    effective_density is measured via block_mask_density() -- for causal, that's density among
+    only the causally-visited (k_block <= q_block) region, matching how bench_xattn_prefill
+    derives density from a real GPU-computed mask (see block_mask_density's docstring for why a
+    plain full-square mask.mean() is wrong here) -- NOT generate_block_mask_with_ratio's own
+    returned density (which uses a different, incompatible total_flops convention).
     """
     num_q_blocks = (seq_len + sparse_block_size - 1) // sparse_block_size
     num_k_blocks = num_q_blocks
@@ -288,7 +317,7 @@ def fake_block_mask(num_heads, seq_len, sparse_block_size, density, is_causal, b
         g = torch.Generator().manual_seed(seed)
         mask = torch.rand(batch, num_heads, num_q_blocks, num_k_blocks, generator=g) < density
     mask = mask.to(torch.bool)
-    effective_density = mask.float().mean().item()
+    effective_density = block_mask_density(mask, is_causal)
     return mask, effective_density
 
 
