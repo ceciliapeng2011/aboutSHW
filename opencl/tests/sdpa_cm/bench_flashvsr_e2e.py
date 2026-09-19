@@ -35,6 +35,7 @@ Run with: python3 bench_flashvsr_e2e.py
 """
 import gc
 import math
+import os
 
 import numpy as np
 import torch
@@ -47,6 +48,20 @@ import test_sdpa_prefill as base
 import test_sdpa_prefill_xattn as xattn_mod
 
 torch.manual_seed(0)
+
+# Same GFLOPS/utilization convention as bench_sdpa.py's flops_for()/report() (2 GEMMs, 4 FLOPs/MAC,
+# non-causal so no triangle-halving, scaled by block-mask density); HW_PEAK_FLOPS=31 matches this
+# doc's own established convention for this Xe2 Arc GPU's compute roofline (vs. bench_sdpa.py's
+# generic default of 20), overridable via the same env var.
+HW_PEAK_FLOPS = float(os.environ.get("HW_PEAK_FLOPS", "31")) * 1e12
+
+
+def sparse_utilization(q_len, kv_len, density, latency_ms):
+    flops = NUM_HEADS * q_len * kv_len * HEAD_DIM * 4 * density
+    gflops = flops / (latency_ms * 1e6) if latency_ms > 0 else 0.0
+    utilization = flops / (latency_ms * 1e-3) / HW_PEAK_FLOPS * 100 if latency_ms > 0 else 0.0
+    return gflops, utilization
+
 
 # FlashVSR real config: 320x480 portrait source -> 1280x1920 target (4x scale), see report.
 # VAE 8x downsample -> latent 160x240 -> patchify(2x2) -> post-patchify grid h*w=80*120=9600.
@@ -86,14 +101,19 @@ def time_kernel(fn, n_warmup=5, n_iters=20):
     return sum(ns) / len(ns) * 1e-6  # ms
 
 
-def bench_chunk(name, f, cache_groups=0):
+def bench_chunk(name, f, cache_groups=0, topk_ratio=TOPK_RATIO):
     q_groups = f // 2
     k_groups = q_groups + cache_groups  # streaming FIFO cache prepend -- see module docstring
     num_q_windows = SPATIAL_WINDOWS * q_groups
     num_k_windows = SPATIAL_WINDOWS * k_groups
     q_len = num_q_windows * WINDOW_TOKENS
     kv_len = num_k_windows * WINDOW_TOKENS
-    topk = int(SPATIAL_WINDOWS * TOPK_RATIO)
+    # generate_draft_block_mask's `topk` is a GLOBAL top-k count over the flattened
+    # (spatial_windows x num_k_windows) grid per (head, Q-temporal-group) -- see
+    # flashvsr_mask_reference.py's docstring -- so resulting density = topk / (SPATIAL_WINDOWS *
+    # num_k_windows) = topk_ratio / num_k_windows, independent of SPATIAL_WINDOWS itself. Callers
+    # wanting a specific target density can invert that: topk_ratio = target_density * num_k_windows.
+    topk = int(SPATIAL_WINDOWS * topk_ratio)
 
     q_w = make_windowed(num_q_windows, seed=1)
     k_w = make_windowed(num_k_windows, seed=2)
@@ -143,6 +163,14 @@ def bench_chunk(name, f, cache_groups=0):
                                               sparse_block_size=WINDOW_TOKENS, block_mask=mask),
         n_warmup=3, n_iters=10)
 
+    # Dense (density=1.0, no mask/pruning at all) self-attention SDPA on the SAME q/k/v -- the
+    # "full density" reference point: shows what the sparse path is actually buying vs. just
+    # running cm_sdpa_opt_prefill's plain dense kernel and skipping all five mask-gen kernels
+    # entirely. Comparable to bench_sdpa.py's bench_prefill (dense) vs.
+    # bench_xattn_prefill_synthetic (sparse) split, but using the REAL per-chunk shapes here.
+    ms_sdpa_dense = time_kernel(lambda: base.run_prefill(q, k, v, is_causal=False),
+                                 n_warmup=3, n_iters=10)
+
     # Cross-attention, dense, kv_len=512 -- separate op, reported for scale only.
     qc, kc, vc = base.make_qkv(batch=1, num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
                                 q_len=q_len, kv_len=S_CTX, head_size=HEAD_DIM)
@@ -158,30 +186,62 @@ def bench_chunk(name, f, cache_groups=0):
         ("cm_sdpa_opt_prefill (self-attn, sparse)", ms_sdpa_sparse),
     ]
     total_self_attn = sum(ms for _, ms in kernels)
+    # "Full pipeline vs. just running dense" comparison: mask-gen overhead + sparse SDPA vs. a
+    # single dense SDPA call with none of the five mask-gen kernels at all.
+    total_vs_dense_speedup = ms_sdpa_dense / total_self_attn if total_self_attn > 0 else 0.0
 
     print(f"\n=== {name} chunk: f={f} q_len={q_len} kv_len={kv_len} "
           f"(q_groups={q_groups}, k_groups={k_groups}, mask_density={density:.3f}) ===")
     for label, ms in sorted(kernels, key=lambda x: -x[1]):
         pct = ms / total_self_attn * 100 if total_self_attn > 0 else 0.0
         print(f"  {label:<42} {ms:>10.3f} ms  {pct:>5.1f}%")
-    print(f"  {'TOTAL self-attention e2e':<42} {total_self_attn:>10.3f} ms  100.0%")
+    print(f"  {'TOTAL self-attention e2e (sparse+maskgen)':<42} {total_self_attn:>10.3f} ms  100.0%")
+    print(f"  {'[full density] cm_sdpa_opt_prefill (dense)':<42} {ms_sdpa_dense:>10.3f} ms  "
+          f"(speedup vs. sparse+maskgen e2e: {total_vs_dense_speedup:.2f}x)")
     print(f"  {'[separate] cross-attn (kv_len=512)':<42} {ms_cross:>10.3f} ms")
+    gflops, util = sparse_utilization(q_len, kv_len, density, ms_sdpa_sparse)
+    print(f"  cm_sdpa_opt_prefill (sparse) utilization: {gflops:,.0f} GFLOPS, {util:.1f}% of "
+          f"{HW_PEAK_FLOPS/1e12:.0f} TFLOPS peak (density={density:.3f})")
+    gflops_d, util_d = sparse_utilization(q_len, kv_len, 1.0, ms_sdpa_dense)
+    print(f"  cm_sdpa_opt_prefill (dense)  utilization: {gflops_d:,.0f} GFLOPS, {util_d:.1f}% of "
+          f"{HW_PEAK_FLOPS/1e12:.0f} TFLOPS peak (density=1.000)")
 
     del t_qw, t_kw, t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs, t_mask
     gc.collect()
-    return kernels, total_self_attn, ms_cross
+    return kernels, total_self_attn, ms_cross, ms_sdpa_dense
 
 
-if __name__ == "__main__":
-    cl.profiling(True)
-    results = {}
-    for name, cfg in CHUNKS.items():
-        results[name] = bench_chunk(name, cfg["f"], cache_groups=cfg["cache_groups"])
-
-    print("\n=== Hotspot summary (both chunks) ===")
+def print_hotspot_summary(title, results):
+    print(f"\n=== {title} ===")
     agg = {}
-    for name, (kernels, total, _) in results.items():
+    for name, (kernels, total, *_rest) in results.items():
         for label, ms in kernels:
             agg.setdefault(label, []).append(ms)
     for label, values in sorted(agg.items(), key=lambda kv: -max(kv[1])):
         print(f"  {label:<42} steady={values[0]:>10.3f} ms  warmup={values[1]:>10.3f} ms")
+
+
+if __name__ == "__main__":
+    cl.profiling(True)
+
+    results = {}
+    for name, cfg in CHUNKS.items():
+        results[name] = bench_chunk(name, cfg["f"], cache_groups=cfg["cache_groups"])
+    print_hotspot_summary("Hotspot summary (both chunks, FlashVSR draft mask)", results)
+
+    # Density-matched comparison: drive FlashVSR's own mask kernels to XAttention's measured
+    # thresh=0.9 densities (see bench_flashvsr_e2e_xattn.py) via topk_ratio = target_density *
+    # num_k_windows (see bench_chunk's docstring) -- isolates "how efficiently does
+    # cm_sdpa_opt_prefill run at a given density" from "which algorithm's own density is more/less
+    # aggressive" (FlashVSR's production topk_ratio=2.0 targets ~0.3-0.4% density by design).
+    xattn_density = {"steady": 0.713, "warmup": 0.720}
+    results_matched = {}
+    for name, cfg in CHUNKS.items():
+        k_groups = cfg["f"] // 2 + cfg["cache_groups"]
+        num_k_windows = SPATIAL_WINDOWS * k_groups
+        topk_ratio = xattn_density[name] * num_k_windows
+        results_matched[name] = bench_chunk(name, cfg["f"], cache_groups=cfg["cache_groups"],
+                                             topk_ratio=topk_ratio)
+    print_hotspot_summary(
+        "Hotspot summary (both chunks, FlashVSR mask, density-matched to XAttention)",
+        results_matched)

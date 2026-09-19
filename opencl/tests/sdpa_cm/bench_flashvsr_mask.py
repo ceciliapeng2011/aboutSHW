@@ -1,15 +1,29 @@
 """
-Roofline benchmark for the FlashVSR draft-block-mask kernels (flashvsr_draft_gemm.cm,
-flashvsr_draft_topk.cm), at FlashVSR's real per-chunk token counts (see
-test_flashvsr_configs.py's module docstring for the derivation: steady-state chunk = 19200
-tokens = 150 windows, warm-up chunk = 57600 tokens = 450 windows, at NUM_HEADS=12, HEAD_DIM=128,
-window=128 tokens, spatial_windows=150 for the 320x480->1280x1920 case).
+Roofline/utilization benchmark for all four FlashVSR draft-block-mask kernels
+(flashvsr_draft_gemm.cm's flashvsr_pool/flashvsr_score, flashvsr_draft_topk.cm's
+flashvsr_softmax/flashvsr_topk_mask). This is the BASELINE this module records before any
+optimization work lands (see the plan doc for the radix-select/fusion changes this baseline is
+meant to be compared against) -- every kernel reports a roofline utilization number (GFLOPS vs.
+HW_PEAK_FLOPS for compute-bound flashvsr_score, GB/s vs. HW_PEAK_BW_GBS for the
+bandwidth/pass-count-bound flashvsr_pool/flashvsr_softmax/flashvsr_topk_mask), swept across:
+  1. seqlen (SEQLEN_SWEEP_WINDOWS -- num_windows from well below to well above FlashVSR's own
+     150/450-window chunk sizes),
+  2. density/topk (DENSITY_SWEEP -- flashvsr_topk_mask only, since it's the only one of the four
+     kernels whose input actually depends on the requested top-k/density; includes 1.0 as the
+     "full density" / no-pruning reference point),
+  3. FlashVSR's real steady-state/warm-up chunk shapes (150/450 windows, topk=300) as a distinct
+     labeled section, matching bench_flashvsr_e2e.py's real end-to-end configs.
 
-flashvsr_pool is expected to be memory-bandwidth-bound (reads the full windowed Q/K, same order
-of bytes as the main SDPA op); roofed against DRAM bandwidth like bench_sdpa.py's bench_decode.
-flashvsr_score/flashvsr_softmax operate on tiny pooled data, expected fast regardless.
-flashvsr_topk_mask's cost is dominated by its own algorithm (this is the one worth watching for
-regressions as it's optimized -- see the module's design-tradeoff comment in flashvsr_draft_topk.cm).
+flashvsr_pool is memory-bandwidth-bound (reads the full windowed Q/K, same order of bytes as the
+main SDPA op); roofed against DRAM bandwidth like bench_sdpa.py's bench_decode.
+flashvsr_score is nominally compute-bound but tiny (pooled vectors only) -- its GFLOPS utilization
+number is expected to be very low (a naive scalar dot-product loop, not a matrix-engine GEMM; see
+the plan doc's Stage C), which this baseline makes visible directly instead of only reporting a
+latency number that looks fast in isolation.
+flashvsr_topk_mask's cost is dominated by its own algorithm (16 full-array binary-search passes,
+independent of the requested topk/density -- expect its GB/s-equivalent number to look roughly
+flat across DENSITY_SWEEP here, which is itself a baseline finding, not a bug) -- this is the one
+worth watching most closely for regressions/improvements as it's optimized.
 """
 import gc
 import os
@@ -25,6 +39,9 @@ import flashvsr_mask_adapter as gpu_mod
 torch.manual_seed(0)
 
 hw_peak_bw_gbs = float(os.environ.get("HW_PEAK_BW_GBS", "100"))
+# Same env convention as bench_sdpa.py -- lets this script's flashvsr_score utilization be
+# compared apples-to-apples against cm_sdpa_opt_prefill's own GFLOPS/utilization numbers.
+hw_peak_flops = float(os.environ.get("HW_PEAK_FLOPS", "20")) * 1e12
 
 
 def report_bw(label, bytes_moved, ms):
@@ -36,6 +53,19 @@ def report_bw(label, bytes_moved, ms):
         f"latency(ms)={Colors.BOLD}{Colors.YELLOW}{ms:.3f}{Colors.END}, "
         f"{Colors.BOLD}{Colors.GREEN}{utilization:.1f}%{Colors.END} of {hw_peak_bw_gbs:.0f} GB/s roofline"
     )
+    return bw, utilization
+
+
+def report_gflops(label, flops, ms):
+    gflops = flops / (ms * 1e6) if ms > 0 else 0.0
+    utilization = flops / (ms * 1e-3) / hw_peak_flops * 100 if ms > 0 and hw_peak_flops > 0 else 0.0
+    print(
+        f"[perf] {label} | "
+        f"GFLOPS {Colors.BOLD}{Colors.GREEN}{gflops:,.0f}{Colors.END}, "
+        f"latency(ms)={Colors.BOLD}{Colors.YELLOW}{ms:.3f}{Colors.END}, "
+        f"{Colors.BOLD}{Colors.GREEN}{utilization:.2f}%{Colors.END} of {hw_peak_flops/1e12:.0f} TFLOPS XMX peak"
+    )
+    return gflops, utilization
 
 
 def report_ms(label, ms):
@@ -84,9 +114,14 @@ def bench_score(num_q_windows, num_k_windows, spatial_windows, num_heads=12, hea
         kernel.enqueue("flashvsr_score", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
-    report_ms(f"score num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}", avg)
+    # Single QK^T-like GEMM (no PV, unlike full attention): 2 FLOPs (mul+add) per
+    # (head, q_window, k_window, head_dim) MAC, same *2 convention as bench_sdpa.py's flops_for.
+    flops = 2 * num_heads * num_q_windows * num_k_windows * head_dim
+    result = report_gflops(
+        f"score num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}", flops, avg)
     del t_q, t_k, t_mask, t_scores
     gc.collect()
+    return result
 
 
 def bench_softmax(num_q_windows, num_k_windows, num_heads=12, n_warmup=5, n_iters=20):
@@ -104,9 +139,16 @@ def bench_softmax(num_q_windows, num_k_windows, num_heads=12, n_warmup=5, n_iter
         kernel.enqueue("flashvsr_softmax", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
-    report_ms(f"softmax num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}", avg)
+    # 3 full-row passes over raw_scores (fp32): pass1 read-only (max), pass2 read+write in place
+    # (exp+sum), pass3 read + write half probs (normalize) -> (4+8+4+2)=18 bytes/element total.
+    n = num_heads * num_q_windows * num_k_windows
+    total_bytes = n * 18
+    result = report_bw(
+        f"softmax num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}",
+        total_bytes, avg)
     del t_raw, t_probs
     gc.collect()
+    return result
 
 
 def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
@@ -126,28 +168,72 @@ def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
         kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, 1], [1, 1, 1], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
-    report_ms(f"topk_mask spatial={spatial_windows:<4} groups={num_groups} num_k={num_k_windows:<4} "
-              f"n/group={spatial_windows*num_k_windows:<7} topk={topk} heads={num_heads}", avg)
+    # 16 full-array passes (binary search) reading the ushort-sized bit pattern, plus 1 final
+    # pass reading (2B) + writing (1B) the mask -- expressed as an effective-bandwidth number so
+    # it's directly comparable before/after an algorithm change that reduces the pass count (e.g.
+    # a radix-select would cut this to 4 passes, and this formula would report ~4x more GB/s at
+    # the same wall-clock improvement).
+    n_total = num_heads * num_q_windows * num_k_windows
+    total_bytes = n_total * (16 * 2 + 2 + 1)
+    density = topk / (spatial_windows * num_k_windows) if spatial_windows * num_k_windows > 0 else 0.0
+    result = report_bw(
+        f"topk_mask spatial={spatial_windows:<4} groups={num_groups} num_k={num_k_windows:<4} "
+        f"n/group={spatial_windows*num_k_windows:<7} topk={topk:<6} density={density:.3f} "
+        f"heads={num_heads}", total_bytes, avg)
     del t_probs, t_mask
     gc.collect()
+    return result
+
+
+# Seqlen sweep (num_windows swept directly -- WINDOW_TOKENS=128 elsewhere converts to tokens),
+# covering well below/above FlashVSR's own real chunk sizes (150/450 windows).
+SEQLEN_SWEEP_WINDOWS = [64, 150, 256, 450, 600, 900]
+
+# Density sweep for flashvsr_topk_mask -- 1.0 is the "full density" (topk covers every element,
+# i.e. no pruning at all) reference point requested alongside the sparse sweep, so the
+# always-scans-everything binary search's cost-vs-density-independence is visible directly (it's
+# expected to be roughly flat across this list, since the algorithm always does the same 16
+# full-array passes regardless of the requested topk/density -- that flatness is itself a
+# baseline finding worth recording before Stage A's radix-select changes it).
+DENSITY_SWEEP = [1.0, 0.5, 0.1, 0.03, 0.01, 0.004]  # 0.004 matches FlashVSR's real measured density
 
 
 if __name__ == "__main__":
     cl.profiling(True)
 
-    print("\n=== flashvsr_pool (bandwidth-bound) ===")
-    for num_windows in [150, 450]:  # steady / warm-up chunk window counts
+    print("\n=== flashvsr_pool (bandwidth-bound) -- seqlen sweep ===")
+    for num_windows in SEQLEN_SWEEP_WINDOWS:
         bench_pool(num_windows)
 
-    print("\n=== flashvsr_score ===")
+    print("\n=== flashvsr_score -- seqlen sweep (num_groups=1, spatial_windows=num_windows) ===")
+    for num_windows in SEQLEN_SWEEP_WINDOWS:
+        bench_score(num_windows, num_windows, spatial_windows=num_windows)
+
+    print("\n=== flashvsr_softmax -- seqlen sweep ===")
+    for num_windows in SEQLEN_SWEEP_WINDOWS:
+        bench_softmax(num_windows, num_windows)
+
+    print("\n=== flashvsr_topk_mask -- seqlen sweep (spatial=150, topk fixed at 300 i.e. TOPK_RATIO=2) ===")
+    for num_k_windows in SEQLEN_SWEEP_WINDOWS:
+        bench_topk(spatial_windows=150, num_groups=1, num_k_windows=num_k_windows, topk=300)
+
+    print("\n=== flashvsr_topk_mask -- density sweep (spatial=150, num_k_windows=450, incl. full density=1.0) ===")
+    n_per_group = 150 * 450
+    for density in DENSITY_SWEEP:
+        topk = max(1, int(n_per_group * density))
+        bench_topk(spatial_windows=150, num_groups=1, num_k_windows=450, topk=topk)
+
+    print("\n=== FlashVSR real workload (steady/warm-up chunk shapes) ===")
+    print("-- flashvsr_pool --")
+    for num_windows in [150, 450]:  # steady / warm-up chunk window counts
+        bench_pool(num_windows)
+    print("-- flashvsr_score --")
     bench_score(150, 150, spatial_windows=150)
     bench_score(450, 450, spatial_windows=150)
-
-    print("\n=== flashvsr_softmax ===")
+    print("-- flashvsr_softmax --")
     bench_softmax(150, 150)
     bench_softmax(450, 450)
-
-    print("\n=== flashvsr_topk_mask ===")
+    print("-- flashvsr_topk_mask --")
     # steady-state chunk: 1 temporal group, 150 spatial windows, kv from cache (~450) + current
     bench_topk(spatial_windows=150, num_groups=1, num_k_windows=450, topk=300)
     # warm-up chunk: 3 temporal groups, 150 spatial windows each, no cache yet (kv==q==450)
