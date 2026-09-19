@@ -56,8 +56,26 @@ void show(const matrix<T, M, N> mat) {
 #endif
 
 // https://gpuopen.com/download/Introduction_to_GPU_Radix_Sort.pdf
+//
+// Sortable-key width tracks TYPE's own width (via KeyT below), so this radix
+// sort works for any sign-magnitude float-like TYPE -- currently `half`
+// (16-bit) and `float` (32-bit) are the only instantiations (see
+// find_block.hpp's `sort<SOFTMAX_TYPE>` call). Previously this was hardcoded
+// for 16-bit keys: the float<->sortable-uint conversion only ran for `half`,
+// and the counting/reorder/copy-out passes always read/wrote 16-bit `ushort`
+// chunks regardless of TYPE. For `float` (SOFTMAX_TYPE='float', the value
+// every x_attn caller actually uses) this silently reinterpreted each 4-byte
+// score as two independent 16-bit keys, scrambling the sort -- a
+// never-exercised bug since no x_attn test ran the non-causal branch (the
+// only caller of this function) with causal=False. Index arrays
+// (sorted_index/sort_tmp) stay 16-bit regardless of TYPE -- they hold
+// positions in [0, n), which fits ushort for all realistic block counts.
 template<typename TYPE>
 CM_INLINE void sort(uint slm, svmptr_t src, svmptr_t sorted_value, svmptr_t sorted_index, svmptr_t sort_tmp, uint n) {
+    using KeyT = typename std::conditional<sizeof(TYPE) == 4, unsigned, ushort>::type;
+    constexpr int NUM_PASSES = (int)sizeof(KeyT) * 8 / 4;   // 4 bits/pass radix sort
+    constexpr int INT_CHUNKS = (NUM_THREADS * (int)sizeof(KeyT)) / (int)sizeof(int);
+
     const ushort THREADS = NUM_THREADS;
     vector<unsigned, THREADS> seq_u32;
     vector<ushort, THREADS> seq;
@@ -70,40 +88,39 @@ CM_INLINE void sort(uint slm, svmptr_t src, svmptr_t sorted_value, svmptr_t sort
     uint iter = (n + THREADS - 1) / THREADS;
     vector<unsigned, THREADS> offset_src;
     cmtl::cm_vector_assign(offset_src.select_all(), 0, iter);
-    auto f16_u16 = [] (vector_ref<half, THREADS> in, vector_ref<ushort, THREADS> out) {
-        static const ushort HIGH_BIT = 1 << 15;
-        auto in_u16 = in.format<ushort>();
-        auto mask = (in_u16 & HIGH_BIT) != 0;
-        vector<ushort, THREADS> m;
-        m.merge(ushort{0xffff}, HIGH_BIT, mask);
-        out = in_u16 ^ m;
+    auto to_sortable = [] (vector_ref<TYPE, THREADS> in, vector_ref<KeyT, THREADS> out) {
+        static const KeyT HIGH_BIT = KeyT(1) << (sizeof(KeyT) * 8 - 1);
+        auto in_u = in.format<KeyT>();
+        auto mask = (in_u & HIGH_BIT) != 0;
+        vector<KeyT, THREADS> m;
+        m.merge((KeyT)~KeyT(0), HIGH_BIT, mask);
+        out = in_u ^ m;
     };
-    auto u16_f16 = [] (vector_ref<ushort, THREADS> in, vector_ref<half, THREADS> out) {
-        static const ushort HIGH_BIT = 1 << 15;
+    auto from_sortable = [] (vector_ref<KeyT, THREADS> in, vector_ref<TYPE, THREADS> out) {
+        static const KeyT HIGH_BIT = KeyT(1) << (sizeof(KeyT) * 8 - 1);
         auto mask = (in & HIGH_BIT) != 0;
-        vector<ushort, THREADS> m;
-        m.merge(HIGH_BIT, ushort{0xffff}, mask);
-        out.format<ushort>() = in ^ m;
+        vector<KeyT, THREADS> m;
+        m.merge(HIGH_BIT, (KeyT)~KeyT(0), mask);
+        out.format<KeyT>() = in ^ m;
     };
-    if constexpr(std::is_same<TYPE, half>::value) {
-        {
-            // f16 to u16
-            vector<ushort, THREADS> data;
-            vector<half, THREADS> data_f;
-            int i;
-            for (i = 0; i + THREADS <= n / THREADS * THREADS; i += THREADS) {
-                data_f.format<int>() = cm_ptr_load<int, THREADS / 2>((int*)src, i * (int)sizeof(short));
-                f16_u16(data_f, data);
-                cm_ptr_store<int, THREADS / 2>((int*)src, i * (int)sizeof(short), data.format<int>());
-            }
-            if (i < n) {
-                auto pos = seq_u32 + i;
-                SIMD_IF_BEGIN (pos < n) {
-                    data_f = cm_ptr_load<half>((half*)src, pos * (uint)sizeof(half));
-                    f16_u16(data_f, data);
-                    cm_ptr_store<ushort>((ushort*)src, pos * (uint)sizeof(ushort), data);
-                } SIMD_IF_END;
-            }
+    {
+        // TYPE -> sortable KeyT, in place (always -- for any sign-magnitude
+        // float type, not just half)
+        vector<KeyT, THREADS> data;
+        vector<TYPE, THREADS> data_f;
+        int i;
+        for (i = 0; i + THREADS <= n / THREADS * THREADS; i += THREADS) {
+            data_f.format<int>() = cm_ptr_load<int, INT_CHUNKS>((int*)src, i * (int)sizeof(TYPE));
+            to_sortable(data_f, data);
+            cm_ptr_store<int, INT_CHUNKS>((int*)src, i * (int)sizeof(KeyT), data.format<int>());
+        }
+        if (i < n) {
+            auto pos = seq_u32 + i;
+            SIMD_IF_BEGIN (pos < n) {
+                data_f = cm_ptr_load<TYPE>((TYPE*)src, pos * (uint)sizeof(TYPE));
+                to_sortable(data_f, data);
+                cm_ptr_store<KeyT>((KeyT*)src, pos * (uint)sizeof(KeyT), data);
+            } SIMD_IF_END;
         }
     }
     {
@@ -123,19 +140,22 @@ CM_INLINE void sort(uint slm, svmptr_t src, svmptr_t sorted_value, svmptr_t sort
             } SIMD_IF_END;
         }
     }
-    // 4bit per pass, 4 pass for f16
-    for (int pass = 0; pass < 4; pass++) {
+    // 4 bits per pass, NUM_PASSES passes to cover all of KeyT's bits (4 for
+    // 16-bit half keys, 8 for 32-bit float keys)
+    for (int pass = 0; pass < NUM_PASSES; pass++) {
         {
-            // slm layout: short [16][work items] = 16*32*2 bytes
+            // slm layout: short [16][work items] = 16*32*2 bytes -- bucket
+            // histogram counts, always 16 buckets of ushort regardless of
+            // KeyT's width
             vector<int, 64> data = 0;
             for (int i = 0; i < 16 * THREADS * sizeof(ushort); i += 256)
                 cm_slm_block_write(slm, i, data);
         }
         {
             // counting phase
-            vector<ushort, THREADS> data;
+            vector<KeyT, THREADS> data;
             for (int i = 0; i < iter; i++) {
-                data = cm_ptr_load<ushort>((ushort*)sorted_src, (offset_src + i) * (uint)sizeof(ushort), (offset_src + i) < n);
+                data = cm_ptr_load<KeyT>((KeyT*)sorted_src, (offset_src + i) * (uint)sizeof(KeyT), (offset_src + i) < n);
                 vector<ushort, THREADS> bits = 0xf - ((data >> (pass * 4)) & 0xf);
                 vector<ushort, THREADS> addr = bits * THREADS + seq;
                 vector<ushort, THREADS> total;
@@ -176,18 +196,21 @@ CM_INLINE void sort(uint slm, svmptr_t src, svmptr_t sorted_value, svmptr_t sort
         }
         {
             // reorder
-            vector<ushort, THREADS> data;
+            vector<KeyT, THREADS> data;
             for (int i = 0; i < iter; i++) {
-                data = cm_ptr_load((ushort*)sorted_src, (offset_src + i) * (uint)sizeof(ushort), (offset_src + i) < n);
+                data = cm_ptr_load<KeyT>((KeyT*)sorted_src, (offset_src + i) * (uint)sizeof(KeyT), (offset_src + i) < n);
                 vector<ushort, THREADS> bits = 0xf - ((data >> (pass * 4)) & 0xf);
                 vector<ushort, THREADS> addr = bits * THREADS + seq;
                 vector<ushort, THREADS> index;
                 cm_slm_read(slm, addr, index);
-                vector<unsigned, THREADS> offset_i32 = index * (uint)sizeof(ushort);
-                cm_ptr_store((ushort*)sorted_tmp, offset_i32, data, index < n);
+                // Two separate byte offsets: the key/value array is KeyT-wide
+                // (tracks TYPE), but the index array is always ushort-wide.
+                vector<unsigned, THREADS> offset_val = index * (uint)sizeof(KeyT);
+                cm_ptr_store<KeyT>((KeyT*)sorted_tmp, offset_val, data, index < n);
 
-                data = cm_ptr_load((ushort*)cur_idx, (offset_src + i) * (uint)sizeof(ushort));
-                cm_ptr_store((ushort*)cur_idx_tmp, offset_i32, data, (offset_src + i) < n);
+                vector<ushort, THREADS> idx_data = cm_ptr_load<ushort>((ushort*)cur_idx, (offset_src + i) * (uint)sizeof(ushort));
+                vector<unsigned, THREADS> offset_idx = index * (uint)sizeof(ushort);
+                cm_ptr_store<ushort>((ushort*)cur_idx_tmp, offset_idx, idx_data, (offset_src + i) < n);
 
                 index += 1;
                 cm_slm_write(slm, addr, index);
@@ -201,33 +224,25 @@ CM_INLINE void sort(uint slm, svmptr_t src, svmptr_t sorted_value, svmptr_t sort
         }
     }
     {
-        // copy to output
-        vector<ushort, THREADS> data;
-        vector<half, THREADS> data_f;
+        // copy to output: KeyT (sortable) -> TYPE, always (for any
+        // sign-magnitude float type). NUM_PASSES is even for every supported
+        // TYPE (KeyT's bit-width is a multiple of 8), so the sorted keys end
+        // up back in `src` (not `sorted_src`) after the ping-pong loop above.
+        vector<KeyT, THREADS> data;
+        vector<TYPE, THREADS> data_f;
         int i;
         for (i = 0; i + THREADS <= n / THREADS * THREADS; i += THREADS) {
-            data.format<int>() = cm_ptr_load<int, THREADS / 2>((int*)src, i * (int)sizeof(short));
-            if constexpr(std::is_same<TYPE, half>::value) {
-                u16_f16(data, data_f);
-                cm_ptr_store<int, THREADS / 2>((int*)sorted_value, i * (int)sizeof(short), data_f.format<int>());
-            } else {
-                cm_ptr_store<int, THREADS / 2>((int*)sorted_value, i * (int)sizeof(short), data.format<int>());
-            }
+            data.format<int>() = cm_ptr_load<int, INT_CHUNKS>((int*)src, i * (int)sizeof(KeyT));
+            from_sortable(data, data_f);
+            cm_ptr_store<int, INT_CHUNKS>((int*)sorted_value, i * (int)sizeof(TYPE), data_f.format<int>());
         }
         if (i < n) {
             auto pos = seq_u32 + i;
-            if constexpr(std::is_same<TYPE, half>::value) {
-                SIMD_IF_BEGIN (pos < n) {
-                    data = cm_ptr_load((ushort*)src, pos * (uint)sizeof(half));
-                    u16_f16(data, data_f);
-                    cm_ptr_store<half>((half*)sorted_value, pos * (uint)sizeof(half), data_f);
-                } SIMD_IF_END;
-            } else {
-                SIMD_IF_BEGIN (pos < n) {
-                    data = cm_ptr_load((ushort*)src, pos * (uint)sizeof(ushort));
-                    cm_ptr_store<ushort>((ushort*)sorted_value, pos * (uint)sizeof(ushort), data);
-                } SIMD_IF_END;
-            }
+            SIMD_IF_BEGIN (pos < n) {
+                data = cm_ptr_load<KeyT>((KeyT*)src, pos * (uint)sizeof(KeyT));
+                from_sortable(data, data_f);
+                cm_ptr_store<TYPE>((TYPE*)sorted_value, pos * (uint)sizeof(TYPE), data_f);
+            } SIMD_IF_END;
         }
     }
 }

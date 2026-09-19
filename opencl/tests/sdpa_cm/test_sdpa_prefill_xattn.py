@@ -1,16 +1,20 @@
 """
 Stage 3a: XAttention block-sparse 2nd stage wired onto cm_sdpa_opt_prefill.cm.
 
-Root-cause note (see final report): x_attn/find_block.hpp's non-causal branch calls
-sort.hpp's `sort<SOFTMAX_TYPE>`, a radix sort hardcoded for 16-bit (`half`) sort keys (it only
-byte-converts float->sortable-uint for `half` inputs; for `float` it silently reinterprets the
-score buffer as raw ushort pairs). Every x_attn test in this repo hardcodes SOFTMAX_TYPE='float'
-and none of them exercise causal=False, so this appears to be a pre-existing, never-exercised bug
-in shared x_attn infra, confirmed empirically here (GPU mask vs CPU find_blocks_ref reference
-diverges completely -- ~50% match, density insensitive to threshold -- for causal=False, while the
-causal path matches the CPU reference exactly). It is unrelated to and out of scope for this
-stage's SDPA-kernel wiring; this suite therefore validates exclusively through the causal path,
-which is XAttention's primary use case (autoregressive long-context prefill) anyway.
+Root-cause note, now fixed (see opencl/tests/x_attn/sort.hpp): find_block.hpp's non-causal
+branch calls sort.hpp's `sort<SOFTMAX_TYPE>`, a radix sort that was hardcoded for 16-bit (`half`)
+sort keys -- it only byte-converted float->sortable-uint for `half` inputs, and its
+counting/reorder/copy-out passes always read/wrote 16-bit `ushort` chunks regardless of TYPE. Every
+x_attn test in this repo hardcodes SOFTMAX_TYPE='float', and none of them exercised causal=False,
+so this was a pre-existing, never-exercised bug in shared x_attn infra -- confirmed empirically
+here before the fix (GPU mask vs CPU find_blocks_ref reference diverged completely, ~50% match,
+density insensitive to threshold, for causal=False, while the causal path matched the CPU reference
+exactly). sort.hpp now generalizes the sortable-key width to TYPE's own size (KeyT), so `float`
+sorts correctly; `test_mask_matches_cpu_reference_non_causal` below exercises it (98.8-100% match
+at representative thresholds, on par with the causal path's own tie-tolerant comparison). Separately
+(unrelated to sort.hpp, not fixed here): find_block.hpp's non-causal loop bound (`j < k_block_pad -
+1`) never considers the single lowest-scoring block, unlike the causal branch's equivalent loop
+(`j < k_block_pad`) -- only visible at thresholds near 1.0 that require literally every block.
 """
 import functools
 import os
@@ -162,6 +166,25 @@ def test_mask_matches_cpu_reference():
     match_frac = (mask[:, :, :qb, :kb] == mask_ref).float().mean().item()
     assert match_frac >= 0.99, f"mask match_frac={match_frac} too low at thresh=0.9"
     print("test_mask_matches_cpu_reference PASSED")
+
+
+def test_mask_matches_cpu_reference_non_causal():
+    # Regression test for the sort.hpp bug documented in this file's module docstring: the
+    # non-causal branch's radix sort (sort<SOFTMAX_TYPE>) was hardcoded for 16-bit `half` keys and
+    # silently scrambled `float` scores, making this path's mask ~50%-random garbage. Thresholds
+    # here deliberately stay below ~0.94 (this shape's max reachable density) to avoid the
+    # separate, unrelated find_block.hpp loop-bound edge case noted in the module docstring.
+    q, k, v = base.make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=4096, kv_len=4096, head_size=64)
+    q, k = q.float().half(), k.float().half()
+    mask, _, _ = xa.build_sparse_mask(q, k, 4, 4, 64, 256, False, 0.6)
+    mask_ref, qb, kb = xa.cpu_reference_mask(q, k, 256, False, 0.6)
+    assert torch.equal(mask[:, :, :qb, :kb], mask_ref), "mask mismatch at thresh=0.6 (expected exact)"
+
+    mask, _, _ = xa.build_sparse_mask(q, k, 4, 4, 64, 256, False, 0.85)
+    mask_ref, qb, kb = xa.cpu_reference_mask(q, k, 256, False, 0.85)
+    match_frac = (mask[:, :, :qb, :kb] == mask_ref).float().mean().item()
+    assert match_frac >= 0.99, f"mask match_frac={match_frac} too low at thresh=0.85"
+    print("test_mask_matches_cpu_reference_non_causal PASSED")
 
 
 # ---------------------------------------------------------------------------
