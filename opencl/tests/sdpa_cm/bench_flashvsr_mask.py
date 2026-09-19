@@ -160,12 +160,20 @@ def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
     t_mask = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.uint8))
     args = [t_probs, t_mask, num_q_windows, num_k_windows, spatial_windows, topk]
 
+    # LWS's 3rd dim MUST be TOPK_LOCAL_SIZE -- the kernel's cooperative-binary-search workgroup
+    # width (flashvsr_mask_adapter.py/bench_flashvsr_e2e.py both dispatch it this way). LWS=[1,1,1]
+    # (this function's own value until fixed here) leaves lid==0 as the ONLY work item while the
+    # kernel body still divides work as if TOPK_LOCAL_SIZE=32 threads existed side by side (`for i
+    # = lid; i < n; i += LOCAL_SIZE`), so a single thread only ever visits 1/32 of the elements and
+    # the cross-lane SLM reduction reads 31 never-written slots -- silently WRONG results, not just
+    # a different perf profile.
+    ls = gpu_mod.TOPK_LOCAL_SIZE
     cl.finish()
     for _ in range(n_warmup):
-        kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, 1], [1, 1, 1], *args)
+        kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, ls], [1, 1, ls], *args)
     cl.finish()
     for _ in range(n_iters):
-        kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, 1], [1, 1, 1], *args)
+        kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, ls], [1, 1, ls], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
     # 16 full-array passes (binary search) reading the ushort-sized bit pattern, plus 1 final
