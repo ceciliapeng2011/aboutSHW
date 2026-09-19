@@ -11,10 +11,16 @@ here before the fix (GPU mask vs CPU find_blocks_ref reference diverged complete
 density insensitive to threshold, for causal=False, while the causal path matched the CPU reference
 exactly). sort.hpp now generalizes the sortable-key width to TYPE's own size (KeyT), so `float`
 sorts correctly; `test_mask_matches_cpu_reference_non_causal` below exercises it (98.8-100% match
-at representative thresholds, on par with the causal path's own tie-tolerant comparison). Separately
-(unrelated to sort.hpp, not fixed here): find_block.hpp's non-causal loop bound (`j < k_block_pad -
-1`) never considers the single lowest-scoring block, unlike the causal branch's equivalent loop
-(`j < k_block_pad`) -- only visible at thresholds near 1.0 that require literally every block.
+at representative thresholds, on par with the causal path's own tie-tolerant comparison).
+
+A second, separate bug was found and fixed alongside it: find_block.hpp's non-causal selection
+loop bound was `j < k_block_pad - 1`, never considering the single lowest-scoring block as a
+selection candidate (unlike the causal branch's equivalent loop, `j < k_block_pad`). Invisible at
+ordinary thresholds since one out of many blocks rarely tips a mismatch, but at thresholds near 1.0
+(requiring literally every block) the mask could never reach full density -- fixed by extending the
+loop bound to `k_block_pad` and guarding the DEBUG_ACC-only `acc_score_p[j + 1]` write (which has no
+slot for the now-reachable `j == k_block_pad - 1` case) rather than writing one element past the
+buffer. `test_mask_reaches_full_density_near_threshold_one` below exercises it.
 """
 import functools
 import os
@@ -171,9 +177,7 @@ def test_mask_matches_cpu_reference():
 def test_mask_matches_cpu_reference_non_causal():
     # Regression test for the sort.hpp bug documented in this file's module docstring: the
     # non-causal branch's radix sort (sort<SOFTMAX_TYPE>) was hardcoded for 16-bit `half` keys and
-    # silently scrambled `float` scores, making this path's mask ~50%-random garbage. Thresholds
-    # here deliberately stay below ~0.94 (this shape's max reachable density) to avoid the
-    # separate, unrelated find_block.hpp loop-bound edge case noted in the module docstring.
+    # silently scrambled `float` scores, making this path's mask ~50%-random garbage.
     q, k, v = base.make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=4096, kv_len=4096, head_size=64)
     q, k = q.float().half(), k.float().half()
     mask, _, _ = xa.build_sparse_mask(q, k, 4, 4, 64, 256, False, 0.6)
@@ -185,6 +189,21 @@ def test_mask_matches_cpu_reference_non_causal():
     match_frac = (mask[:, :, :qb, :kb] == mask_ref).float().mean().item()
     assert match_frac >= 0.99, f"mask match_frac={match_frac} too low at thresh=0.85"
     print("test_mask_matches_cpu_reference_non_causal PASSED")
+
+
+def test_mask_reaches_full_density_near_threshold_one():
+    # Regression test for the find_block.hpp loop-bound bug documented in this file's module
+    # docstring: the non-causal selection loop stopped at `k_block_pad - 1`, so the single
+    # lowest-scoring block was never a selection candidate. At thresh=1.0 (require literally every
+    # block, cumulative_sum_without_self always < required_sum) the CPU reference always reaches
+    # full density -- pre-fix the GPU mask plateaued one block short of it.
+    q, k, v = base.make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=4096, kv_len=4096, head_size=64)
+    q, k = q.float().half(), k.float().half()
+    mask, _, _ = xa.build_sparse_mask(q, k, 4, 4, 64, 256, False, 1.0)
+    mask_ref, qb, kb = xa.cpu_reference_mask(q, k, 256, False, 1.0)
+    assert torch.equal(mask[:, :, :qb, :kb], mask_ref), "mask mismatch at thresh=1.0 (expected exact, full density)"
+    assert mask_ref.float().mean().item() == 1.0, "sanity: thresh=1.0 should require every block"
+    print("test_mask_reaches_full_density_near_threshold_one PASSED")
 
 
 # ---------------------------------------------------------------------------

@@ -308,10 +308,20 @@ CM_INLINE void find(uint slm, int m_block,
     acc_score_p[0] = 0;
 #endif
     int j;
-    for (j = 0; j < k_block_pad - 1; j++) {
+    // Loop bound is k_block_pad (not k_block_pad - 1): every sorted rank, including the single
+    // lowest-scoring one, must be a selection candidate to match find_blocks_ref's CPU reference
+    // (which sweeps cumulative_sum_without_self over the full K_block range) and the causal
+    // branch's own `j < k_block_pad` bound above. Previously the last rank was never considered,
+    // which only mattered at thresholds near 1.0 (requiring literally every block) -- there,
+    // the mask could never reach full density.
+    for (j = 0; j < k_block_pad; j++) {
         sum_cur += sorted_value_p[j];
 #if DEBUG_ACC == 1
-        acc_score_p[j + 1] = sum_cur;
+        // acc_score_p has only k_block_pad valid slots (0..k_block_pad-1); the cumulative sum
+        // after including all k_block_pad ranks has no slot to record into, so skip that one
+        // debug write rather than writing one element past the buffer.
+        if (j + 1 < k_block_pad)
+            acc_score_p[j + 1] = sum_cur;
 #endif
         if (sum_cur < thresh_act) {
             block_mask_p[sorted_index_p[j]] = 1;
@@ -321,9 +331,10 @@ CM_INLINE void find(uint slm, int m_block,
         }
     }
 #if DEBUG_ACC == 1
-    for (j = j + 1; j < k_block_pad - 1; j++) {
+    for (j = j + 1; j < k_block_pad; j++) {
         sum_cur += sorted_value_p[j];
-        acc_score_p[j + 1] = sum_cur;
+        if (j + 1 < k_block_pad)
+            acc_score_p[j + 1] = sum_cur;
     }
 #endif
 
