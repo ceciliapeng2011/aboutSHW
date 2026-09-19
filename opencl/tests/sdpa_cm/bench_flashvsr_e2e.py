@@ -54,13 +54,26 @@ torch.manual_seed(0)
 # doc's own established convention for this Xe2 Arc GPU's compute roofline (vs. bench_sdpa.py's
 # generic default of 20), overridable via the same env var.
 HW_PEAK_FLOPS = float(os.environ.get("HW_PEAK_FLOPS", "31")) * 1e12
+# Same env convention as bench_flashvsr_mask.py -- lets the mask-gen kernels' (pool/softmax/
+# topk_mask) bandwidth-roofline utilization numbers be compared directly against that script's.
+HW_PEAK_BW_GBS = float(os.environ.get("HW_PEAK_BW_GBS", "100"))
+
+
+def flops_util(flops, ms):
+    gflops = flops / (ms * 1e6) if ms > 0 else 0.0
+    utilization = flops / (ms * 1e-3) / HW_PEAK_FLOPS * 100 if ms > 0 else 0.0
+    return gflops, utilization
+
+
+def bw_util(total_bytes, ms):
+    bw = total_bytes / (ms * 1e6) if ms > 0 else 0.0
+    utilization = bw / HW_PEAK_BW_GBS * 100 if HW_PEAK_BW_GBS > 0 else 0.0
+    return bw, utilization
 
 
 def sparse_utilization(q_len, kv_len, density, latency_ms):
     flops = NUM_HEADS * q_len * kv_len * HEAD_DIM * 4 * density
-    gflops = flops / (latency_ms * 1e6) if latency_ms > 0 else 0.0
-    utilization = flops / (latency_ms * 1e-3) / HW_PEAK_FLOPS * 100 if latency_ms > 0 else 0.0
-    return gflops, utilization
+    return flops_util(flops, latency_ms)
 
 
 # FlashVSR real config: 320x480 portrait source -> 1280x1920 target (4x scale), see report.
