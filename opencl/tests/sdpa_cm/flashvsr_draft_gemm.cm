@@ -17,16 +17,25 @@
 // On-device stage 1/2 of FlashVSR's generate_draft_block_mask (see
 // FlashVSR/diffsynth/models/wan_video_dit.py:116-153 and
 // sdpa_cm/flashvsr_mask_reference.py for the vendored torch ground truth):
-//   flashvsr_pool  -- mean-pool a windowed [num_windows,WINDOW_TOKENS,NUM_HEADS*HEAD_DIM] half
-//                     tensor over the WINDOW_TOKENS dim, per head -> pooled
-//                     [num_windows,NUM_HEADS,HEAD_DIM] half. Bandwidth-bound: reads the full
-//                     windowed Q/K, same order of bytes as the main attention op itself.
-//                     Called once for Q, once for K.
-//   flashvsr_score -- block-level QK^T on the pooled vectors, scaled by 1/sqrt(HEAD_DIM), plus
-//                     the tiled static local-spatial-window additive mask
-//                     (build_local_block_mask_shifted_vec_normal_slide's output). Tiny compute
-//                     (pooled vectors only); output is pre-softmax raw scores, softmax itself
-//                     lives in flashvsr_draft_topk.cm (needs the full row before it can start).
+//   flashvsr_pool         -- mean-pool a windowed [num_windows,WINDOW_TOKENS,NUM_HEADS*HEAD_DIM]
+//                            half tensor over the WINDOW_TOKENS dim, per head -> pooled
+//                            [num_windows,NUM_HEADS,HEAD_DIM] half. Bandwidth-bound: reads the
+//                            full windowed Q/K, same order of bytes as the main attention op
+//                            itself. Called once for Q, once for K.
+//   flashvsr_score_softmax -- block-level QK^T on the pooled vectors, scaled by 1/sqrt(HEAD_DIM),
+//                            plus the tiled static local-spatial-window additive mask
+//                            (build_local_block_mask_shifted_vec_normal_slide's output), fused
+//                            with the row-wise softmax that used to be a separate
+//                            flashvsr_softmax kernel launch (flashvsr_draft_topk.cm). The
+//                            score-computing loop already visits every element of the row once
+//                            while computing the dot product, so it tracks a running row-max in
+//                            that same pass for free -- eliminating softmax's dedicated max-scan
+//                            pass entirely (same trick as x_attn/estimate.hpp's GEMM-output ->
+//                            online-softmax fusion). Net: 4 row-touches across 2 kernel launches
+//                            (old flashvsr_score + flashvsr_softmax) drop to 3 row-touches in 1
+//                            launch. Output is half probabilities (half chosen so the top-k step
+//                            in flashvsr_draft_topk.cm can treat each value's raw bit pattern as
+//                            a monotonic sort key directly).
 //
 #include <cm/cm.h>
 #include <cm/cmtl.h>
@@ -80,17 +89,22 @@ extern "C" _GENX_MAIN_ void flashvsr_pool(
 //   across every (Q-temporal-group, K-temporal-group) pair via modulo-spatial-window addressing
 //   (l % spatial_windows, m % spatial_windows), matching generate_draft_block_mask's
 //   `repeat(repeat_len,1,repeat_num,1)` tiling exactly without materializing the full [l,m] mask.
-// raw_scores: [NUM_HEADS, num_q_windows, num_k_windows] float, output (pre-softmax).
+// raw_scores: [NUM_HEADS, num_q_windows, num_k_windows] float, scratch -- this kernel's own
+//   inter-pass working buffer (still needed since num_k_windows is runtime-sized and can't live
+//   in registers/a fixed-size vector); not read by any caller.
+// probs: [NUM_HEADS, num_q_windows, num_k_windows] half, softmax output (always >= 0).
 // GWS: [num_q_windows, NUM_HEADS, 1], LWS: [1,1,1].
-extern "C" _GENX_MAIN_ void flashvsr_score(
+extern "C" _GENX_MAIN_ void flashvsr_score_softmax(
     half* pooled_q ATTR,
     half* pooled_k ATTR,
     uchar* local_mask ATTR,
     float* raw_scores ATTR,
+    half* probs ATTR,
     int num_q_windows,
     int num_k_windows,
     int spatial_windows,
     float scale) {
+    constexpr float log2e = 1.4426950408889634f;
     uint l = cm_group_id(0);
     uint h = cm_group_id(1);
 
@@ -103,6 +117,9 @@ extern "C" _GENX_MAIN_ void flashvsr_score(
 
     uint out_row_off = (h * (uint)num_q_windows + l) * (uint)num_k_windows;
 
+    // Pass 1: dot product + local mask (unchanged math from the old flashvsr_score), also
+    // tracking a running row_max for free in this same loop.
+    float row_max = -3.0e38f;
     for (int m = 0; m < num_k_windows; m++) {
         vector<half, HEAD_DIM> kv;
         kv.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)m * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
@@ -116,6 +133,23 @@ extern "C" _GENX_MAIN_ void flashvsr_score(
         if (!keep) score = -1.0e9f;
 
         raw_scores[out_row_off + (uint)m] = score;
+        row_max = cm_max<float>(row_max, score);
+    }
+
+    // Pass 2: exp + accumulate sum (unchanged from the old flashvsr_softmax's 2nd pass).
+    float sum = 0.0f;
+    for (int m = 0; m < num_k_windows; m++) {
+        float v = raw_scores[out_row_off + (uint)m];
+        float e = cm_exp((v - row_max) * log2e); // cm_exp == exp2, so this is exp(v - row_max)
+        sum += e;
+        raw_scores[out_row_off + (uint)m] = e;
+    }
+
+    // Pass 3: normalize (unchanged from the old flashvsr_softmax's 3rd pass).
+    float inv_sum = 1.0f / sum;
+    for (int m = 0; m < num_k_windows; m++) {
+        float e = raw_scores[out_row_off + (uint)m];
+        probs[out_row_off + (uint)m] = (half)(e * inv_sum);
     }
 }
 

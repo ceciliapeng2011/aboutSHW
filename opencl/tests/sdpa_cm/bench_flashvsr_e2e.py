@@ -35,12 +35,15 @@ For each chunk shape, __main__ prints:
   [1] bench_dense_reference -- cm_sdpa_opt_prefill's plain DENSE kernel time + GFLOPS utilization,
       no mask-gen kernels at all (the "what if we just skip sparsity" baseline).
   [2] bench_sparse_at_density -- swept across DENSITY_SWEEP (plus FlashVSR's own real production
-      density derived from TOPK_RATIO) -- a per-kernel table (pool x2, score, softmax, topk_mask,
-      sparse SDPA) with time, a roofline utilization number (GFLOPS or GB/s depending on whether
-      the kernel is compute- or bandwidth-bound), % of that density's total kernel time, and the
-      summed total kernel time.
-This is the BASELINE this module records before any optimization work lands on the mask-gen
-kernels (see the plan doc's Stage A/B/C radix-select/fusion changes).
+      density derived from TOPK_RATIO) -- a per-kernel table (pool x2, score_softmax (fused),
+      topk_mask, sparse SDPA) with time, a roofline utilization number (GFLOPS or GB/s depending
+      on whether the kernel is compute- or bandwidth-bound), % of that density's total kernel
+      time, and the summed total kernel time.
+Reflects the Stage A (4-pass MSD radix-select in flashvsr_topk_mask, replacing a 16-iteration
+binary search) and Stage B (flashvsr_score+flashvsr_softmax fused into flashvsr_score_softmax)
+optimizations -- see flashvsr_draft_topk.cm's and flashvsr_draft_gemm.cm's headers for the
+per-kernel design notes, and bench_flashvsr_mask.py for the isolated per-kernel microbenchmarks
+these changes were validated against.
 
 Run with: python3 bench_flashvsr_e2e.py
 """
@@ -160,10 +163,10 @@ def bench_dense_reference(name, f, cache_groups=0):
 
 
 def bench_sparse_at_density(name, f, cache_groups, density):
-    """[2] Full mask-gen pipeline (pool x2, score, softmax, topk_mask) + sparse SDPA at a
+    """[2] Full mask-gen pipeline (pool x2, score_softmax (fused), topk_mask) + sparse SDPA at a
     requested block-mask density, reporting per-kernel time/utilization/% of total, plus the
-    summed total kernel time -- the baseline table Stage A/B/C's optimizations are measured
-    against. `density` is inverted to flashvsr_mask_reference's `topk` GLOBAL top-k count via
+    summed total kernel time. `density` is inverted to flashvsr_mask_reference's `topk` GLOBAL
+    top-k count via
     topk_ratio = density * num_k_windows (see flashvsr_mask_reference.py's docstring: density =
     topk / (SPATIAL_WINDOWS * num_k_windows) = topk_ratio / num_k_windows)."""
     q_groups = f // 2
@@ -195,16 +198,12 @@ def bench_sparse_at_density(name, f, cache_groups, density):
 
     t_local_mask = cl.tensor(local_mask.to(torch.uint8).contiguous().numpy())
     t_raw_scores = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.float32))
-    scale = 1.0 / math.sqrt(HEAD_DIM)
-    ms_score = time_kernel(lambda: gemm_kernel.enqueue(
-        "flashvsr_score", [num_q_windows, NUM_HEADS, 1], [1, 1, 1],
-        t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores,
-        num_q_windows, num_k_windows, SPATIAL_WINDOWS, scale))
-
     t_probs = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.float16))
-    ms_softmax = time_kernel(lambda: topk_kernel.enqueue(
-        "flashvsr_softmax", [num_q_windows, NUM_HEADS, 1], [1, 1, 1],
-        t_raw_scores, t_probs, num_k_windows))
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    ms_score_softmax = time_kernel(lambda: gemm_kernel.enqueue(
+        "flashvsr_score_softmax", [num_q_windows, NUM_HEADS, 1], [1, 1, 1],
+        t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs,
+        num_q_windows, num_k_windows, SPATIAL_WINDOWS, scale))
 
     t_mask = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.uint8))
     ls = gpu_mod.TOPK_LOCAL_SIZE
@@ -223,31 +222,29 @@ def bench_sparse_at_density(name, f, cache_groups, density):
                                               sparse_block_size=WINDOW_TOKENS, block_mask=mask),
         n_warmup=3, n_iters=10)
 
-    # Per-kernel utilization -- formulas match bench_flashvsr_mask.py's bench_score/bench_softmax/
+    # Per-kernel utilization -- formulas match bench_flashvsr_mask.py's bench_score_softmax/
     # bench_topk exactly, so the two scripts' numbers are directly comparable. flashvsr_pool/
-    # flashvsr_softmax/flashvsr_topk_mask are bandwidth-rooflined (elementwise/pass-count bound,
-    # topk_mask's "GB/s" is an effective/equivalent number given it's really SLM-barrier-bound, not
-    # a literal DRAM bandwidth measurement -- see bench_flashvsr_mask.py's module docstring);
-    # flashvsr_score and the sparse SDPA call are compute-rooflined.
+    # flashvsr_topk_mask are bandwidth-rooflined (elementwise/pass-count bound, topk_mask's "GB/s"
+    # is an effective/equivalent number given it's really SLM-barrier-bound, not a literal DRAM
+    # bandwidth measurement -- see bench_flashvsr_mask.py's module docstring); flashvsr_score_
+    # softmax's FLOPs-based number only reflects the QK^T dot product (softmax's own row-touches
+    # are bandwidth, not FLOPs) and the sparse SDPA call is compute-rooflined.
     pool_q_bytes = num_q_windows * WINDOW_TOKENS * NUM_HEADS * HEAD_DIM * 2
     pool_k_bytes = num_k_windows * WINDOW_TOKENS * NUM_HEADS * HEAD_DIM * 2
     score_flops = 2 * NUM_HEADS * num_q_windows * num_k_windows * HEAD_DIM
     n_probs = NUM_HEADS * num_q_windows * num_k_windows
-    softmax_bytes = n_probs * 18
-    topk_bytes = n_probs * (16 * 2 + 2 + 1)
+    topk_bytes = n_probs * (4 * 2 + 2 + 1)
 
     bw_pq, u_pq = bw_util(pool_q_bytes, ms_pool_q)
     bw_pk, u_pk = bw_util(pool_k_bytes, ms_pool_k)
-    gf_sc, u_sc = flops_util(score_flops, ms_score)
-    bw_sm, u_sm = bw_util(softmax_bytes, ms_softmax)
+    gf_sc, u_sc = flops_util(score_flops, ms_score_softmax)
     bw_tk, u_tk = bw_util(topk_bytes, ms_topk)
     gf_sp, u_sp = sparse_utilization(q_len, kv_len, measured_density, ms_sdpa_sparse)
 
     kernels = [
         ("flashvsr_pool(Q)", ms_pool_q, f"{bw_pq:8,.1f} GB/s", u_pq),
         ("flashvsr_pool(K)", ms_pool_k, f"{bw_pk:8,.1f} GB/s", u_pk),
-        ("flashvsr_score", ms_score, f"{gf_sc:8,.0f} GFLOPS", u_sc),
-        ("flashvsr_softmax", ms_softmax, f"{bw_sm:8,.1f} GB/s", u_sm),
+        ("flashvsr_score_softmax", ms_score_softmax, f"{gf_sc:8,.0f} GFLOPS", u_sc),
         ("flashvsr_topk_mask", ms_topk, f"{bw_tk:8,.1f} GB/s*", u_tk),
         ("cm_sdpa_opt_prefill (sparse)", ms_sdpa_sparse, f"{gf_sp:8,.0f} GFLOPS", u_sp),
     ]

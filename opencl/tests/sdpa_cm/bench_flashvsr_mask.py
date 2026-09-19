@@ -1,14 +1,12 @@
 """
-Roofline/utilization benchmark for all four FlashVSR draft-block-mask kernels
-(flashvsr_draft_gemm.cm's flashvsr_pool/flashvsr_score, flashvsr_draft_topk.cm's
-flashvsr_softmax/flashvsr_topk_mask). This is the BASELINE this module records before any
-optimization work lands (see the plan doc for the radix-select/fusion changes this baseline is
-meant to be compared against) -- every kernel reports a roofline utilization number (GFLOPS vs.
-HW_PEAK_FLOPS for compute-bound flashvsr_score, GB/s vs. HW_PEAK_BW_GBS for the
-bandwidth/pass-count-bound flashvsr_pool/flashvsr_softmax/flashvsr_topk_mask), swept across:
+Roofline/utilization benchmark for the three FlashVSR draft-block-mask kernels
+(flashvsr_draft_gemm.cm's flashvsr_pool/flashvsr_score_softmax, flashvsr_draft_topk.cm's
+flashvsr_topk_mask) -- every kernel reports a roofline utilization number (GFLOPS vs.
+HW_PEAK_FLOPS for compute-bound flashvsr_score_softmax, GB/s vs. HW_PEAK_BW_GBS for the
+bandwidth/pass-count-bound flashvsr_pool/flashvsr_topk_mask), swept across:
   1. seqlen (SEQLEN_SWEEP_WINDOWS -- num_windows from well below to well above FlashVSR's own
      150/450-window chunk sizes),
-  2. density/topk (DENSITY_SWEEP -- flashvsr_topk_mask only, since it's the only one of the four
+  2. density/topk (DENSITY_SWEEP -- flashvsr_topk_mask only, since it's the only one of the three
      kernels whose input actually depends on the requested top-k/density; includes 1.0 as the
      "full density" / no-pruning reference point),
   3. FlashVSR's real steady-state/warm-up chunk shapes (150/450 windows, topk=300) as a distinct
@@ -16,14 +14,17 @@ bandwidth/pass-count-bound flashvsr_pool/flashvsr_softmax/flashvsr_topk_mask), s
 
 flashvsr_pool is memory-bandwidth-bound (reads the full windowed Q/K, same order of bytes as the
 main SDPA op); roofed against DRAM bandwidth like bench_sdpa.py's bench_decode.
-flashvsr_score is nominally compute-bound but tiny (pooled vectors only) -- its GFLOPS utilization
-number is expected to be very low (a naive scalar dot-product loop, not a matrix-engine GEMM; see
-the plan doc's Stage C), which this baseline makes visible directly instead of only reporting a
-latency number that looks fast in isolation.
-flashvsr_topk_mask's cost is dominated by its own algorithm (16 full-array binary-search passes,
-independent of the requested topk/density -- expect its GB/s-equivalent number to look roughly
-flat across DENSITY_SWEEP here, which is itself a baseline finding, not a bug) -- this is the one
-worth watching most closely for regressions/improvements as it's optimized.
+flashvsr_score_softmax's QK^T dot product is nominally compute-bound but tiny (pooled vectors
+only) -- its GFLOPS utilization number (which covers only the dot product, not the fused
+softmax's own bandwidth-bound row-touches) is expected to be very low (a naive scalar
+dot-product loop, not a matrix-engine GEMM; see the plan doc's Stage C), which this benchmark
+makes visible directly instead of only reporting a latency number that looks fast in isolation.
+flashvsr_topk_mask now finds its threshold via a 4-pass, 4-bit-per-pass MSD radix-select
+(previously a 16-iteration bit-by-bit binary search -- see flashvsr_draft_topk.cm's header for the
+x_attn/sort.hpp-inspired technique) -- its cost is dominated by those 4 full-array passes,
+independent of the requested topk/density, so its GB/s-equivalent number is expected to stay
+roughly flat across DENSITY_SWEEP, same as before the optimization, just ~3-4x fewer bytes moved
+at the same wall-clock improvement.
 """
 import gc
 import os
@@ -93,8 +94,8 @@ def bench_pool(num_windows, num_heads=12, head_dim=128, window_tokens=128, n_war
     gc.collect()
 
 
-def bench_score(num_q_windows, num_k_windows, spatial_windows, num_heads=12, head_dim=128,
-                 n_warmup=5, n_iters=20):
+def bench_score_softmax(num_q_windows, num_k_windows, spatial_windows, num_heads=12, head_dim=128,
+                         n_warmup=5, n_iters=20):
     kernel = gpu_mod._get_gemm_kernel(num_heads, head_dim, 128)
     pooled_q = torch.randn(num_q_windows, num_heads, head_dim, dtype=torch.float16).numpy()
     pooled_k = torch.randn(num_k_windows, num_heads, head_dim, dtype=torch.float16).numpy()
@@ -103,50 +104,28 @@ def bench_score(num_q_windows, num_k_windows, spatial_windows, num_heads=12, hea
     t_k = cl.tensor(pooled_k)
     t_mask = cl.tensor(local_mask)
     t_scores = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float32))
+    t_probs = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float16))
     scale = 1.0 / (head_dim ** 0.5)
-    args = [t_q, t_k, t_mask, t_scores, num_q_windows, num_k_windows, spatial_windows, scale]
+    args = [t_q, t_k, t_mask, t_scores, t_probs, num_q_windows, num_k_windows, spatial_windows, scale]
 
     cl.finish()
     for _ in range(n_warmup):
-        kernel.enqueue("flashvsr_score", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
+        kernel.enqueue("flashvsr_score_softmax", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
     cl.finish()
     for _ in range(n_iters):
-        kernel.enqueue("flashvsr_score", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
+        kernel.enqueue("flashvsr_score_softmax", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
     # Single QK^T-like GEMM (no PV, unlike full attention): 2 FLOPs (mul+add) per
     # (head, q_window, k_window, head_dim) MAC, same *2 convention as bench_sdpa.py's flops_for.
+    # (Softmax's own 3 row-touches are bandwidth, not FLOPs, so they're not folded into this
+    # number -- this reports the fused kernel's compute-roofline utilization the same way the old
+    # standalone flashvsr_score did, just now timing the whole fused kernel's wall-clock.)
     flops = 2 * num_heads * num_q_windows * num_k_windows * head_dim
     result = report_gflops(
-        f"score num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}", flops, avg)
-    del t_q, t_k, t_mask, t_scores
-    gc.collect()
-    return result
-
-
-def bench_softmax(num_q_windows, num_k_windows, num_heads=12, n_warmup=5, n_iters=20):
-    kernel = gpu_mod._get_topk_kernel(num_heads)
-    raw = torch.randn(num_heads, num_q_windows, num_k_windows, dtype=torch.float32).numpy()
-    t_raw = cl.tensor(raw)
-    t_probs = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float16))
-    args = [t_raw, t_probs, num_k_windows]
-
-    cl.finish()
-    for _ in range(n_warmup):
-        kernel.enqueue("flashvsr_softmax", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
-    cl.finish()
-    for _ in range(n_iters):
-        kernel.enqueue("flashvsr_softmax", [num_q_windows, num_heads, 1], [1, 1, 1], *args)
-    lat_ms = [ns * 1e-6 for ns in cl.finish()]
-    avg = sum(lat_ms) / len(lat_ms)
-    # 3 full-row passes over raw_scores (fp32): pass1 read-only (max), pass2 read+write in place
-    # (exp+sum), pass3 read + write half probs (normalize) -> (4+8+4+2)=18 bytes/element total.
-    n = num_heads * num_q_windows * num_k_windows
-    total_bytes = n * 18
-    result = report_bw(
-        f"softmax num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}",
-        total_bytes, avg)
-    del t_raw, t_probs
+        f"score_softmax num_q={num_q_windows:<4} num_k={num_k_windows:<4} heads={num_heads}",
+        flops, avg)
+    del t_q, t_k, t_mask, t_scores, t_probs
     gc.collect()
     return result
 
@@ -176,13 +155,10 @@ def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
         kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, ls], [1, 1, ls], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
-    # 16 full-array passes (binary search) reading the ushort-sized bit pattern, plus 1 final
-    # pass reading (2B) + writing (1B) the mask -- expressed as an effective-bandwidth number so
-    # it's directly comparable before/after an algorithm change that reduces the pass count (e.g.
-    # a radix-select would cut this to 4 passes, and this formula would report ~4x more GB/s at
-    # the same wall-clock improvement).
+    # 4 full-array passes (4-bit-per-pass MSD radix-select, see flashvsr_draft_topk.cm) reading
+    # the ushort-sized bit pattern, plus 1 final pass reading (2B) + writing (1B) the mask.
     n_total = num_heads * num_q_windows * num_k_windows
-    total_bytes = n_total * (16 * 2 + 2 + 1)
+    total_bytes = n_total * (4 * 2 + 2 + 1)
     density = topk / (spatial_windows * num_k_windows) if spatial_windows * num_k_windows > 0 else 0.0
     result = report_bw(
         f"topk_mask spatial={spatial_windows:<4} groups={num_groups} num_k={num_k_windows:<4} "
@@ -213,13 +189,9 @@ if __name__ == "__main__":
     for num_windows in SEQLEN_SWEEP_WINDOWS:
         bench_pool(num_windows)
 
-    print("\n=== flashvsr_score -- seqlen sweep (num_groups=1, spatial_windows=num_windows) ===")
+    print("\n=== flashvsr_score_softmax -- seqlen sweep (num_groups=1, spatial_windows=num_windows) ===")
     for num_windows in SEQLEN_SWEEP_WINDOWS:
-        bench_score(num_windows, num_windows, spatial_windows=num_windows)
-
-    print("\n=== flashvsr_softmax -- seqlen sweep ===")
-    for num_windows in SEQLEN_SWEEP_WINDOWS:
-        bench_softmax(num_windows, num_windows)
+        bench_score_softmax(num_windows, num_windows, spatial_windows=num_windows)
 
     print("\n=== flashvsr_topk_mask -- seqlen sweep (spatial=150, topk fixed at 300 i.e. TOPK_RATIO=2) ===")
     for num_k_windows in SEQLEN_SWEEP_WINDOWS:
@@ -235,12 +207,9 @@ if __name__ == "__main__":
     print("-- flashvsr_pool --")
     for num_windows in [150, 450]:  # steady / warm-up chunk window counts
         bench_pool(num_windows)
-    print("-- flashvsr_score --")
-    bench_score(150, 150, spatial_windows=150)
-    bench_score(450, 450, spatial_windows=150)
-    print("-- flashvsr_softmax --")
-    bench_softmax(150, 150)
-    bench_softmax(450, 450)
+    print("-- flashvsr_score_softmax --")
+    bench_score_softmax(150, 150, spatial_windows=150)
+    bench_score_softmax(450, 450, spatial_windows=150)
     print("-- flashvsr_topk_mask --")
     # steady-state chunk: 1 temporal group, 150 spatial windows, kv from cache (~450) + current
     bench_topk(spatial_windows=150, num_groups=1, num_k_windows=450, topk=300)

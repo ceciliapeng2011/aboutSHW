@@ -14,27 +14,29 @@
  * limitations under the License.
  *******************************************************************************/
 //
-// Stage 3/4 of FlashVSR's generate_draft_block_mask (see flashvsr_draft_gemm.cm's header for
-// stages 1/2):
-//   flashvsr_softmax    -- row-wise softmax of flashvsr_draft_gemm.cm's raw (local-masked)
-//                          scores -> half probabilities (half chosen so the top-k step below can
-//                          treat each value's raw bit pattern as a monotonic sort key directly).
+// Stage 3 of FlashVSR's generate_draft_block_mask (see flashvsr_draft_gemm.cm's header for stages
+// 1/2, which now include the row-wise softmax fused into flashvsr_score_softmax):
 //   flashvsr_topk_mask  -- the part that differs fundamentally from X-Attention's
 //                          xattn_find_block.cm: a GLOBAL top-k over the flattened
 //                          (spatial_windows * num_k_windows) elements of one
 //                          (head, Q-temporal-group), not a per-row threshold.
 //
 // Deliberate deviation from the original plan: rather than reusing x_attn/sort.hpp's radix
-// `sort<half>` (whose index arrays are `ushort`, capped at 65535), this finds the top-k
-// threshold via a binary search on the fp16 raw bit pattern (softmax outputs are always >= 0,
-// so IEEE754 bit pattern order already matches value order for the range actually produced here
-// -- no half<->sortable-uint transform needed): each of ~15 iterations counts how many elements
-// exceed a candidate bit-pattern threshold, converging on the exact (topk+1)-th-largest value,
-// exactly like generate_draft_block_mask's `torch.topk(...).values[:,-1]`. FlashVSR's own
-// production scale (warm-up chunk: spatial_windows=150 * num_k_windows=450 = 67500 elements per
-// group) exceeds sort.hpp's ushort index range, which the binary-search approach has no bound on
-// (only extra read passes, not a correctness ceiling) -- see the implementation plan's Stage 2
-// note for the analysis that motivated this switch.
+// `sort<half>` (whose index arrays are `ushort`, capped at 65535, and which also produces a full
+// reorder/permutation we don't need), this finds the top-k threshold via a **4-pass, 4-bit-per-pass
+// MSD radix-select** on the fp16 raw bit pattern (softmax outputs are always >= 0, so IEEE754 bit
+// pattern order already matches value order for the range actually produced here -- no
+// half<->sortable-uint transform needed): each pass buckets the elements still consistent with the
+// prefix decided so far into 16 histogram buckets (same histogram-in-SLM idea as
+// x_attn/sort.hpp:143-196's radix-sort counting phase, just without the reorder/scatter step since
+// only the rank-th VALUE is wanted, not a full sorted permutation), then narrows to the bucket
+// containing the target rank -- converging on the exact (topk+1)-th-largest value in 4 full-array
+// passes instead of the single-bit binary search's 16, exactly like
+// generate_draft_block_mask's `torch.topk(...).values[:,-1]`. FlashVSR's own production scale
+// (warm-up chunk: spatial_windows=150 * num_k_windows=450 = 67500 elements per group) exceeds
+// sort.hpp's ushort index range, which this rank-only approach has no bound on at all (it never
+// allocates a per-element index array) -- see the implementation plan's Stage 2 note for the
+// analysis that motivated avoiding `sort<TYPE>()` here.
 //
 #include <cm/cm.h>
 #include <cm/cmtl.h>
@@ -49,39 +51,6 @@ namespace KERNEL_NAME {
 #define NUM_HEADS 12
 #endif
 
-// raw_scores: [NUM_HEADS, num_q_windows, num_k_windows] float (flashvsr_score's output).
-// probs:      [NUM_HEADS, num_q_windows, num_k_windows] half (softmax output; always >= 0).
-// GWS: [num_q_windows, NUM_HEADS, 1], LWS: [1,1,1].
-extern "C" _GENX_MAIN_ void flashvsr_softmax(
-    float* raw_scores ATTR,
-    half* probs ATTR,
-    int num_k_windows) {
-    constexpr float log2e = 1.4426950408889634f;
-    uint l = cm_group_id(0);
-    uint h = cm_group_id(1);
-    uint row_off = (h * (uint)cm_group_count(0) + l) * (uint)num_k_windows;
-
-    float row_max = -3.0e38f;
-    for (int m = 0; m < num_k_windows; m++) {
-        float v = raw_scores[row_off + (uint)m];
-        row_max = cm_max<float>(row_max, v);
-    }
-
-    float sum = 0.0f;
-    for (int m = 0; m < num_k_windows; m++) {
-        float v = raw_scores[row_off + (uint)m];
-        float e = cm_exp((v - row_max) * log2e); // cm_exp == exp2, so this is exp(v - row_max)
-        sum += e;
-        raw_scores[row_off + (uint)m] = e;
-    }
-
-    float inv_sum = 1.0f / sum;
-    for (int m = 0; m < num_k_windows; m++) {
-        float e = raw_scores[row_off + (uint)m];
-        probs[row_off + (uint)m] = (half)(e * inv_sum);
-    }
-}
-
 #ifndef TOPK_LOCAL_SIZE
 #define TOPK_LOCAL_SIZE 32
 #endif
@@ -94,11 +63,12 @@ extern "C" _GENX_MAIN_ void flashvsr_softmax(
 //   one contiguous spatial_windows*num_k_windows slice of probs (rows
 //   [g*spatial_windows,(g+1)*spatial_windows) of head h) -- contiguous because probs is row-major
 //   over (h, l, m) and a temporal group is a contiguous run of l. The TOPK_LOCAL_SIZE work items
-//   within that workgroup split the slice's n elements (strided) and cooperatively binary-search
-//   the top-k threshold via an SLM partial-count reduction each of the ~16 iterations --
-//   parallelizes the single-thread-per-group binary search that otherwise leaves this kernel
-//   using a tiny fraction of the GPU's EUs (measured ~72ms/call at FlashVSR's warm-up-chunk scale
-//   with TOPK_LOCAL_SIZE=1; see bench_flashvsr_mask.py).
+//   within that workgroup split the slice's n elements (strided) and cooperatively find the
+//   top-k threshold via a 4-pass MSD radix-select (see file header) with an SLM histogram
+//   reduction each pass -- parallelizes what was originally a single-thread binary search that
+//   left this kernel using a tiny fraction of the GPU's EUs (measured ~72ms/call at FlashVSR's
+//   warm-up-chunk scale with TOPK_LOCAL_SIZE=1 and the old bit-by-bit search; see
+//   bench_flashvsr_mask.py).
 extern "C" _GENX_MAIN_ void flashvsr_topk_mask(
     half* probs ATTR,
     uchar* mask_out ATTR,
@@ -107,11 +77,20 @@ extern "C" _GENX_MAIN_ void flashvsr_topk_mask(
     int spatial_windows,
     int topk) {
     constexpr uint LOCAL_SIZE = TOPK_LOCAL_SIZE;
+    constexpr uint NUM_BUCKETS = 16;
     uint h = cm_group_id(0);
     uint g = cm_group_id(1);
     uint lid = cm_local_id(2);
 
-    const uint slm_size = (LOCAL_SIZE + 1) * (uint)sizeof(int);
+    // SLM layout: NUM_BUCKETS*LOCAL_SIZE ints, bucket-major (bucket*LOCAL_SIZE+lane) so lane 0 can
+    // reduce each bucket's LOCAL_SIZE partial counts with one contiguous cm_sum -- each lane owns
+    // an exclusive column of this region, so no cross-lane races on the scatter-store below -- then
+    // 1 int for the shared `prefix` (bit pattern decided so far) and 1 int for the shared
+    // `remaining_rank`, both broadcast to every lane between passes.
+    const uint hist_bytes = NUM_BUCKETS * LOCAL_SIZE * (uint)sizeof(int);
+    const uint prefix_off = hist_bytes;
+    const uint rank_off = prefix_off + (uint)sizeof(int);
+    const uint slm_size = rank_off + (uint)sizeof(int);
     cm_slm_init(slm_size);
     auto slm = cm_slm_alloc(slm_size);
 
@@ -126,33 +105,88 @@ extern "C" _GENX_MAIN_ void flashvsr_topk_mask(
     // compared as an unsigned integer, already preserves value order -- no half<->sortable-uint
     // sign-flip transform needed (that's only required for values that can be negative).
     ushort* probs_bits = (ushort*)probs;
-    ushort lo = 0;
-    ushort hi = 0x7fff;
-    for (int iter = 0; iter < 16; iter++) {
-        ushort mid = lo + (hi - lo) / 2;
-        int local_count = 0;
+
+    vector<uint, NUM_BUCKETS> bucket_seq;
+    cmtl::cm_vector_assign(bucket_seq.select_all(), 0, 1);
+
+    if (lid == 0) {
+        vector<int, 1> zero = 0;
+        cm_slm_block_write(slm, prefix_off, zero.format<int>());
+        // 1-indexed order statistic to locate: the smallest threshold_bits with
+        // count(x > threshold_bits) <= apply_topk equals the (apply_topk+1)-th largest value.
+        vector<int, 1> rank0 = apply_topk + 1;
+        cm_slm_block_write(slm, rank_off, rank0.format<int>());
+    }
+    cm_barrier();
+
+    // 4 passes x 4 bits/pass covers the full 16-bit key space (top nibble is bounded by 0x7 for
+    // the values this kernel actually sees, since bit 15 -- the half sign bit -- is always 0; the
+    // unused bucket range there is simply always empty, not a correctness issue).
+    for (int pass = 0; pass < 4; pass++) {
+        int shift = 12 - pass * 4;
+
+        vector<int, 1> prefix_v, rank_v;
+        cm_slm_block_read(slm, prefix_off, prefix_v.format<int>());
+        cm_slm_block_read(slm, rank_off, rank_v.format<int>());
+        ushort prefix = (ushort)prefix_v[0];
+        int remaining_rank = rank_v[0];
+        ushort prefix_mask = (ushort)~(uint)((1u << (shift + 4)) - 1);
+        ushort prefix_bits = prefix & prefix_mask;
+
+        vector<int, NUM_BUCKETS> local_hist = 0;
         for (uint i = lid; i < n; i += LOCAL_SIZE) {
-            if (probs_bits[base_off + i] > mid) local_count++;
+            ushort v = probs_bits[base_off + i];
+            if ((v & prefix_mask) == prefix_bits) {
+                uint b = ((uint)v >> shift) & 0xFu;
+                // Compile-time-unrolled bucket compare instead of a runtime-indexed vector
+                // write (`local_hist[b] += 1`) -- more comparisons per element, but the pass
+                // count (4 full-array scans instead of 16) is what dominates this kernel's cost,
+                // not per-element register arithmetic.
+                #pragma unroll
+                for (int bucket = 0; bucket < (int)NUM_BUCKETS; bucket++) {
+                    if ((uint)bucket == b) local_hist[bucket] += 1;
+                }
+            }
         }
-        vector<int, 1> lc = local_count;
-        cm_slm_block_write(slm, lid * (uint)sizeof(int), lc.format<int>());
+        // cm_slm_write's address vector is in ELEMENT units (it multiplies by sizeof(T)
+        // internally) -- unlike cm_slm_block_write/_read below, which take a raw byte offset.
+        vector<uint, NUM_BUCKETS> addr = bucket_seq * LOCAL_SIZE + lid;
+        cm_slm_write(slm, addr, local_hist.format<int>());
         cm_barrier();
 
         if (lid == 0) {
-            vector<int, LOCAL_SIZE> all;
-            cm_slm_block_read(slm, 0, all.format<int>());
-            vector<int, 1> total = cm_sum<int>(all);
-            cm_slm_block_write(slm, LOCAL_SIZE * (uint)sizeof(int), total.format<int>());
+            vector<int, NUM_BUCKETS> total_hist;
+            for (int b = 0; b < (int)NUM_BUCKETS; b++) {
+                vector<int, LOCAL_SIZE> col;
+                cm_slm_block_read(slm, (uint)b * LOCAL_SIZE * (uint)sizeof(int), col);
+                vector<int, 1> s = cm_sum<int>(col);
+                total_hist[b] = s[0];
+            }
+            // Walk buckets from largest (15) to smallest (0): the bucket containing the sought
+            // rank is the first one whose cumulative count (including itself) reaches the rank.
+            int cum_greater = 0;
+            int chosen = 0;
+            for (int b = (int)NUM_BUCKETS - 1; b >= 0; b--) {
+                int cnt = total_hist[b];
+                if (remaining_rank <= cum_greater + cnt) {
+                    chosen = b;
+                    break;
+                }
+                cum_greater += cnt;
+            }
+            ushort new_prefix = prefix | (ushort)((uint)chosen << shift);
+            int new_rank = remaining_rank - cum_greater;
+            vector<int, 1> np = (int)new_prefix;
+            cm_slm_block_write(slm, prefix_off, np.format<int>());
+            vector<int, 1> nr = new_rank;
+            cm_slm_block_write(slm, rank_off, nr.format<int>());
         }
         cm_barrier();
-
-        vector<int, 1> total_v;
-        cm_slm_block_read(slm, LOCAL_SIZE * (uint)sizeof(int), total_v.format<int>());
-        int count = total_v[0];
-        if (count > apply_topk) lo = mid + 1; else hi = mid;
-        cm_barrier();
     }
-    ushort threshold_bits = lo;
+
+    vector<int, 1> final_prefix_v;
+    cm_slm_block_read(slm, prefix_off, final_prefix_v.format<int>());
+    ushort threshold_bits = (ushort)final_prefix_v[0];
 
     for (uint i = lid; i < n; i += LOCAL_SIZE) {
         mask_out[base_off + i] = (probs_bits[base_off + i] > threshold_bits) ? 1 : 0;

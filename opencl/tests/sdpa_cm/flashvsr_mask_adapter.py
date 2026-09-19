@@ -1,16 +1,15 @@
 """
 On-device (CM kernel) implementation of FlashVSR's generate_draft_block_mask, driving
-flashvsr_draft_gemm.cm (flashvsr_pool, flashvsr_score) and flashvsr_draft_topk.cm
-(flashvsr_softmax, flashvsr_topk_mask). Same signature/semantics as
+flashvsr_draft_gemm.cm (flashvsr_pool, flashvsr_score_softmax) and flashvsr_draft_topk.cm
+(flashvsr_topk_mask). Same signature/semantics as
 flashvsr_mask_reference.generate_draft_block_mask -- cross-checked against it directly in
 test_flashvsr_mask.py.
 
 Pipeline (mirrors the reference function's own stages, see flashvsr_draft_gemm.cm's and
 flashvsr_draft_topk.cm's module docstrings for the per-kernel math/design notes):
-  1. flashvsr_pool   x2  (once for q_w, once for k_w) -> pooled_q, pooled_k
-  2. flashvsr_score       -> raw_scores (local-mask-added, pre-softmax)
-  3. flashvsr_softmax     -> probs (half)
-  4. flashvsr_topk_mask   -> mask (uint8, 1=keep/0=skip)
+  1. flashvsr_pool          x2  (once for q_w, once for k_w) -> pooled_q, pooled_k
+  2. flashvsr_score_softmax      -> probs (half; local-mask-added score + softmax fused)
+  3. flashvsr_topk_mask          -> mask (uint8, 1=keep/0=skip)
 """
 import functools
 import math
@@ -95,18 +94,13 @@ def build_draft_mask_gpu(batch_size, nheads, seqlen, q_w, k_w, topk=10, local_at
     local_mask_np = local_attn_mask.to(torch.bool).to(torch.uint8).contiguous().numpy()
     t_local_mask = cl.tensor(local_mask_np)
     t_raw_scores = cl.tensor(np.zeros((nheads, num_q_windows, num_k_windows), dtype=np.float32))
+    t_probs = cl.tensor(np.zeros((nheads, num_q_windows, num_k_windows), dtype=np.float16))
 
     scale = 1.0 / math.sqrt(head_dim)
     gemm_kernel.enqueue(
-        "flashvsr_score", [num_q_windows, nheads, 1], [1, 1, 1],
-        t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores,
+        "flashvsr_score_softmax", [num_q_windows, nheads, 1], [1, 1, 1],
+        t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs,
         num_q_windows, num_k_windows, spatial_windows, scale,
-    )
-
-    t_probs = cl.tensor(np.zeros((nheads, num_q_windows, num_k_windows), dtype=np.float16))
-    topk_kernel.enqueue(
-        "flashvsr_softmax", [num_q_windows, nheads, 1], [1, 1, 1],
-        t_raw_scores, t_probs, num_k_windows,
     )
 
     num_groups = seqlen
