@@ -118,9 +118,52 @@ extern "C" _GENX_MAIN_ void flashvsr_score_softmax(
     uint out_row_off = (h * (uint)num_q_windows + l) * (uint)num_k_windows;
 
     // Pass 1: dot product + local mask (unchanged math from the old flashvsr_score), also
-    // tracking a running row_max for free in this same loop.
+    // tracking a running row_max for free in this same loop. At only ~0.5% of compute
+    // roofline (see bench_flashvsr_mask.py), this loop is dominated by per-iteration scalar
+    // overhead (loop increment/compare, modulo, mask branch) rather than the dot product
+    // itself -- 4x unrolled here so that overhead is amortized across 4 independent K-rows'
+    // worth of work instead of paid once per row.
+    constexpr int UNROLL = 4;
     float row_max = -3.0e38f;
-    for (int m = 0; m < num_k_windows; m++) {
+    int m = 0;
+    for (; m + UNROLL <= num_k_windows; m += UNROLL) {
+        vector<half, HEAD_DIM> kv0, kv1, kv2, kv3;
+        kv0.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)(m + 0) * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
+        kv1.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)(m + 1) * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
+        kv2.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)(m + 2) * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
+        kv3.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)(m + 3) * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
+
+        float dot0 = cm_sum<float>(qv_f * vector<float, HEAD_DIM>(kv0));
+        float dot1 = cm_sum<float>(qv_f * vector<float, HEAD_DIM>(kv1));
+        float dot2 = cm_sum<float>(qv_f * vector<float, HEAD_DIM>(kv2));
+        float dot3 = cm_sum<float>(qv_f * vector<float, HEAD_DIM>(kv3));
+
+        float score0 = dot0 * scale;
+        float score1 = dot1 * scale;
+        float score2 = dot2 * scale;
+        float score3 = dot3 * scale;
+
+        uint m0_spatial = (uint)(m + 0) % (uint)spatial_windows;
+        uint m1_spatial = (uint)(m + 1) % (uint)spatial_windows;
+        uint m2_spatial = (uint)(m + 2) % (uint)spatial_windows;
+        uint m3_spatial = (uint)(m + 3) % (uint)spatial_windows;
+
+        if (!local_mask[mask_row_off + m0_spatial]) score0 = -1.0e9f;
+        if (!local_mask[mask_row_off + m1_spatial]) score1 = -1.0e9f;
+        if (!local_mask[mask_row_off + m2_spatial]) score2 = -1.0e9f;
+        if (!local_mask[mask_row_off + m3_spatial]) score3 = -1.0e9f;
+
+        raw_scores[out_row_off + (uint)(m + 0)] = score0;
+        raw_scores[out_row_off + (uint)(m + 1)] = score1;
+        raw_scores[out_row_off + (uint)(m + 2)] = score2;
+        raw_scores[out_row_off + (uint)(m + 3)] = score3;
+
+        row_max = cm_max<float>(row_max, score0);
+        row_max = cm_max<float>(row_max, score1);
+        row_max = cm_max<float>(row_max, score2);
+        row_max = cm_max<float>(row_max, score3);
+    }
+    for (; m < num_k_windows; m++) {
         vector<half, HEAD_DIM> kv;
         kv.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)pooled_k, ((uint)m * (uint)NUM_HEADS + h) * (uint)HEAD_DIM * (uint)sizeof(half));
         vector<float, HEAD_DIM> kv_f = kv;
