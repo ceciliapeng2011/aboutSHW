@@ -168,20 +168,37 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     summed total kernel time. `density` is inverted to flashvsr_mask_reference's `topk` GLOBAL
     top-k count via
     topk_ratio = density * num_k_windows (see flashvsr_mask_reference.py's docstring: density =
-    topk / (SPATIAL_WINDOWS * num_k_windows) = topk_ratio / num_k_windows)."""
+    topk / (SPATIAL_WINDOWS * num_k_windows) = topk_ratio / num_k_windows).
+
+    `density` here is a TRUE target -- clamped to MAX_LOCAL_DENSITY (the local spatial-window
+    mask's own density) if it exceeds it. generate_draft_block_mask applies that local mask
+    BEFORE top-k ever runs (out-of-window scores are forced to -1e9), so no `topk` value can ever
+    select more than MAX_LOCAL_DENSITY's worth of blocks -- requesting density=1.0 and density=0.5
+    both silently saturate to the SAME measured ~0.48 density at this benchmark's grid/local_range,
+    producing two rows that report identical sparse-SDPA cost despite looking like a 2x density
+    difference. Clamping here makes that ceiling explicit instead of a silent alias."""
     q_groups = f // 2
     k_groups = q_groups + cache_groups  # streaming FIFO cache prepend -- see module docstring
     num_q_windows = SPATIAL_WINDOWS * q_groups
     num_k_windows = SPATIAL_WINDOWS * k_groups
     q_len = num_q_windows * WINDOW_TOKENS
     kv_len = num_k_windows * WINDOW_TOKENS
+
+    local_mask = ref_mod.build_local_block_mask_shifted_vec_normal_slide(
+        SPATIAL_H, SPATIAL_W, LOCAL_RANGE, LOCAL_RANGE, include_self=True)
+    max_local_density = local_mask.float().mean().item()
+    if density > max_local_density:
+        print(f"  [note] requested density={density:.4f} exceeds the local-window mask's own "
+              f"density={max_local_density:.4f} -- no topk can select more than that many blocks "
+              f"(they're forced to -1e9 before top-k runs), so clamping to {max_local_density:.4f} "
+              f"instead of silently aliasing with a lower request.")
+        density = max_local_density
+
     topk_ratio = density * num_k_windows
     topk = max(1, int(SPATIAL_WINDOWS * topk_ratio))
 
     q_w = make_windowed(num_q_windows, seed=1)
     k_w = make_windowed(num_k_windows, seed=2)
-    local_mask = ref_mod.build_local_block_mask_shifted_vec_normal_slide(
-        SPATIAL_H, SPATIAL_W, LOCAL_RANGE, LOCAL_RANGE, include_self=True)
 
     gemm_kernel = gpu_mod._get_gemm_kernel(NUM_HEADS, HEAD_DIM, WINDOW_TOKENS)
     topk_kernel = gpu_mod._get_topk_kernel(NUM_HEADS)
@@ -277,11 +294,23 @@ def print_hotspot_summary(title, results):
         print(f"  {label:<42} steady={values[0]:>10.3f} ms  warmup={values[1]:>10.3f} ms")
 
 
-# Density sweep for [2]'s table -- 1.0 is the "full density" (topk covers every element, i.e. the
-# mask-gen kernels run but prune nothing) reference point, down to 0.004 which matches FlashVSR's
-# own real measured production density (TOPK_RATIO=2.0 at these chunk shapes -- see below, added
-# per-chunk since real density = TOPK_RATIO/num_k_windows depends on chunk shape).
-DENSITY_SWEEP = [1.0, 0.5, 0.1, 0.03, 0.01, 0.004]
+# MAX_LOCAL_DENSITY: the local spatial-window mask's own density (build_local_block_mask_shifted_
+# vec_normal_slide, depends only on SPATIAL_H/W/LOCAL_RANGE, all fixed module constants above) --
+# the hard ceiling on achievable block-mask density, since out-of-window scores are forced to
+# -1e9 BEFORE top-k runs, so no `topk` value can ever select more than this fraction of blocks.
+MAX_LOCAL_DENSITY = ref_mod.build_local_block_mask_shifted_vec_normal_slide(
+    SPATIAL_H, SPATIAL_W, LOCAL_RANGE, LOCAL_RANGE, include_self=True).float().mean().item()
+
+# Density sweep for [2]'s table -- every value here is a genuinely distinct, achievable TRUE
+# density (bench_sparse_at_density clamps anything above MAX_LOCAL_DENSITY, so using 1.0/0.5
+# directly here would have both silently aliased to the same ~0.48 measured density and produced
+# two rows reporting identical sparse-SDPA cost despite looking like a 2x difference). The top of
+# the sweep is MAX_LOCAL_DENSITY itself (the "prune nothing the local mask doesn't already forbid"
+# reference point) and half of it, down to 0.004 which matches FlashVSR's own real measured
+# production density (TOPK_RATIO=2.0 at these chunk shapes -- see below, added per-chunk since
+# real density = TOPK_RATIO/num_k_windows depends on chunk shape).
+DENSITY_SWEEP = sorted({MAX_LOCAL_DENSITY, MAX_LOCAL_DENSITY / 2, 0.1, 0.03, 0.01, 0.004},
+                        reverse=True)
 
 
 if __name__ == "__main__":
