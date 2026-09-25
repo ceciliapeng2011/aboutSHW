@@ -6,18 +6,26 @@ compare against a masked torch SDPA reference using the SAME mask.
 Deliberately separate from test_flashvsr_mask.py (which only checks that the mask itself is
 correct, independent of any attention kernel): this file isolates "did cm_sdpa_opt_prefill.cm
 honor an already-correct mask" from "is the mask itself accurate" -- the same separation of
-concerns test_sdpa_prefill_xattn.py uses for X-Attention's sparse path.
+concerns test_sdpa_prefill_block_mask.py uses for its own generic bypass-correctness test.
 
 See /home/ceciliapeng/.claude/plans/flickering-crunching-pascal.md (Stage 3) and
 /home/ceciliapeng/repos/reports/block_sparse_attention_for_flashvsr.md for the design this
 implements.
 """
+import os
+import sys
+
 import torch
+
+CWD = os.path.dirname(os.path.realpath(__file__))
+SDPA_CM_DIR = os.path.dirname(CWD)
+if SDPA_CM_DIR not in sys.path:
+    sys.path.insert(0, SDPA_CM_DIR)
 
 import flashvsr_mask_reference as ref_mod
 import flashvsr_mask_adapter as gpu_mod
-import test_sdpa_prefill as base
-import test_sdpa_prefill_xattn as xattn_mod
+import test_sdpa_prefill as base    # noqa: E402
+import test_sdpa_prefill_block_mask as block_mask_mod    # noqa: E402
 import test_flashvsr_mask as mask_tests
 
 torch.manual_seed(12)
@@ -53,10 +61,10 @@ def test_end_to_end_sparse_attention():
     v = (torch.randint(low, high, [1, nheads, kv_len, head_dim], generator=g).to(torch.float16)
          / high)
 
-    out = xattn_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=window_tokens,
-                                        block_mask=mask)
-    ref = xattn_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
-                                     sparse_block_size=window_tokens)
+    out = block_mask_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=window_tokens,
+                                             block_mask=mask)
+    ref = block_mask_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
+                                          sparse_block_size=window_tokens)
 
     # A Q-window with zero kept K-windows is a legitimate outcome of the joint (not per-row)
     # top-k on uncorrelated synthetic test data (confirmed identical between the reference and
@@ -107,10 +115,10 @@ def test_end_to_end_sparse_attention_realistic_ratio():
     v = (torch.randint(low, high, [1, nheads, kv_len, head_dim], generator=g).to(torch.float16)
          / high)
 
-    out = xattn_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=window_tokens,
-                                        block_mask=mask)
-    ref = xattn_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
-                                     sparse_block_size=window_tokens)
+    out = block_mask_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=window_tokens,
+                                             block_mask=mask)
+    ref = block_mask_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
+                                          sparse_block_size=window_tokens)
 
     # See test_end_to_end_sparse_attention's comment: all-masked Q-rows are a legitimate synthetic
     # -data outcome, excluded from the numeric comparison rather than papered over.

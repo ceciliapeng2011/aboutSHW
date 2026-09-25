@@ -6,9 +6,7 @@ Ported near-verbatim from /home/ceciliapeng/repos/FlashVSR/diffsynth/models/wan_
   - generate_draft_block_mask (:116-153)
 
 Not imported directly from the FlashVSR repo to avoid pulling in its optional heavy deps
-(flash_attn / flash_attn_interface / sageattention) -- same rationale as x_attn/references.py
-being the standalone ground truth dense_xattn_adapter.py's tests diff against, rather than
-importing X-Attention's own upstream repo.
+(flash_attn / flash_attn_interface / sageattention).
 
 This module is pure torch/einops (mean/einsum/softmax/topk) -- no custom kernel -- and so IS the
 "host-side" mask-generation baseline; flashvsr_mask_adapter.py's GPU kernels are cross-checked

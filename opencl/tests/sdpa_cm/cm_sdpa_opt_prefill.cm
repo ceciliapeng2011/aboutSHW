@@ -61,9 +61,9 @@ _GENX_MAIN_ void KERNEL_NAME(
     int q_len,
     int kv_len
 #if SPARSE_BLOCK_SIZE > 1
-    // [B,Hq,num_q_blocks,num_k_blocks], row-major, 1 byte/block, 1=keep 0=skip -- the dense-K
-    // adapter's identity-block-table mask (see sdpa_cm/dense_xattn_adapter.py). Q-block index is
-    // per q-head (not shared across a GQA group) -- matches XAttention's own indexing.
+    // [B,Hq,num_q_blocks,num_k_blocks], row-major, 1 byte/block, 1=keep 0=skip -- a caller-supplied
+    // block-table mask, algorithm-agnostic. Q-block index is per q-head (not shared across a GQA
+    // group).
     , bool* sparse_block_mask [[type("svmptr_t")]]
     , int num_q_blocks
     , int num_k_blocks

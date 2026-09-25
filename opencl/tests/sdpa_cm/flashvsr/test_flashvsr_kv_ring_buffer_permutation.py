@@ -24,12 +24,12 @@ its `compatibility_mode` dense fallback -- so both are tested here, independentl
      `generate_draft_block_mask`'s joint top-k + `build_local_block_mask_shifted_vec_normal_slide`'s
      purely-spatial local mask, then a masked attention). Only reuses this repo's
      `flashvsr_mask_reference.py` (the vendored, dependency-light -- torch+einops only, no CUDA --
-     ground truth for FlashVSR's OWN mask math); deliberately does NOT import
-     `test_sdpa_prefill_xattn.py` / `dense_xattn_adapter.py` or the CM sparse-prefill kernel --
-     those implement a DIFFERENT sparsity algorithm (XAttention's own 2nd-stage block selection),
-     unrelated to FlashVSR's `generate_draft_block_mask`, and pulling them in would conflate two
-     independent questions. The block-mask -> token-mask expansion and the masked-SDPA reference
-     below are reimplemented standalone (a few lines; not copied) for that reason.
+     ground truth for FlashVSR's OWN mask math); deliberately does NOT invoke the CM sparse-prefill
+     GPU kernel -- pulling that in would conflate "is this permutation invariant" with "does the
+     GPU kernel honor the mask correctly" (the latter is covered separately by
+     test_flashvsr_block_sparse_attention.py). The block-mask -> token-mask expansion and the
+     masked-SDPA reference below are reimplemented standalone (a few lines; not copied) for that
+     reason.
 
 WHY GROUP-LEVEL (not row-level) permutation: `build_local_block_mask_shifted_vec_normal_slide`
 takes no temporal/slot argument at all (only h//8,w//8,local_range) and is tiled IDENTICALLY across
@@ -39,7 +39,8 @@ support "whole temporal GROUP reordering is safe", not "reordering individual wi
 a group is safe" -- so every permutation constructed here moves whole `one_len`-window groups
 around, exactly matching what the real ring buffer would do, and never splits a group.
 
-Run: /home/ceciliapeng/OCL/aboutSHW/ocl.venv/bin/python3 test_flashvsr_kv_ring_buffer_permutation.py
+Run: /home/ceciliapeng/OCL/aboutSHW/ocl.venv/bin/python3 flashvsr/test_flashvsr_kv_ring_buffer_permutation.py
+(from the sdpa_cm/ directory)
 (torch+einops only; no OpenCL/CM/GPU device needed -- this file never imports `clops`.)
 """
 import torch

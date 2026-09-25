@@ -45,21 +45,27 @@ optimizations -- see flashvsr_draft_topk.cm's and flashvsr_draft_gemm.cm's heade
 per-kernel design notes, and bench_flashvsr_mask.py for the isolated per-kernel microbenchmarks
 these changes were validated against.
 
-Run with: python3 bench_flashvsr_e2e.py
+Run with: python3 flashvsr/bench_flashvsr_e2e.py (from the sdpa_cm/ directory)
 """
 import gc
 import math
 import os
+import sys
 
 import numpy as np
 import torch
 
 from clops import cl
 
+CWD = os.path.dirname(os.path.realpath(__file__))
+SDPA_CM_DIR = os.path.dirname(CWD)
+if SDPA_CM_DIR not in sys.path:
+    sys.path.insert(0, SDPA_CM_DIR)
+
 import flashvsr_mask_adapter as gpu_mod
 import flashvsr_mask_reference as ref_mod
-import test_sdpa_prefill as base
-import test_sdpa_prefill_xattn as xattn_mod
+import test_sdpa_prefill as base    # noqa: E402
+import test_sdpa_prefill_block_mask as block_mask_mod    # noqa: E402
 
 torch.manual_seed(0)
 
@@ -235,8 +241,8 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     q, k, v = base.make_qkv(batch=1, num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
                              q_len=q_len, kv_len=kv_len, head_size=HEAD_DIM)
     ms_sdpa_sparse = time_kernel(
-        lambda: xattn_mod.run_prefill_sparse(q, k, v, is_causal=False,
-                                              sparse_block_size=WINDOW_TOKENS, block_mask=mask),
+        lambda: block_mask_mod.run_prefill_sparse(q, k, v, is_causal=False,
+                                                    sparse_block_size=WINDOW_TOKENS, block_mask=mask),
         n_warmup=3, n_iters=10)
 
     # Per-kernel utilization -- formulas match bench_flashvsr_mask.py's bench_score_softmax/
@@ -278,20 +284,6 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     del t_qw, t_kw, t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs, t_mask, q, k, v
     gc.collect()
     return dict(density=measured_density, topk=topk, total_ms=total_ms, kernels=kernels)
-
-
-def print_hotspot_summary(title, results):
-    """Kept for bench_flashvsr_e2e_xattn.py, which still returns bench_chunk_xattn's original
-    (kernels, total, ms_cross) 3-tuple shape -- unrelated to bench_sparse_at_density's dict return
-    above (this file's own __main__ no longer calls this; the per-density tables already show the
-    same per-kernel breakdown, across MORE than 2 configs)."""
-    print(f"\n=== {title} ===")
-    agg = {}
-    for name, (kernels, total, *_rest) in results.items():
-        for label, ms in kernels:
-            agg.setdefault(label, []).append(ms)
-    for label, values in sorted(agg.items(), key=lambda kv: -max(kv[1])):
-        print(f"  {label:<42} steady={values[0]:>10.3f} ms  warmup={values[1]:>10.3f} ms")
 
 
 # MAX_LOCAL_DENSITY: the local spatial-window mask's own density (build_local_block_mask_shifted_

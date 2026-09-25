@@ -27,13 +27,21 @@ are infeasible for an accuracy test here: PyTorch's reference SDPA materializes 
 tests use proportionally smaller, CPU-feasible stand-ins of the same shape family (same head
 config, same q_len:kv_len ratio) instead of the literal production sizes.
 """
+import os
+import sys
+
 import torch
 
 from clops import cl
 
-import test_sdpa_prefill as base
-import test_sdpa_prefill_xattn as xattn_mod
-import bench_sdpa as bench
+CWD = os.path.dirname(os.path.realpath(__file__))
+SDPA_CM_DIR = os.path.dirname(CWD)
+if SDPA_CM_DIR not in sys.path:
+    sys.path.insert(0, SDPA_CM_DIR)
+
+import test_sdpa_prefill as base    # noqa: E402
+import test_sdpa_prefill_block_mask as block_mask_mod    # noqa: E402
+import bench_sdpa as bench    # noqa: E402
 
 torch.manual_seed(7)
 
@@ -87,10 +95,10 @@ def test_self_attention_sparse_steady():
                              q_len=STEADY_CHUNK_TEST, kv_len=STEADY_CHUNK_TEST, head_size=HEAD_SIZE)
     mask, density = bench.fake_block_mask(NUM_HEADS, STEADY_CHUNK_TEST, SPARSE_BLOCK_SIZE,
                                            density=0.3, is_causal=False)
-    out = xattn_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=SPARSE_BLOCK_SIZE,
-                                        block_mask=mask)
-    ref = xattn_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
-                                     sparse_block_size=SPARSE_BLOCK_SIZE)
+    out = block_mask_mod.run_prefill_sparse(q, k, v, is_causal=False, sparse_block_size=SPARSE_BLOCK_SIZE,
+                                             block_mask=mask)
+    ref = block_mask_mod.ref_sdpa_sparse(q, k, v, is_causal=False, mask=mask,
+                                          sparse_block_size=SPARSE_BLOCK_SIZE)
     base.check_close(out, ref)
     print(f"[test_self_attention_sparse_steady] effective_density={density:.3f}")
 
