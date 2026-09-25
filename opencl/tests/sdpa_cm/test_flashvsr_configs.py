@@ -48,6 +48,16 @@ S_CTX = 512               # FlashVSR's fixed text cross-attention context length
 STEADY_CHUNK_TEST = 2048
 WARMUP_CHUNK_TEST = 4096
 
+# Self-attention's real steady-state streaming-KV-cache shape (q_len != kv_len, dense, non-causal):
+# ratio kv_len/q_len == 4 (kv_ratio=3.0 cached window-groups + this chunk's own 1 group -- see
+# module docstring / bench_sdpa.py's STEADY_Q_LEN/STEADY_KV_LEN_REAL). Unlike the square
+# q_len==kv_len warm-up/steady "no cache" cases above, PyTorch's CPU SDPA reference doesn't
+# materialize the full [q_len, kv_len] matrix for this shape (flash-attention CPU backend tiles
+# instead), so these literal-ratio sizes are CPU-feasible directly -- no scaled-down stand-in
+# needed here.
+LQ_STREAMING_CACHE = 15360
+LK_STREAMING_CACHE = 61440
+
 
 def test_self_attention_dense_steady():
     # Self-attention kernel call itself is always non-causal in FlashVSR (see module docstring).
@@ -85,6 +95,18 @@ def test_self_attention_sparse_steady():
     print(f"[test_self_attention_sparse_steady] effective_density={density:.3f}")
 
 
+def test_self_attention_dense_streaming_cache():
+    # Self-attention against its real streaming-KV-cache shape: q_len=15360 (this chunk's own
+    # tokens) attending over kv_len=61440 (4 stabilized window-groups, this chunk's included) --
+    # see LQ_STREAMING_CACHE/LK_STREAMING_CACHE's comment. Still the always-non-causal kernel call
+    # (see module docstring); dense, no sparsity.
+    q, k, v = base.make_qkv(batch=1, num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS,
+                             q_len=LQ_STREAMING_CACHE, kv_len=LK_STREAMING_CACHE, head_size=HEAD_SIZE)
+    out = base.run_prefill(q, k, v, is_causal=False)
+    ref = base.ref_sdpa(q, k, v, is_causal=False)
+    base.check_close(out, ref)
+
+
 def test_cross_attention():
     # DiT cross-attention: dense, non-causal, small fixed-length K/V (persistent text-embedding
     # cache) against a much longer Q (video-chunk tokens) -- already supported since make_qkv/
@@ -104,5 +126,7 @@ if __name__ == "__main__":
     print("test_self_attention_dense_warmup PASSED")
     test_self_attention_sparse_steady()
     print("test_self_attention_sparse_steady PASSED")
+    test_self_attention_dense_streaming_cache()
+    print("test_self_attention_dense_streaming_cache PASSED")
     test_cross_attention()
     print("test_cross_attention PASSED")

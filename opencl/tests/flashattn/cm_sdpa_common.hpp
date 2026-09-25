@@ -167,7 +167,14 @@ void sdpa_kernel_lsc(
 
     //# save cur_O/cur_sum.transpose(0, 1)
     matrix<half, num_P_tiles*REG_M, REG_N> cur_O_f16;
+    // Guard the all-masked-row case (every KV block skipped by a sparse block mask, or an
+    // otherwise-empty attended range): cur_sum stays exactly 0, and an unguarded cm_inv(0) -> +Inf
+    // combines with the (also-zero) rO accumulator into 0*Inf == NaN. Match the CPU reference
+    // (ov::reference::block_sparse_attention's `sum > 0.0f ? 1.0f/sum : 0.0f`) by forcing the
+    // reciprocal to 0 wherever the sum was 0, so an empty row's output is 0 instead of NaN.
+    vector<unsigned short, q_step> cur_sum_is_zero = (cur_sum == 0.0f);
     cur_sum = cm_inv(cur_sum);
+    cur_sum.merge(0.0f, cur_sum_is_zero);
 
     lsc::block_2d_desc<half, 1, REG_M, REG_N> b2dO(o_base, q_tokens_left - 1, head_size*sizeof(half) - 1, o_pitch - 1, 0, 0);
 
@@ -429,7 +436,14 @@ void sdpa_kernel_lsc_prefetch(
 
     //# save cur_O/cur_sum.transpose(0, 1)
     matrix<half, num_P_tiles*REG_M, REG_N> cur_O_f16;
+    // Guard the all-masked-row case (every KV block skipped by a sparse block mask, or an
+    // otherwise-empty attended range): cur_sum stays exactly 0, and an unguarded cm_inv(0) -> +Inf
+    // combines with the (also-zero) rO accumulator into 0*Inf == NaN. Match the CPU reference
+    // (ov::reference::block_sparse_attention's `sum > 0.0f ? 1.0f/sum : 0.0f`) by forcing the
+    // reciprocal to 0 wherever the sum was 0, so an empty row's output is 0 instead of NaN.
+    vector<unsigned short, q_step> cur_sum_is_zero = (cur_sum == 0.0f);
     cur_sum = cm_inv(cur_sum);
+    cur_sum.merge(0.0f, cur_sum_is_zero);
 
     lsc::block_2d_desc<half, 1, REG_M, REG_N> b2dO(o_base, q_tokens_left - 1, head_size*sizeof(half) - 1, o_pitch - 1, 0, 0);
 
@@ -685,7 +699,15 @@ void sdpa_kernel(
     if (q_tokens_left > 0) {
         //# save cur_O/cur_sum.transpose(0, 1)
         matrix<half, num_P_tiles*REG_M, REG_N> cur_O_f16;
+        // Guard the all-masked-row case (every KV block skipped by a sparse block mask, or an
+        // otherwise-empty attended range): cur_sum stays exactly 0, and an unguarded cm_inv(0) ->
+        // +Inf combines with the (also-zero) rO accumulator into 0*Inf == NaN. Match the CPU
+        // reference (ov::reference::block_sparse_attention's `sum > 0.0f ? 1.0f/sum : 0.0f`) by
+        // forcing the reciprocal to 0 wherever the sum was 0, so an empty row's output is 0
+        // instead of NaN.
+        vector<unsigned short, q_step> cur_sum_is_zero = (cur_sum == 0.0f);
         cur_sum = cm_inv(cur_sum);
+        cur_sum.merge(0.0f, cur_sum_is_zero);
 
         #pragma unroll
         for(int k = 0, ri=0; k < head_size; k += REG_N, ri += num_P_tiles) {
