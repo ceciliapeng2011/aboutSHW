@@ -4,20 +4,21 @@
 Examples:
   # Common files between 2 folders
   python3 find_same_name_files.py \
-    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    $HOME/OCL/aboutSHW/opencl/tests/x_attn
-
-  # Common files across 3 folders (intersection of all)
-  python3 find_same_name_files.py \
-    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
-    $HOME/OCL/aboutSHW/opencl/tests/pageatten \
+    $HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
     $HOME/OCL/aboutSHW/opencl/tests/x_attn
 
   # Compare the first folder against each of the others separately
   python3 find_same_name_files.py --pairwise \
-    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
     $HOME/OCL/aboutSHW/opencl/tests/pageatten \
-    $HOME/OCL/aboutSHW/opencl/tests/x_attn
+    $HOME/OCL/aboutSHW/opencl/tests/x_attn \
+    $HOME/OCL/aboutSHW/opencl/tests/flashattn
+
+  # Compare the source tree against the whole tests tree in one shot
+  # (recurses into every subfolder, so new target dirs need no edits here)
+  python3 find_same_name_files.py \
+    $HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/OCL/aboutSHW/opencl/tests
 """
 
 from __future__ import annotations
@@ -30,9 +31,10 @@ from typing import Dict, List, Set
 
 
 DEFAULT_DIRS = [
-    "$HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm",
+    "$HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm",
     "$HOME/OCL/aboutSHW/opencl/tests/pageatten",
     "$HOME/OCL/aboutSHW/opencl/tests/x_attn",
+    "$HOME/OCL/aboutSHW/opencl/tests/flashattn",
 ]
 
 

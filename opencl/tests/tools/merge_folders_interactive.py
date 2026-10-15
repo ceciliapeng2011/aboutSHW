@@ -13,19 +13,23 @@ Features:
 Examples:
   # Interactive merge (default)
   python3 merge_folders_interactive.py \
-    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
+    $HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm \
     $HOME/OCL/aboutSHW/opencl/tests/x_attn
 
   # Reverse direction
   python3 merge_folders_interactive.py \
     $HOME/OCL/aboutSHW/opencl/tests/x_attn \
-    $HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm
+    $HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm
 
   # Brutal-force overwrite destination
   python3 merge_folders_interactive.py SRC DST --force
 
   # Preview only
   python3 merge_folders_interactive.py SRC DST --dry-run
+
+Note: this only touches basenames that exist on BOTH sides (source-only files,
+e.g. brand-new kernels never ported to tests/, are ignored -- see
+find_same_name_files.py to discover those first and place them manually).
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from pathlib import Path
 from typing import Dict, List
 
 
-DEFAULT_SOURCE = "$HOME/openvino/src/plugins/intel_gpu/src/graph/impls/cm"
+DEFAULT_SOURCE = "$HOME/openvino.pipeline.mx/thirdparty/openvino/src/plugins/intel_gpu/src/graph/impls/cm"
 DEFAULT_DESTINATION = "$HOME/OCL/aboutSHW/opencl/tests/x_attn"
 KERNEL_SUFFIXES = {".cm", ".hpp"}
 KERNEL_DECL_RE = re.compile(r'(\bextern\s+"C"\s+_GENX_MAIN_\s+void\s+)([A-Za-z_]\w*|KERNEL_NAME)(\s*\()')
