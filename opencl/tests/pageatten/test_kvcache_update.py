@@ -25,7 +25,7 @@ class pa_kvcache_update_cm:
         self.wg_size = (block_size // sub_block_size) if enable_kvcache_compress == 2 else 16
 
         self.enable_kvcache_compress = enable_kvcache_compress
-        src = r'''#include "pa_kv_cache_update_ref.hpp"'''
+        src = r'''#include "pa_kv_cache_update_ref.cm"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_kv_heads=} {k_head_size=} {v_head_size=} {enable_kvcache_compress=}...")
 
