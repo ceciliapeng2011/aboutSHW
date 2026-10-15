@@ -198,7 +198,13 @@ _GENX_MAIN_ void KERNEL_NAME(
     // exp_sums/max_logits carry the local softmax denominator/max so the finalization kernel
     // can re-weight and combine partitions via the standard log-sum-exp merge.
     half* tmp_out_ptr = tmp_out + (uint64_t)out_idx * head_size;
-    float inv_sum = 1.0f / cur_sum;
+    // Guard the all-masked-partition case (every KV position in this split-KV partition skipped
+    // by a sparse block mask or attn_mask): cur_sum stays exactly 0, and an unguarded 1.0f/0.0f ->
+    // +Inf combines with the (also-zero) rO accumulator into 0*Inf == NaN, which
+    // cm_sdpa_opt_decode_finalization.cm's weighted merge cannot recover from since NaN*0 is still
+    // NaN. Match cm_sdpa_common.hpp's identical guard for the prefill path: force the reciprocal
+    // to 0 so an empty partition's tmp_out is 0 instead of NaN.
+    float inv_sum = cur_sum > 0.0f ? 1.0f / cur_sum : 0.0f;
     #pragma unroll
     for (int k = 0, ci = 0; k < head_size; k += REG_N, ci++) {
         vector<half, REG_N> o_f16 = cm_mul<float>(rO[ci].format<float>(), inv_sum);

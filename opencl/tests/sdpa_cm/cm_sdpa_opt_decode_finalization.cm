@@ -47,9 +47,15 @@ _GENX_MAIN_ void KERNEL_NAME(
     for (int p = 0; p < num_partitions; p++)
         total += cm_exp(max_logits[base + p] - global_max) * exp_sums[base + p];
 
+    // Guard the all-partitions-masked case (the whole query row had no surviving KV position in
+    // any partition -- cm_sdpa_opt_decode.cm already zeroes such a partition's exp_sums/tmp_out,
+    // but an unguarded division here would still turn 0/0 into NaN and poison every partition's
+    // contribution below). Match the CPU reference's 0-for-empty-row behavior.
+    float inv_total = total > 0.0f ? 1.0f / total : 0.0f;
+
     vector<float, head_size> acc = 0.0f;
     for (int p = 0; p < num_partitions; p++) {
-        float w = cm_exp(max_logits[base + p] - global_max) * exp_sums[base + p] / total;
+        float w = cm_exp(max_logits[base + p] - global_max) * exp_sums[base + p] * inv_total;
         vector<half, head_size> chunk;
         cm_svm_block_read<half, head_size>((svmptr_t)(tmp_out + (uint64_t)(base + p) * head_size), chunk);
         vector<float, head_size> chunk_f = chunk;
