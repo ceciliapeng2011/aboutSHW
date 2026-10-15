@@ -1,9 +1,10 @@
 """
 Roofline/utilization benchmark for the three FlashVSR draft-block-mask kernels
-(flashvsr_draft_gemm.cm's flashvsr_pool/flashvsr_score_softmax, flashvsr_draft_topk.cm's
-flashvsr_topk_mask) -- every kernel reports a roofline utilization number (GFLOPS vs.
-HW_PEAK_FLOPS for compute-bound flashvsr_score_softmax, GB/s vs. HW_PEAK_BW_GBS for the
-bandwidth/pass-count-bound flashvsr_pool/flashvsr_topk_mask), swept across:
+(draft_block_mask_pool.cm's flashvsr_pool, draft_block_mask_score_softmax.cm's
+flashvsr_score_softmax, draft_block_mask_topk_mask.cm's flashvsr_topk_mask) -- every kernel
+reports a roofline utilization number (GFLOPS vs. HW_PEAK_FLOPS for compute-bound
+flashvsr_score_softmax, GB/s vs. HW_PEAK_BW_GBS for the bandwidth/pass-count-bound
+flashvsr_pool/flashvsr_topk_mask), swept across:
   1. seqlen (SEQLEN_SWEEP_WINDOWS -- num_windows from well below to well above FlashVSR's own
      150/450-window chunk sizes),
   2. density/topk (DENSITY_SWEEP -- flashvsr_topk_mask only, since it's the only one of the three
@@ -19,9 +20,10 @@ only) -- its GFLOPS utilization number (which covers only the dot product, not t
 softmax's own bandwidth-bound row-touches) is expected to be very low (a naive scalar
 dot-product loop, not a matrix-engine GEMM; see the plan doc's Stage C), which this benchmark
 makes visible directly instead of only reporting a latency number that looks fast in isolation.
-flashvsr_topk_mask now finds its threshold via a 4-pass, 4-bit-per-pass MSD radix-select
-(previously a 16-iteration bit-by-bit binary search -- see flashvsr_draft_topk.cm's header for the
-x_attn/sort.hpp-inspired technique) -- its cost is dominated by those 4 full-array passes,
+flashvsr_topk_mask now finds its threshold via an 8-pass, 4-bit-per-pass MSD radix-select over
+full float32 probabilities (previously 4-pass/16-bit half -- see draft_block_mask_topk_mask.cm's
+header for the x_attn/sort.hpp-inspired technique) -- its cost is dominated by those full-array
+passes,
 independent of the requested topk/density, so its GB/s-equivalent number is expected to stay
 roughly flat across DENSITY_SWEEP, same as before the optimization, just ~3-4x fewer bytes moved
 at the same wall-clock improvement.
@@ -74,7 +76,7 @@ def report_ms(label, ms):
 
 
 def bench_pool(num_windows, num_heads=12, head_dim=128, window_tokens=128, n_warmup=5, n_iters=20):
-    kernel = gpu_mod._get_gemm_kernel(num_heads, head_dim, window_tokens)
+    kernel = gpu_mod._get_pool_kernel(num_heads, head_dim, window_tokens)
     windowed = torch.randn(num_windows, window_tokens, num_heads * head_dim, dtype=torch.float16).numpy()
     t_in = cl.tensor(windowed)
     t_out = cl.tensor(np.zeros((num_windows, num_heads, head_dim), dtype=np.float16))
@@ -96,7 +98,7 @@ def bench_pool(num_windows, num_heads=12, head_dim=128, window_tokens=128, n_war
 
 def bench_score_softmax(num_q_windows, num_k_windows, spatial_windows, num_heads=12, head_dim=128,
                          n_warmup=5, n_iters=20):
-    kernel = gpu_mod._get_gemm_kernel(num_heads, head_dim, 128)
+    kernel = gpu_mod._get_score_softmax_kernel(num_heads, head_dim)
     pooled_q = torch.randn(num_q_windows, num_heads, head_dim, dtype=torch.float16).numpy()
     pooled_k = torch.randn(num_k_windows, num_heads, head_dim, dtype=torch.float16).numpy()
     local_mask = (torch.rand(spatial_windows, spatial_windows) > 0.5).to(torch.uint8).numpy()
@@ -104,9 +106,13 @@ def bench_score_softmax(num_q_windows, num_k_windows, spatial_windows, num_heads
     t_k = cl.tensor(pooled_k)
     t_mask = cl.tensor(local_mask)
     t_scores = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float32))
-    t_probs = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float16))
+    # float32, not half: draft_block_mask_score_softmax.cm now emits full-precision probabilities
+    # (see draft_block_mask_topk_mask.cm's header on why the top-k radix-select needs this).
+    t_probs = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.float32))
     scale = 1.0 / (head_dim ** 0.5)
-    args = [t_q, t_k, t_mask, t_scores, t_probs, num_q_windows, num_k_windows, spatial_windows, scale]
+    # spatial_windows_k == spatial_windows here (no streaming-KV-growth case in this benchmark).
+    args = [t_q, t_k, t_mask, t_scores, t_probs, num_q_windows, num_k_windows, spatial_windows,
+             spatial_windows, scale]
 
     cl.finish()
     for _ in range(n_warmup):
@@ -134,10 +140,13 @@ def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
                n_warmup=2, n_iters=5):
     kernel = gpu_mod._get_topk_kernel(num_heads)
     num_q_windows = spatial_windows * num_groups
-    probs = torch.rand(num_heads, num_q_windows, num_k_windows, dtype=torch.float32).half().numpy()
+    # float32: draft_block_mask_topk_mask.cm's radix-select now reads the full-precision bit
+    # pattern (see draft_block_mask_topk_mask.cm's header).
+    probs = torch.rand(num_heads, num_q_windows, num_k_windows, dtype=torch.float32).numpy()
     t_probs = cl.tensor(probs)
     t_mask = cl.tensor(np.zeros((num_heads, num_q_windows, num_k_windows), dtype=np.uint8))
-    args = [t_probs, t_mask, num_q_windows, num_k_windows, spatial_windows, topk]
+    # batch_size=1 (no batch-tiling exercised in this benchmark).
+    args = [t_probs, t_mask, num_q_windows, num_k_windows, spatial_windows, topk, 1]
 
     # LWS's 3rd dim MUST be TOPK_LOCAL_SIZE -- the kernel's cooperative-binary-search workgroup
     # width (flashvsr_mask_adapter.py/bench_flashvsr_e2e.py both dispatch it this way). LWS=[1,1,1]
@@ -155,10 +164,10 @@ def bench_topk(spatial_windows, num_groups, num_k_windows, topk, num_heads=12,
         kernel.enqueue("flashvsr_topk_mask", [num_heads, num_groups, ls], [1, 1, ls], *args)
     lat_ms = [ns * 1e-6 for ns in cl.finish()]
     avg = sum(lat_ms) / len(lat_ms)
-    # 4 full-array passes (4-bit-per-pass MSD radix-select, see flashvsr_draft_topk.cm) reading
-    # the ushort-sized bit pattern, plus 1 final pass reading (2B) + writing (1B) the mask.
+    # 8 full-array passes (4-bit-per-pass MSD radix-select, see draft_block_mask_topk_mask.cm)
+    # reading the uint32-sized bit pattern, plus 1 final pass reading (4B) + writing (1B) the mask.
     n_total = num_heads * num_q_windows * num_k_windows
-    total_bytes = n_total * (4 * 2 + 2 + 1)
+    total_bytes = n_total * (8 * 4 + 4 + 1)
     density = topk / (spatial_windows * num_k_windows) if spatial_windows * num_k_windows > 0 else 0.0
     result = report_bw(
         f"topk_mask spatial={spatial_windows:<4} groups={num_groups} num_k={num_k_windows:<4} "

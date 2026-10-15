@@ -1,7 +1,8 @@
 """
 End-to-end per-kernel timing breakdown for FlashVSR's self-attention pipeline -- the four
-mask-generation kernels (flashvsr_draft_gemm.cm/flashvsr_draft_topk.cm, see
-flashvsr_mask_adapter.py) PLUS the actual sparse cm_sdpa_opt_prefill.cm call that consumes the
+mask-generation kernels (draft_block_mask_pool.cm/draft_block_mask_score_softmax.cm/
+draft_block_mask_topk_mask.cm, see flashvsr_mask_adapter.py) PLUS the actual sparse
+cm_sdpa_opt_prefill.cm call that consumes the
 real mask they produce -- at FlashVSR's real per-chunk configs (steady/warm-up chunks, 320x480
 portrait -> 1280x1920 case, see
 /home/ceciliapeng/repos/reports/flashvsr_v1.1_full_inference_pipeline.md and
@@ -39,11 +40,12 @@ For each chunk shape, __main__ prints:
       topk_mask, sparse SDPA) with time, a roofline utilization number (GFLOPS or GB/s depending
       on whether the kernel is compute- or bandwidth-bound), % of that density's total kernel
       time, and the summed total kernel time.
-Reflects the Stage A (4-pass MSD radix-select in flashvsr_topk_mask, replacing a 16-iteration
-binary search) and Stage B (flashvsr_score+flashvsr_softmax fused into flashvsr_score_softmax)
-optimizations -- see flashvsr_draft_topk.cm's and flashvsr_draft_gemm.cm's headers for the
-per-kernel design notes, and bench_flashvsr_mask.py for the isolated per-kernel microbenchmarks
-these changes were validated against.
+Reflects the Stage A (8-pass MSD radix-select over full float32 probs in flashvsr_topk_mask,
+replacing a 16-iteration binary search over half) and Stage B (flashvsr_score+flashvsr_softmax
+fused into flashvsr_score_softmax) optimizations -- see draft_block_mask_topk_mask.cm's and
+draft_block_mask_score_softmax.cm's headers for the per-kernel design notes, and
+bench_flashvsr_mask.py for the isolated per-kernel microbenchmarks these changes were validated
+against.
 
 Run with: python3 flashvsr/bench_flashvsr_e2e.py (from the sdpa_cm/ directory)
 """
@@ -206,7 +208,8 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     q_w = make_windowed(num_q_windows, seed=1)
     k_w = make_windowed(num_k_windows, seed=2)
 
-    gemm_kernel = gpu_mod._get_gemm_kernel(NUM_HEADS, HEAD_DIM, WINDOW_TOKENS)
+    pool_kernel = gpu_mod._get_pool_kernel(NUM_HEADS, HEAD_DIM, WINDOW_TOKENS)
+    score_softmax_kernel = gpu_mod._get_score_softmax_kernel(NUM_HEADS, HEAD_DIM)
     topk_kernel = gpu_mod._get_topk_kernel(NUM_HEADS)
 
     t_qw = cl.tensor(q_w.to(torch.float16).contiguous().numpy())
@@ -214,27 +217,31 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     t_pooled_q = cl.tensor(np.zeros((num_q_windows, NUM_HEADS, HEAD_DIM), dtype=np.float16))
     t_pooled_k = cl.tensor(np.zeros((num_k_windows, NUM_HEADS, HEAD_DIM), dtype=np.float16))
 
-    ms_pool_q = time_kernel(lambda: gemm_kernel.enqueue(
+    ms_pool_q = time_kernel(lambda: pool_kernel.enqueue(
         "flashvsr_pool", [num_q_windows, NUM_HEADS, 1], [1, 1, 1], t_qw, t_pooled_q))
-    ms_pool_k = time_kernel(lambda: gemm_kernel.enqueue(
+    ms_pool_k = time_kernel(lambda: pool_kernel.enqueue(
         "flashvsr_pool", [num_k_windows, NUM_HEADS, 1], [1, 1, 1], t_kw, t_pooled_k))
 
     t_local_mask = cl.tensor(local_mask.to(torch.uint8).contiguous().numpy())
     t_raw_scores = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.float32))
-    t_probs = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.float16))
+    # float32, not half: draft_block_mask_score_softmax.cm now emits full-precision probabilities
+    # (see draft_block_mask_topk_mask.cm's header).
+    t_probs = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.float32))
     scale = 1.0 / math.sqrt(HEAD_DIM)
-    ms_score_softmax = time_kernel(lambda: gemm_kernel.enqueue(
+    # SPATIAL_WINDOWS used for both spatial_windows and spatial_windows_k here -- this benchmark's
+    # local_mask is square (no streaming-KV-growth case being modeled).
+    ms_score_softmax = time_kernel(lambda: score_softmax_kernel.enqueue(
         "flashvsr_score_softmax", [num_q_windows, NUM_HEADS, 1], [1, 1, 1],
         t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs,
-        num_q_windows, num_k_windows, SPATIAL_WINDOWS, scale))
+        num_q_windows, num_k_windows, SPATIAL_WINDOWS, SPATIAL_WINDOWS, scale))
 
-    t_mask = cl.tensor(np.zeros((NUM_HEADS, num_q_windows, num_k_windows), dtype=np.uint8))
+    t_mask = cl.tensor(np.zeros((1, NUM_HEADS, num_q_windows, num_k_windows), dtype=np.uint8))
     ls = gpu_mod.TOPK_LOCAL_SIZE
     ms_topk = time_kernel(lambda: topk_kernel.enqueue(
         "flashvsr_topk_mask", [NUM_HEADS, q_groups, ls], [1, 1, ls],
-        t_probs, t_mask, num_q_windows, num_k_windows, SPATIAL_WINDOWS, topk))
+        t_probs, t_mask, num_q_windows, num_k_windows, SPATIAL_WINDOWS, topk, 1))
 
-    mask = torch.from_numpy(t_mask.numpy()).to(torch.bool).unsqueeze(0)
+    mask = torch.from_numpy(t_mask.numpy()).to(torch.bool)  # already (1, NUM_HEADS, nq, nk)
     measured_density = mask.float().mean().item()
 
     # Sparse self-attention SDPA, using the REAL mask produced above (not a synthetic density).
@@ -256,7 +263,9 @@ def bench_sparse_at_density(name, f, cache_groups, density):
     pool_k_bytes = num_k_windows * WINDOW_TOKENS * NUM_HEADS * HEAD_DIM * 2
     score_flops = 2 * NUM_HEADS * num_q_windows * num_k_windows * HEAD_DIM
     n_probs = NUM_HEADS * num_q_windows * num_k_windows
-    topk_bytes = n_probs * (4 * 2 + 2 + 1)
+    # 8 full-array passes over the uint32-sized bit pattern, plus 1 final read(4B)+write(1B) pass
+    # -- see draft_block_mask_topk_mask.cm.
+    topk_bytes = n_probs * (8 * 4 + 4 + 1)
 
     bw_pq, u_pq = bw_util(pool_q_bytes, ms_pool_q)
     bw_pk, u_pk = bw_util(pool_k_bytes, ms_pool_k)

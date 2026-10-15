@@ -1,7 +1,9 @@
 # FlashVSR draft-mask generation: utilization findings and Stage C optimization
 
 Follow-up to the radix-select/score-softmax-fusion pass (see git history for
-`flashvsr_draft_topk.cm`/`flashvsr_draft_gemm.cm`). After that pass, two
+`flashvsr_draft_topk.cm`/`flashvsr_draft_gemm.cm`, since renamed/split upstream into
+`draft_block_mask_topk_mask.cm`/`draft_block_mask_pool.cm`/`draft_block_mask_score_softmax.cm`).
+After that pass, two
 utilization hotspots remained, at very different scales:
 
 1. **`cm_sdpa_opt_prefill` (sparse) itself** -- 73-80% of the total critical
