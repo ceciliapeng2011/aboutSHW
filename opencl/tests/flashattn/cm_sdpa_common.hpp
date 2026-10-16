@@ -468,6 +468,263 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
     }
 }
 
+// ============================================================================================
+// Two-source variant: ring (history, persistent) + current (this step's own new K/V) are two
+// INDEPENDENT buffers that are never concatenated in memory -- the online-softmax accumulators
+// (cur_max/cur_sum/rO) are shared across both sources, so attending to "ring then current" is
+// numerically identical to attending to concat(ring, current) in one pass. See
+// flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md Sec 3.3/10.4 (the real
+// BlockSparseAttention/DraftBlockMask primitives' `input[1]=key_cache.<layer>` +
+// `input[2]=k_new_f16` ABI this mirrors) and cm_sdpa_opt_prefill_multisource.cm.
+//
+// Deliberately NOT generalized to causal masking or the dense additive attn_mask: FlashVSR's own
+// self-attention never uses either (only the sparse block-table mask), so this stays its own
+// small, independently-testable code path alongside (not merged into) sdpa_kernel_lsc_prefetch
+// above, which remains untouched.
+
+// Processes one source's full KV range [0, kv_stop) into the SHARED cur_max/cur_sum/rO
+// accumulators. kv_stop<=0 (an empty source, e.g. chunk0's not-yet-populated ring, or warmup's
+// absent "current" split) is a no-op -- constructing a block_2d_desc with height kv_stop-1 would
+// underflow for kv_stop==0, so this is checked before any descriptor is built.
+// sparse_mask_base must already be offset by the caller to this source's own block-index range
+// within one combined mask buffer (ring blocks first, current blocks second).
+template <int head_size, int wg_local_size, int sparse_block_size>
+CM_INLINE void sdpa_accumulate_kv_source(
+    int wg_local_id,
+    int kv_stop,
+    uint k_pitch_bytes,
+    uint v_pitch_bytes,
+    svmptr_t k_base [[type("svmptr_t")]],
+    svmptr_t v_base [[type("svmptr_t")]],
+    svmptr_t sparse_mask_base [[type("svmptr_t")]],
+    matrix_ref<half, ((head_size + 16 - 1) / 16 * 16) / REG_K, REG_K * REG_N> rQ,
+    vector_ref<float, q_step> cur_max,
+    vector_ref<float, q_step> cur_sum,
+    matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO) {
+    static_assert(sparse_block_size > 1, "dense dual-source is out of scope -- use sdpa_kernel_lsc_prefetch for single-source dense attention");
+    if (kv_stop <= 0)
+        return;
+
+    constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
+    constexpr int num_P_tiles = REG_N / REG_M;
+
+    lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
+
+    static_assert(wg_local_size == 16);
+    lsc::block_2d_desc<half, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
+
+    constexpr int KV_BLK = CMFLA_KV_BLK;
+    constexpr int num_K = kv_step / REG_M;
+    constexpr int BLK_ROWS = KV_BLK * kv_step;
+
+    // Warm up first K and V tiles before the loop so kv_base=0 finds them in cache (identical
+    // mechanism to sdpa_kernel_lsc_prefetch above, just scoped to this source's own range).
+    prefetch_K.set_block_y(wg_local_id);
+    prefetch_V.set_block_y(wg_local_id);
+    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+    cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
+#    pragma unroll
+    for (int ri = 1; ri < padded_head_size / REG_K; ri++) {
+        cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri * REG_K));
+        cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri * REG_N));
+    }
+
+    for (int kv_base = 0; kv_base < kv_stop; kv_base += BLK_ROWS) {
+        // ---- block-sparsity: skip this whole KV_BLK chunk (no load, no DPAS) when its
+        // sparse_block_size-sized bucket is masked out -- indexed relative to THIS source's own
+        // kv_base (sparse_mask_base already points at this source's row in the combined mask).
+        {
+            constexpr int sb_shift = (sparse_block_size == 128) ? 7 : (sparse_block_size == 256) ? 8 : -1;
+            static_assert(sb_shift > 0, "sparse_block_size must be 128 or 256");
+            static_assert(sparse_block_size % BLK_ROWS == 0,
+                          "sparse_block_size must be a multiple of KV_BLK*kv_step so a chunk never straddles a sparse block");
+            if (sparse_mask_base && !((const bool*)sparse_mask_base)[(uint)kv_base >> sb_shift]) {
+                continue;
+            }
+        }
+
+        //# St = K @ Q^T for KV_BLK stacked sub-tiles -> [KV_BLK*kv_step, q_step]
+        matrix<float, BLK_ROWS, q_step> St;
+        auto St2 = St.format<float, KV_BLK * num_K, REG_M * REG_N>();
+#    pragma unroll
+        for (int b = 0; b < KV_BLK; b++) {
+            int kv_pos = kv_base + b * kv_step;
+            matrix<half, num_K, REG_M * REG_K> Kmat;
+            prefetch_K.set_block_y(wg_local_id + kv_pos + BLK_ROWS);
+            prefetch_V.set_block_y(wg_local_id + kv_pos);
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
+            cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
+
+            b2dK.set_block_y(kv_pos);
+            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+#    pragma unroll
+            for (int k = 0; k < num_K; k++)
+                St2.row(b * num_K + k) =
+                    cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(0, rQ[0].format<int32_t>(), Kmat[k].format<int32_t>());
+
+#    pragma unroll
+            for (int ri = 1; ri < padded_head_size / REG_K; ri++) {
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri * REG_K));
+                cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri * REG_N));
+                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
+#    pragma unroll
+                for (int k = 0; k < num_K; k++) {
+                    St2.row(b * num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(St2.row(b * num_K + k),
+                                                                                                                          rQ[ri].format<int32_t>(),
+                                                                                                                          Kmat[k].format<int32_t>());
+                }
+            }
+        }
+
+        // ---- kv-tail mask (no causal mask in this kernel family -- see file header comment) ----
+        {
+            int kv_tokens = kv_stop - kv_base;
+            for (int p = kv_tokens; p < BLK_ROWS; p++)
+                St[p] = -3.4e38f;
+        }
+
+        // ---- one online-softmax update over the whole block ----
+        auto max_comp = cm_online_softmax_update(St, cur_max, cur_sum);
+
+        // ---- rescale rO ----
+        if constexpr (KV_BLK >= 2) {
+            if (kv_base > 0) {
+#    pragma unroll
+                for (int t = 0; t < padded_head_size / REG_N * num_P_tiles; t++) {
+                    auto cO = rO[t].format<float, REG_M, REG_N>();
+#    pragma unroll
+                    for (int r = 0; r < REG_M; r++)
+                        cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles) * REG_M]);
+                }
+            }
+        } else {
+#    pragma unroll
+            for (int t = 0; t < padded_head_size / REG_N * num_P_tiles; t++) {
+                auto cO = rO[t].format<float, REG_M, REG_N>();
+#    pragma unroll
+                for (int r = 0; r < REG_M; r++)
+                    cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles) * REG_M]);
+            }
+        }
+
+        // ---- transpose each sub-tile and accumulate P@V into rO ----
+        constexpr int num_Vchunks = padded_head_size / REG_N;
+#    pragma unroll
+        for (int b = 0; b < KV_BLK; b++) {
+            matrix<half, REG_N, REG_K> P;
+            transpose_St_to_P_half(St.select<kv_step, 1, q_step, 1>(b * kv_step, 0), P);
+            auto P2 = P.format<half, num_P_tiles, REG_M * REG_K>();
+            b2dV.set_block_y(kv_base + b * kv_step);
+#    pragma unroll
+            for (int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
+                matrix<half, REG_K / 2, REG_N * 2> Vmat;
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
+#    pragma unroll
+                for (int p = 0; p < num_P_tiles; p++) {
+                    rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(rO[ri + p].format<float>(),
+                                                                                                       Vmat.format<int32_t>(),
+                                                                                                       P2.row(p).format<int32_t>());
+                }
+            }
+        }
+    }
+}
+
+template <int num_heads, int num_kv_heads, int head_size, int wg_local_size, int sparse_block_size>
+void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
+                                   int q_len,
+                                   uint q_pitch_bytes,
+                                   svmptr_t q_base [[type("svmptr_t")]],
+                                   svmptr_t o_base [[type("svmptr_t")]],
+                                   int kv_len_ring,
+                                   uint k_pitch_bytes_ring,
+                                   uint v_pitch_bytes_ring,
+                                   svmptr_t k_base_ring [[type("svmptr_t")]],
+                                   svmptr_t v_base_ring [[type("svmptr_t")]],
+                                   svmptr_t sparse_mask_ring [[type("svmptr_t")]],
+                                   int kv_len_cur,
+                                   uint k_pitch_bytes_cur,
+                                   uint v_pitch_bytes_cur,
+                                   svmptr_t k_base_cur [[type("svmptr_t")]],
+                                   svmptr_t v_base_cur [[type("svmptr_t")]],
+                                   svmptr_t sparse_mask_cur [[type("svmptr_t")]],
+                                   uint o_pitch_bytes = num_heads * head_size * sizeof(half),
+                                   float q_prescale_rt = q_prescale) {
+    uint o_pitch = o_pitch_bytes;
+    constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
+
+    vector<float, q_step> cur_max;
+    vector<float, q_step> cur_sum;
+
+    cur_max = -3e38f;
+    cur_sum = 0;
+    constexpr int num_P_tiles = REG_N / REG_M;
+    matrix<half, padded_head_size / REG_K, REG_K * REG_N> rQ;
+    matrix<float, padded_head_size / REG_N * num_P_tiles, REG_M * REG_N> rO;
+    rO = 0.0f;
+
+    auto q_tokens_left = q_len;
+    static_assert(q_step == REG_N);
+    static_assert(kv_step == REG_K);
+
+    if (q_tokens_left < 0)
+        q_tokens_left = 0;
+    if (q_tokens_left > q_step)
+        q_tokens_left = q_step;
+
+    if (q_tokens_left > 0) {
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(reinterpret_cast<uint*>(q_base),
+                                                           q_tokens_left - 1,
+                                                           head_size * sizeof(half) - 1,
+                                                           q_pitch_bytes - 1,
+                                                           0,
+                                                           0);
+#    pragma unroll
+        for (int k = 0, ri = 0; k < padded_head_size / 2; k += REG_K / 2, ri++) {
+            cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale_rt);
+        }
+    }
+
+    // ---- ring, then current: numerically equivalent to one pass over concat(ring, current) ----
+    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(
+        wg_local_id, kv_len_ring, k_pitch_bytes_ring, v_pitch_bytes_ring,
+        k_base_ring, v_base_ring, sparse_mask_ring, rQ, cur_max, cur_sum, rO);
+    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(
+        wg_local_id, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
+        k_base_cur, v_base_cur, sparse_mask_cur, rQ, cur_max, cur_sum, rO);
+
+    if (q_tokens_left == 0)
+        return;
+
+    //# save cur_O/cur_sum.transpose(0, 1)
+    matrix<half, num_P_tiles * REG_M, REG_N> cur_O_f16;
+    // Guard the all-masked-row case (every KV block skipped across both sources): see
+    // sdpa_kernel_lsc_prefetch's identical guard above for the NaN-avoidance rationale.
+    vector<unsigned short, q_step> cur_sum_is_zero = (cur_sum == 0.0f);
+    cur_sum = cm_inv(cur_sum);
+    cur_sum.merge(0.0f, cur_sum_is_zero);
+
+    lsc::block_2d_desc<half, 1, REG_M, REG_N> b2dO(o_base, q_tokens_left - 1, head_size * sizeof(half) - 1, o_pitch - 1, 0, 0);
+
+#    pragma unroll
+    for (int k = 0, ri = 0; k < padded_head_size; k += REG_N, ri += num_P_tiles) {
+#    pragma unroll
+        for (int p = 0; p < num_P_tiles; p++) {
+            auto cO = rO[ri + p].format<float, REG_M, REG_N>();
+#    pragma unroll
+            for (int r = 0; r < cO.n_rows(); r++) {
+                cur_O_f16[r + p * REG_M] = cm_mul<float>(cO.row(r), cur_sum[r + p * REG_M]);
+            }
+        }
+        b2dO.set_block_x(k);
+        cm_store(b2dO.set_block_y(0), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
+        cm_store(b2dO.set_block_y(REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
+    }
+}
+
 #else  // CM_HAS_LSC_UNTYPED_2D
 
 template <bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused = 0>

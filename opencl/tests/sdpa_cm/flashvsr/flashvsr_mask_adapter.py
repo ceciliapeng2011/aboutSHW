@@ -134,3 +134,91 @@ def build_draft_mask_gpu(batch_size, nheads, seqlen, q_w, k_w, topk=10, local_at
 
     mask = torch.from_numpy(t_mask.numpy()).to(torch.bool)
     return mask  # -> (batch_size, nheads, num_q_windows, num_k_windows)
+
+
+def build_draft_mask_gpu_multisource(batch_size, nheads, seqlen, q_w, k_ring_w, k_cur_w,
+                                      topk=10, local_attn_mask=None):
+    """Two-source variant of build_draft_mask_gpu: mirrors the real DraftBlockMask primitive's
+    `input[1]=key_cache.<layer>` (ring, persistent) + `input[2]=k_new_f16` (current, this chunk's
+    own new K) ABI (see flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md Sec 10.4) --
+    `k_ring_w` and `k_cur_w` are two INDEPENDENT buffers, never concatenated on the host or on
+    device before pooling.
+
+    k_ring_w: (num_ring_windows, window_tokens, nheads*head_dim) -- ring/history K windows.
+    k_cur_w:  (num_cur_windows, window_tokens, nheads*head_dim) -- this chunk's own new K windows.
+    Combined k_w semantics (num_k_windows = num_ring_windows + num_cur_windows, ring windows first)
+    are otherwise identical to build_draft_mask_gpu's single k_w -- only the pooling stage (Stage 1,
+    draft_block_mask_pool.cm) ever reads the raw windowed K; that kernel already treats its input as
+    an arbitrary-length windowed buffer, so pooling ring and current separately into two slices of
+    one pooled_k buffer is sufficient -- score_softmax/topk_mask (Stages 2/3) are reused UNCHANGED,
+    operating on the combined (but tiny, already-pooled) pooled_k exactly as build_draft_mask_gpu
+    does today.
+
+    Returns: (batch_size, nheads, num_q_windows, num_ring_windows+num_cur_windows) bool torch
+    tensor -- bit-identical to build_draft_mask_gpu(..., k_w=torch.cat([k_ring_w, k_cur_w])) (see
+    test_flashvsr_mask_multisource.py).
+    """
+    assert local_attn_mask is not None, "local_attn_mask must be provided"
+
+    num_q_windows, window_tokens, d_full = q_w.shape
+    num_ring_windows = k_ring_w.shape[0]
+    num_cur_windows = k_cur_w.shape[0]
+    assert k_ring_w.shape[1:] == (window_tokens, d_full)
+    assert k_cur_w.shape[1:] == (window_tokens, d_full)
+    assert d_full % nheads == 0
+    head_dim = d_full // nheads
+    spatial_windows = local_attn_mask.shape[0]
+    spatial_windows_k = local_attn_mask.shape[1]
+    assert num_q_windows % seqlen == 0, "num_q_windows must be seqlen * spatial_windows"
+    assert num_q_windows // seqlen == spatial_windows, (
+        "local_attn_mask's spatial extent must match q_w's windows-per-temporal-group"
+    )
+
+    num_k_windows = num_ring_windows + num_cur_windows
+
+    pool_kernel = _get_pool_kernel(nheads, head_dim, window_tokens)
+    score_softmax_kernel = _get_score_softmax_kernel(nheads, head_dim)
+    topk_kernel = _get_topk_kernel(nheads)
+
+    q_w_np = q_w.to(torch.float16).contiguous().numpy()
+    k_ring_w_np = k_ring_w.to(torch.float16).contiguous().numpy()
+    k_cur_w_np = k_cur_w.to(torch.float16).contiguous().numpy()
+
+    t_pooled_q = _pool(pool_kernel, q_w_np, num_q_windows, nheads, head_dim)
+
+    # Ring and current are pooled from two SEPARATE device buffers (never concatenated, raw or
+    # windowed) via two independent dispatches of the unchanged draft_block_mask_pool.cm kernel.
+    # cl.tensor.numpy() is a device->host copy (not a view, see clops/cl/cl.cpp's tensor::to_numpy),
+    # so the two pooled results are assembled into one CONTIGUOUS HOST array first and uploaded as
+    # a single device tensor -- only the tiny pooled buffer is ever concatenated, never raw K.
+    pooled_k_np = np.zeros((num_k_windows, nheads, head_dim), dtype=np.float16)
+    if num_ring_windows > 0:
+        t_pooled_k_ring = _pool(pool_kernel, k_ring_w_np, num_ring_windows, nheads, head_dim)
+        pooled_k_np[0:num_ring_windows] = t_pooled_k_ring.numpy()
+    if num_cur_windows > 0:
+        t_pooled_k_cur = _pool(pool_kernel, k_cur_w_np, num_cur_windows, nheads, head_dim)
+        pooled_k_np[num_ring_windows:num_k_windows] = t_pooled_k_cur.numpy()
+    t_pooled_k = cl.tensor(pooled_k_np)
+
+    local_mask_np = local_attn_mask.to(torch.bool).to(torch.uint8).contiguous().numpy()
+    t_local_mask = cl.tensor(local_mask_np)
+    t_raw_scores = cl.tensor(np.zeros((nheads, num_q_windows, num_k_windows), dtype=np.float32))
+    t_probs = cl.tensor(np.zeros((nheads, num_q_windows, num_k_windows), dtype=np.float32))
+
+    scale = 1.0 / math.sqrt(head_dim)
+    score_softmax_kernel.enqueue(
+        "flashvsr_score_softmax", [num_q_windows, nheads, 1], [1, 1, 1],
+        t_pooled_q, t_pooled_k, t_local_mask, t_raw_scores, t_probs,
+        num_q_windows, num_k_windows, spatial_windows, spatial_windows_k, scale,
+    )
+
+    num_groups = seqlen
+    t_mask = cl.tensor(np.zeros((batch_size, nheads, num_q_windows, num_k_windows), dtype=np.uint8))
+    topk_local_size = TOPK_LOCAL_SIZE
+    topk_kernel.enqueue(
+        "flashvsr_topk_mask", [nheads, num_groups, topk_local_size], [1, 1, topk_local_size],
+        t_probs, t_mask, num_q_windows, num_k_windows, spatial_windows, int(topk), int(batch_size),
+    )
+
+    mask = torch.from_numpy(t_mask.numpy()).to(torch.bool)
+    return mask  # -> (batch_size, nheads, num_q_windows, num_ring_windows+num_cur_windows)
