@@ -31,24 +31,29 @@
 // compile-time transpose order. SWAPPED (heads inner) -> tokens are num_heads*head_size apart.
 // IDENTITY (heads outer) -> tokens are head_size apart (heads live in separate seq_len*head_size
 // chunks, handled by get_head_byte_offset below).
-template<int order>
+//
+// elem_size defaults to sizeof(half) (every existing caller's behavior, unchanged). An fp8e4m3
+// ring buffer (see KV_RING_FP8E4M3 in cm_sdpa_opt_prefill_multisource.cm) packs 1 byte/element
+// instead of 2, so its own pitch/offset must be computed with elem_size=sizeof(uchar) -- callers
+// opt in explicitly by passing the second template argument.
+template<int order, int elem_size = sizeof(half)>
 inline uint get_seq_pitch_bytes(int seq_len, int num_heads, int head_size) {
     if constexpr (order == TRANSPOSE_ORDER_SWAPPED)
-        return num_heads * head_size * sizeof(half);
+        return num_heads * head_size * elem_size;
     else
-        return head_size * sizeof(half);
+        return head_size * elem_size;
 }
 
 // Byte offset of head `h`'s sub-tensor within one batch's chunk.
-template<int order>
+template<int order, int elem_size = sizeof(half)>
 inline uint get_head_byte_offset(int h, int seq_len, int head_size) {
     if constexpr (order == TRANSPOSE_ORDER_SWAPPED)
-        return h * head_size * sizeof(half);
+        return h * head_size * elem_size;
     else
-        return (uint)h * seq_len * head_size * sizeof(half);
+        return (uint)h * seq_len * head_size * elem_size;
 }
 
 // Byte size of one batch's chunk (invariant to transpose order -- same total elements either way).
-inline uint get_batch_byte_stride(int seq_len, int num_heads, int head_size) {
-    return (uint)seq_len * num_heads * head_size * sizeof(half);
+inline uint get_batch_byte_stride(int seq_len, int num_heads, int head_size, int elem_size = sizeof(half)) {
+    return (uint)seq_len * num_heads * head_size * elem_size;
 }
