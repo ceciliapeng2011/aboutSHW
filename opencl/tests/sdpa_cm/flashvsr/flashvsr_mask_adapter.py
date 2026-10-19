@@ -17,6 +17,7 @@ per-kernel math/design notes):
 import functools
 import math
 import os
+import sys
 
 import numpy as np
 import torch
@@ -24,6 +25,15 @@ import torch
 from clops import cl
 
 CWD = os.path.dirname(os.path.realpath(__file__))
+# hf8_e4m3_ref.py (the fp8e4m3<->fp16 host reference/LUT-builder) lives one level up, in sdpa_cm/
+# itself, not flashvsr/ -- add it to sys.path the same way the test_flashvsr_* files in this
+# directory already do for their own sdpa_cm-root imports, so this module stays importable
+# regardless of which directory the importing script's own sys.path already covers.
+SDPA_CM_DIR = os.path.dirname(CWD)
+if SDPA_CM_DIR not in sys.path:
+    sys.path.insert(0, SDPA_CM_DIR)
+
+from hf8_e4m3_ref import build_hf8_decode_lut_f16
 
 # Must match draft_block_mask_topk_mask.cm's TOPK_LOCAL_SIZE default -- number of work items per
 # workgroup cooperatively binary-searching one (head, Q-temporal-group)'s top-k threshold.
@@ -31,14 +41,29 @@ TOPK_LOCAL_SIZE = 32
 
 
 @functools.cache
-def _get_pool_kernel(num_heads, head_dim, window_tokens):
+def _get_pool_kernel(num_heads, head_dim, window_tokens, k_fp8e4m3=False):
+    """k_fp8e4m3: compiles the K_FP8E4M3=1 variant of draft_block_mask_pool.cm (fp8e4m3-packed
+    `windowed` input, decode-on-read via the LUT-gather path, extra hf8_lut kernel param). Only
+    ever meaningful for a K-pooling dispatch -- Q is never quantized in this project, so Q-pooling
+    always goes through the default k_fp8e4m3=False (plain half) variant; see pool_k_fp8e4m3
+    below."""
     src = r'''#include "draft_block_mask_pool.cm"'''
     opts = (
         f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256 -mCM_printregusage '
         f"-I{CWD} -DKERNEL_NAME=flashvsr_pool "
-        f"-DNUM_HEADS={num_heads} -DHEAD_DIM={head_dim} -DWINDOW_TOKENS={window_tokens}"
+        f"-DNUM_HEADS={num_heads} -DHEAD_DIM={head_dim} -DWINDOW_TOKENS={window_tokens} "
+        f"-DK_FP8E4M3={int(k_fp8e4m3)}"
     )
     return cl.kernels(src, opts)
+
+
+@functools.cache
+def _get_hf8_lut_tensor():
+    """Host-built 256-entry half decode LUT (see hf8_e4m3_ref.build_hf8_decode_lut_f16) for the
+    K_FP8E4M3 pooling path's hf8_lut kernel param. A tiny (512B) constant table shared by every
+    fp8 K-pooling dispatch regardless of shape, so it's built/uploaded once and cached like a
+    compiled kernel rather than re-uploaded per call."""
+    return cl.tensor(build_hf8_decode_lut_f16())
 
 
 @functools.cache
@@ -63,11 +88,33 @@ def _get_topk_kernel(num_heads):
     return cl.kernels(src, opts)
 
 
-def _pool(kernel, windowed_np, num_windows, num_heads, head_dim):
+def _pool(kernel, windowed_np, num_windows, num_heads, head_dim, hf8_lut_tensor=None):
     t_in = cl.tensor(windowed_np)
     t_out = cl.tensor(np.zeros((num_windows, num_heads, head_dim), dtype=np.float16))
-    kernel.enqueue("flashvsr_pool", [num_windows, num_heads, 1], [1, 1, 1], t_in, t_out)
+    if hf8_lut_tensor is not None:
+        kernel.enqueue("flashvsr_pool", [num_windows, num_heads, 1], [1, 1, 1], t_in, hf8_lut_tensor, t_out)
+    else:
+        kernel.enqueue("flashvsr_pool", [num_windows, num_heads, 1], [1, 1, 1], t_in, t_out)
     return t_out
+
+
+def pool_k_fp8e4m3(k_w_fp8_bytes, num_k_windows, nheads, head_dim, window_tokens):
+    """Opt-in fp8e4m3-packed-input K-pooling dispatch: K_FP8E4M3=1 compiled variant of
+    draft_block_mask_pool.cm, decoding each raw K byte on the fly (LUT-gather, see
+    hf8_e4m3_decode_to_f16_lut in draft_block_mask_pool.cm) instead of mean-pooling an
+    already-materialized half copy of the windowed K buffer. Q is never quantized in this project
+    (only ring K/V ever is) -- there is no fp8 counterpart for Q, callers must keep routing Q
+    through the existing half `_pool`/`build_draft_mask_gpu*` path.
+
+    k_w_fp8_bytes: (num_k_windows, window_tokens, nheads*head_dim) uint8 array of fp8e4m3-encoded
+    bytes (see hf8_e4m3_ref.encode_f16_to_hf8).
+    Returns: (num_k_windows, nheads, head_dim) half cl.tensor -- bit-identical (see
+    test_flashvsr_mask_pool_fp8.py) to running the unmodified half kernel on the
+    host-decoded-back-to-half version of the same bytes.
+    """
+    kernel = _get_pool_kernel(nheads, head_dim, window_tokens, k_fp8e4m3=True)
+    lut = _get_hf8_lut_tensor()
+    return _pool(kernel, k_w_fp8_bytes, num_k_windows, nheads, head_dim, hf8_lut_tensor=lut)
 
 
 def build_draft_mask_gpu(batch_size, nheads, seqlen, q_w, k_w, topk=10, local_attn_mask=None):

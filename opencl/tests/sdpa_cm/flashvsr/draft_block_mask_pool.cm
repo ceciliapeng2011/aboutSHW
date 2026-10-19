@@ -3,14 +3,24 @@
 //
 
 // Stage 1 of DraftBlockMask (FlashVSR's generate_draft_block_mask, wan_video_dit.py:116-153):
-// mean-pool a windowed [N, WINDOW_TOKENS, NUM_HEADS*HEAD_DIM] half tensor over the WINDOW_TOKENS
-// dim, per head -> pooled [N, NUM_HEADS, HEAD_DIM] half. Bandwidth-bound: reads the full windowed
-// Q/K, same order of bytes as the main attention op itself. The same kernel entry point is used for
-// both Q and K, bound to different input/output buffers and dispatch sizes by the host (see
-// DraftBlockMaskPoolGenerator in draft_block_mask.cpp).
+// mean-pool a windowed [N, WINDOW_TOKENS, NUM_HEADS*HEAD_DIM] half (or, with K_FP8E4M3, fp8e4m3)
+// tensor over the WINDOW_TOKENS dim, per head -> pooled [N, NUM_HEADS, HEAD_DIM] half. Bandwidth-
+// bound: reads the full windowed Q/K, same order of bytes as the main attention op itself. The
+// same kernel entry point is used for both Q and K, bound to different input/output buffers and
+// dispatch sizes by the host (see DraftBlockMaskPoolGenerator in draft_block_mask.cpp).
 //
-// JIT constants: NUM_HEADS, HEAD_DIM, WINDOW_TOKENS
+// JIT constants: NUM_HEADS, HEAD_DIM, WINDOW_TOKENS, K_FP8E4M3 (default 0)
 // GWS: [N, NUM_HEADS, 1], LWS: [1,1,1].
+//
+// K_FP8E4M3: this project's ring K/V cache may be stored fp8e4m3-packed (1 byte/element) to save
+// device memory; Q is never quantized (only ring K/V ever is, see the BlockSparseAttention
+// fp8-ring work this mirrors), so this flag only ever applies to a K-pooling dispatch -- the host
+// picks which compiled kernel variant (K_FP8E4M3=0/1) to bind to which buffer, same mechanism that
+// already lets this one kernel source serve both Q- and K-pooling. When set, `windowed` is
+// fp8e4m3-packed uchar instead of half, an extra `hf8_lut` param carries the base pointer of a
+// host-built 256-entry half decode LUT (see hf8_e4m3_ref.py's build_hf8_decode_lut_f16), and each
+// row is read as HEAD_DIM raw bytes and decoded on the fly before accumulation. `pooled` (the
+// output) stays half unconditionally either way -- only the input side changes.
 //
 #include <cm/cm.h>
 #include <cm/cmtl.h>
@@ -19,8 +29,39 @@
 #define ATTR [[type("svmptr_t")]]
 #endif
 
+#ifndef K_FP8E4M3
+#define K_FP8E4M3 0
+#endif
+
+#if K_FP8E4M3
+// Deliberate duplicate of cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut (the BlockSparseAttention
+// fp8-ring work's already-proven-correct, proven-faster-than-bit-manipulation LUT-gather decode --
+// see that function's own doc comment in flashattn/cm_sdpa_common.hpp for the full rationale/CM-
+// spec citation). NOT reused via #include here: that header unconditionally pulls in
+// cm_attention_common.hpp, which hard-requires SDPA-specific JIT state this plain elementwise
+// mean-pool kernel has no reason to define (CMFLA_SCALE_FACTOR has no #ifndef fallback, and several
+// static_asserts/templates are gated on DPAS/systolic-array tiling constants (REG_N/REG_K,
+// q_step/kv_step) that only make sense for the matmul-shaped SDPA kernels). Bit-exact parity with
+// the original is covered by this directory's own fp8 pool test, which drives both through the same
+// LUT (hf8_e4m3_ref.build_hf8_decode_lut_f16) and the same byte inputs.
+template <int N>
+CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, svmptr_t lut_base) {
+    // Widen to uint before the *sizeof(half) multiply: raw is 0..255, so plain uchar arithmetic
+    // would overflow (255*2==510) well before a later widening could save it.
+    vector<uint, N> idx = raw;
+    vector<uint, N> offsets = idx * (uint)sizeof(half);
+    return cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
+        reinterpret_cast<half*>(lut_base), offsets);
+}
+#endif
+
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
+#if K_FP8E4M3
+    uchar* windowed ATTR,
+    half* hf8_lut ATTR,
+#else
     half* windowed ATTR,
+#endif
     half* pooled ATTR) {
     constexpr uint D_full = NUM_HEADS * HEAD_DIM;
     uint w = cm_group_id(0);
@@ -30,9 +71,24 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
 
     vector<float, HEAD_DIM> acc = 0;
     for (uint t = 0; t < WINDOW_TOKENS; t++) {
+        vector<float, HEAD_DIM> row_f;
+#if K_FP8E4M3
+        // Plain int-granularity block read of the HEAD_DIM raw bytes (same recipe the half path
+        // below already uses for its own row, just at 1/4 the stride instead of 1/2): a scalar-
+        // offset cm_ptr_load<uchar,N> hits this toolchain's "transposed load only supports U32/U64"
+        // restriction (/cm/builtin/cm/cm_lsc.h), so HEAD_DIM is read as HEAD_DIM/4 ints and
+        // reinterpreted via .format<uchar>() instead -- requires HEAD_DIM % 4 == 0 (true for every
+        // config this project uses, e.g. production HEAD_DIM=128).
+        vector<uchar, HEAD_DIM> raw_row;
+        raw_row.format<int>() =
+            cm_ptr_load<int, HEAD_DIM / 4>((int*)windowed, (row_base_elems + t * D_full) * (uint)sizeof(uchar));
+        vector<half, HEAD_DIM> row = hf8_e4m3_decode_to_f16_lut<HEAD_DIM>(raw_row.select_all(), reinterpret_cast<svmptr_t>(hf8_lut));
+        row_f = row;
+#else
         vector<half, HEAD_DIM> row;
         row.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)windowed, (row_base_elems + t * D_full) * (uint)sizeof(half));
-        vector<float, HEAD_DIM> row_f = row;
+        row_f = row;
+#endif
         acc += row_f;
     }
     vector<half, HEAD_DIM> out = acc * (1.0f / (float)WINDOW_TOKENS);

@@ -1174,13 +1174,22 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
 // small, independently-testable code path alongside (not merged into) sdpa_kernel_lsc_prefetch
 // above, which remains untouched.
 
+// hf8_e4m3_decode_to_f16 (fp8e4m3 -> fp16 in-register decode) is declared near the top of this
+// file, ahead of sdpa_kernel_lsc_prefetch above -- see its doc comment there for the full
+// rationale/algorithm description and why it has to precede both of its callers.
+
 // Processes one source's full KV range [0, kv_stop) into the SHARED cur_max/cur_sum/rO
 // accumulators. kv_stop<=0 (an empty source, e.g. chunk0's not-yet-populated ring, or warmup's
 // absent "current" split) is a no-op -- constructing a block_2d_desc with height kv_stop-1 would
 // underflow for kv_stop==0, so this is checked before any descriptor is built.
 // sparse_mask_base must already be offset by the caller to this source's own block-index range
 // within one combined mask buffer (ring blocks first, current blocks second).
-template <int head_size, int wg_local_size, int sparse_block_size>
+//
+// KVElemT: half for today's fp16 K/V (default -- unchanged behavior) or uchar for an
+// fp8e4m3-packed source, decoded to half in-register right before each DPAS (see
+// hf8_e4m3_decode_to_f16 above). Only the ring source is ever invoked with KVElemT=uchar --
+// current always stays half, see sdpa_kernel_lsc_prefetch_2src's two call sites below.
+template <int head_size, int wg_local_size, int sparse_block_size, typename KVElemT = half>
 CM_INLINE void sdpa_accumulate_kv_source(
     int wg_local_id,
     int kv_stop,
@@ -1194,18 +1203,21 @@ CM_INLINE void sdpa_accumulate_kv_source(
     vector_ref<float, q_step> cur_sum,
     matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO) {
     static_assert(sparse_block_size > 1, "dense dual-source is out of scope -- use sdpa_kernel_lsc_prefetch for single-source dense attention");
+    static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
+                  "KVElemT must be half (fp16 K/V, default) or uchar (fp8e4m3-packed ring K/V)");
     if (kv_stop <= 0)
         return;
 
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
     constexpr int num_P_tiles = REG_N / REG_M;
+    constexpr bool fp8_kv = std::is_same<KVElemT, uchar>::value;
 
-    lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<KVElemT, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<KVElemT, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
 
     static_assert(wg_local_size == 16);
-    lsc::block_2d_desc<half, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<half, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<KVElemT, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<KVElemT, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
 
     constexpr int KV_BLK = CMFLA_KV_BLK;
     constexpr int num_K = kv_step / REG_M;
@@ -1250,7 +1262,16 @@ CM_INLINE void sdpa_accumulate_kv_source(
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
 
             b2dK.set_block_y(kv_pos);
-            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            if constexpr (fp8_kv) {
+                // K path (simple case): raw fp8e4m3 bytes load as a plain 2D block (same tile
+                // shape as the half path, 1 byte/elem instead of 2), decoded to half in-register
+                // right before cm_dpas -- no separate reorder kernel, no extra buffer.
+                matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
+                cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(0));
+                Kmat.format<half>() = hf8_e4m3_decode_to_f16<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>());
+            } else {
+                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
+            }
 #    pragma unroll
             for (int k = 0; k < num_K; k++)
                 St2.row(b * num_K + k) =
@@ -1260,7 +1281,13 @@ CM_INLINE void sdpa_accumulate_kv_source(
             for (int ri = 1; ri < padded_head_size / REG_K; ri++) {
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri * REG_K));
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri * REG_N));
-                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
+                if constexpr (fp8_kv) {
+                    matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
+                    cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(ri * REG_K));
+                    Kmat.format<half>() = hf8_e4m3_decode_to_f16<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>());
+                } else {
+                    cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
+                }
 #    pragma unroll
                 for (int k = 0; k < num_K; k++) {
                     St2.row(b * num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(St2.row(b * num_K + k),
@@ -1312,7 +1339,28 @@ CM_INLINE void sdpa_accumulate_kv_source(
 #    pragma unroll
             for (int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
                 matrix<half, REG_K / 2, REG_N * 2> Vmat;
-                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
+                if constexpr (fp8_kv) {
+                    // V path (harder case): hardware cm_load<lsc::VNNI> only knows how to
+                    // half-pair-interleave 2-byte (half) source elements -- there is no 1-byte
+                    // VNNI transform to ask the LSC unit for. So: load the raw fp8e4m3 bytes as a
+                    // PLAIN (non-VNNI) 2D block (REG_K rows x REG_N cols, same shape as the K
+                    // path), decode every byte to half, then MANUALLY reproduce in software the
+                    // exact VNNI2 interleave hardware would have produced from a half source --
+                    // out_row[i].lo16 = in_row[2*i], out_row[i].hi16 = in_row[2*i+1] (pairs of
+                    // adjacent source *rows* interleaved into each output dword). This is the
+                    // same select<>-based interleave sdpa_kernel_lsc's non-LSC-2D fallback path
+                    // already uses above (search "temp_vnni" earlier in this file) to build a
+                    // VNNI2 tile by hand from already-decoded half data -- reused here verbatim,
+                    // just renamed, so no SLM round-trip is needed for a first correct version.
+                    matrix<uchar, REG_K, REG_N> Vmat_u8;
+                    cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(ci * REG_N));
+                    matrix<half, REG_K, REG_N> Vmat_nat;
+                    Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16<REG_K * REG_N>(Vmat_u8.format<uchar>());
+                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
+                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
+                } else {
+                    cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
+                }
 #    pragma unroll
                 for (int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(rO[ri + p].format<float>(),
@@ -1324,7 +1372,12 @@ CM_INLINE void sdpa_accumulate_kv_source(
     }
 }
 
-template <int num_heads, int num_kv_heads, int head_size, int wg_local_size, int sparse_block_size>
+// fp8_ring_kv: compile-time switch (see KV_RING_FP8E4M3 in cm_sdpa_opt_prefill_multisource.cm)
+// selecting an fp8e4m3-packed ring K/V (decoded to half in-register, see
+// sdpa_accumulate_kv_source/hf8_e4m3_decode_to_f16 above) instead of today's plain half ring.
+// Only the ring call below is templated on it -- current (this step's own new K/V) always stays
+// half (see the scope note at this file's "Two-source variant" header comment).
+template <int num_heads, int num_kv_heads, int head_size, int wg_local_size, int sparse_block_size, bool fp8_ring_kv = false>
 void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
                                    int q_len,
                                    uint q_pitch_bytes,
@@ -1381,7 +1434,8 @@ void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
     }
 
     // ---- ring, then current: numerically equivalent to one pass over concat(ring, current) ----
-    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(
+    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size,
+                               typename std::conditional<fp8_ring_kv, uchar, half>::type>(
         wg_local_id, kv_len_ring, k_pitch_bytes_ring, v_pitch_bytes_ring,
         k_base_ring, v_base_ring, sparse_mask_ring, rQ, cur_max, cur_sum, rO);
     sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(

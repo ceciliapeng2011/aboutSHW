@@ -33,6 +33,16 @@
 // cm_sdpa_opt_prefill.cm (cm_sdpa_opt_common.hpp) -- K/V orders apply identically to both the ring
 // and current buffers (both are addressed via the same get_seq_pitch_bytes/get_head_byte_offset
 // helpers, just with each source's own kv_len).
+//
+// KV_RING_FP8E4M3 (default 0): when set, key_ring/value_ring are read as fp8e4m3-packed bytes (1
+// byte/element) instead of plain half, decoded to half in-register right at DPAS time -- see
+// cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16/sdpa_accumulate_kv_source<...,KVElemT=uchar>. Only
+// the ring source is ever affected; key_cur/value_cur always stay plain half (current is
+// transient, quantizing it buys no persistent-memory win -- see
+// flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md Sec 3.1's identical rationale for
+// the analogous int8 design). The physical ring buffer is then 1 byte/element, so its own
+// pitch/offset must be computed at elem_size=sizeof(uchar) (see kv_ring_elem_size below) --
+// current's pitch/offset are untouched (still implicitly sizeof(half) via the 1-arg template call).
 #include "cm_sdpa_common.hpp"
 #include "cm_sdpa_opt_common.hpp"
 
@@ -45,6 +55,10 @@ namespace KERNEL_NAME {
 #define SPARSE_BLOCK_SIZE 128
 #endif
 static_assert(SPARSE_BLOCK_SIZE > 1, "cm_sdpa_opt_prefill_multisource.cm requires a sparse block mask (SPARSE_BLOCK_SIZE > 1)");
+
+#ifndef KV_RING_FP8E4M3
+#define KV_RING_FP8E4M3 0
+#endif
 
 _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
@@ -82,24 +96,33 @@ _GENX_MAIN_ void KERNEL_NAME(
     int wg_seq_len = local_size * q_step;
     int q_start = wg_id * wg_seq_len + wg_local_id * q_step;
 
+    // Ring-only byte-size-per-element: 1 (uchar/fp8e4m3) when KV_RING_FP8E4M3, else sizeof(half)
+    // (today's unchanged default) -- current's pitch/offset calls below deliberately keep using
+    // the 1-arg template form, which still defaults to sizeof(half) regardless of this macro.
+#if KV_RING_FP8E4M3
+    constexpr int kv_ring_elem_size = sizeof(uchar);
+#else
+    constexpr int kv_ring_elem_size = sizeof(half);
+#endif
+
     uint q_seq_pitch = get_seq_pitch_bytes<Q_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
-    uint k_seq_pitch_ring = get_seq_pitch_bytes<K_TRANSPOSE_ORDER>(kv_len_ring, num_kv_heads, head_size);
-    uint v_seq_pitch_ring = get_seq_pitch_bytes<V_TRANSPOSE_ORDER>(kv_len_ring, num_kv_heads, head_size);
+    uint k_seq_pitch_ring = get_seq_pitch_bytes<K_TRANSPOSE_ORDER, kv_ring_elem_size>(kv_len_ring, num_kv_heads, head_size);
+    uint v_seq_pitch_ring = get_seq_pitch_bytes<V_TRANSPOSE_ORDER, kv_ring_elem_size>(kv_len_ring, num_kv_heads, head_size);
     uint k_seq_pitch_cur = get_seq_pitch_bytes<K_TRANSPOSE_ORDER>(kv_len_cur, num_kv_heads, head_size);
     uint v_seq_pitch_cur = get_seq_pitch_bytes<V_TRANSPOSE_ORDER>(kv_len_cur, num_kv_heads, head_size);
     uint o_seq_pitch = get_seq_pitch_bytes<OUTPUT_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
 
     uint q_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
-    uint k_batch_off_ring = (uint)b * get_batch_byte_stride(kv_len_ring, num_kv_heads, head_size);
-    uint v_batch_off_ring = (uint)b * get_batch_byte_stride(kv_len_ring, num_kv_heads, head_size);
+    uint k_batch_off_ring = (uint)b * get_batch_byte_stride(kv_len_ring, num_kv_heads, head_size, kv_ring_elem_size);
+    uint v_batch_off_ring = (uint)b * get_batch_byte_stride(kv_len_ring, num_kv_heads, head_size, kv_ring_elem_size);
     uint k_batch_off_cur = (uint)b * get_batch_byte_stride(kv_len_cur, num_kv_heads, head_size);
     uint v_batch_off_cur = (uint)b * get_batch_byte_stride(kv_len_cur, num_kv_heads, head_size);
     uint o_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
 
     uint q_off = q_batch_off + get_head_byte_offset<Q_TRANSPOSE_ORDER>(h, q_len, head_size)
                  + (uint)q_start * q_seq_pitch;
-    uint k_off_ring = k_batch_off_ring + get_head_byte_offset<K_TRANSPOSE_ORDER>(hkv, kv_len_ring, head_size);
-    uint v_off_ring = v_batch_off_ring + get_head_byte_offset<V_TRANSPOSE_ORDER>(hkv, kv_len_ring, head_size);
+    uint k_off_ring = k_batch_off_ring + get_head_byte_offset<K_TRANSPOSE_ORDER, kv_ring_elem_size>(hkv, kv_len_ring, head_size);
+    uint v_off_ring = v_batch_off_ring + get_head_byte_offset<V_TRANSPOSE_ORDER, kv_ring_elem_size>(hkv, kv_len_ring, head_size);
     uint k_off_cur = k_batch_off_cur + get_head_byte_offset<K_TRANSPOSE_ORDER>(hkv, kv_len_cur, head_size);
     uint v_off_cur = v_batch_off_cur + get_head_byte_offset<V_TRANSPOSE_ORDER>(hkv, kv_len_cur, head_size);
     uint o_off = o_batch_off + get_head_byte_offset<OUTPUT_TRANSPOSE_ORDER>(h, q_len, head_size)
@@ -124,7 +147,7 @@ _GENX_MAIN_ void KERNEL_NAME(
         }
     }
 
-    sdpa_kernel_lsc_prefetch_2src<num_heads, num_kv_heads, head_size, 16, SPARSE_BLOCK_SIZE>(
+    sdpa_kernel_lsc_prefetch_2src<num_heads, num_kv_heads, head_size, 16, SPARSE_BLOCK_SIZE, (bool)KV_RING_FP8E4M3>(
         wg_local_id,
         q_tokens,
         q_seq_pitch,
