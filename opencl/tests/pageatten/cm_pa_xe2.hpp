@@ -352,7 +352,12 @@ void pa_lsc_u8(uint slm_K,
 
                     // Each worker computes partial St using its head_size chunk
                     uint slm_K_worker_offset = slm_offset + worker_offset * kv_step * sizeof(half);
-                    matrix<float, kv_step, q_step> St = ugemm_KQ_serialized(slm_K, rQ, slm_K_worker_offset);
+                    // ugemm_KQ_serialized's compile-time-recursive, CM_NOINLINE steps are only a win when
+                    // St must be accumulated piecewise across head-size-partitioned workers; for the
+                    // non-partitioned path (head_size != 256) ugemm_KQ's single inlined loop is faster.
+                    matrix<float, kv_step, q_step> St = enable_head_size_partition
+                        ? ugemm_KQ_serialized(slm_K, rQ, slm_K_worker_offset)
+                        : ugemm_KQ(slm_K, rQ, slm_K_worker_offset);
 
                     // Head_size partitioning: synchronize and accumulate partial St
                     if constexpr (enable_head_size_partition) {
@@ -577,7 +582,11 @@ void pa_lsc_u8(uint slm_K,
 
             // Each worker computes partial St using its head_size chunk
             uint slm_K_worker_offset = slm_offset + worker_offset * kv_step * sizeof(half);
-            matrix<float, kv_step, q_step> St = ugemm_KQ_serialized(slm_K, rQ, slm_K_worker_offset);
+            // See the other ugemm_KQ_serialized call site's comment above (non-partitioned path is
+            // faster with the plain inlined ugemm_KQ).
+            matrix<float, kv_step, q_step> St = enable_head_size_partition
+                ? ugemm_KQ_serialized(slm_K, rQ, slm_K_worker_offset)
+                : ugemm_KQ(slm_K, rQ, slm_K_worker_offset);
 
             // Head_size partitioning: synchronize and accumulate partial St
             if constexpr (enable_head_size_partition) {
