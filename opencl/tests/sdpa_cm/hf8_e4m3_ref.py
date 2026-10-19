@@ -111,7 +111,7 @@ def build_hf8_decode_lut_f16() -> np.ndarray:
     """256-entry half lookup table for cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut (the
     LUT-gather fp8e4m3->fp16 decode, an additional path alongside the bit-manipulation
     hf8_e4m3_decode_to_f16 -- see KV_FP8E4M3 in cm_sdpa_opt_prefill.cm, always LUT-decode via
-    sdpa_kernel_lsc_fp8). fp8e4m3 has only 256 possible byte values, so table[byte] ==
+    sdpa_kernel_lsc). fp8e4m3 has only 256 possible byte values, so table[byte] ==
     decode_hf8_to_f16(byte) for every byte 0..255 covers the whole domain exactly.
 
     Laid out as a plain np.float16[256] array (NOT packed into uint32) -- a direct compile+run

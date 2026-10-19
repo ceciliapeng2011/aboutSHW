@@ -27,17 +27,17 @@
 //
 // KV_FP8E4M3 (default 0): when set, key/value are read as fp8e4m3-packed bytes (1
 // byte/element) instead of plain half, decoded to half once per work-group and staged through SLM
-// -- calls cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 (built on sdpa_kernel_lsc's SLM-staged
-// architecture) instead of sdpa_kernel_lsc_prefetch, always using the LUT-gather decode (see
-// sdpa_kernel_lsc_fp8's doc comment; a per-work-item decode variant -- both the default
-// bit-manipulation decode and an opt-in LUT-gather decode -- was measured slower and has since been
-// removed). Mirrors KV_RING_FP8E4M3's convention in cm_sdpa_opt_prefill_multisource.cm, applied
-// here to the single K/V source this kernel has (query and output stay plain half either way). The
-// physical K/V buffer is then 1 byte/element, so its own pitch/offset must be computed at
-// elem_size=sizeof(uchar) (see kv_elem_size below) -- Q/output pitch/offset calls below
-// deliberately keep using the 1-arg template form, which still defaults to sizeof(half).
-// Causal-only, no attn_mask (matches sdpa_kernel_lsc_fp8's own scope). SPARSE_BLOCK_SIZE IS
-// supported here (both 128 and 256) -- see sdpa_kernel_lsc_fp8's doc comment for the two-level
+// -- calls cm_sdpa_common.hpp's sdpa_kernel_lsc instantiated with KVElemT=uchar instead of
+// sdpa_kernel_lsc_prefetch, always using the LUT-gather decode (see sdpa_kernel_lsc's doc comment;
+// a per-work-item decode variant -- both the default bit-manipulation decode and an opt-in
+// LUT-gather decode -- was measured slower and has since been removed). Mirrors KV_RING_FP8E4M3's
+// convention in cm_sdpa_opt_prefill_multisource.cm, applied here to the single K/V source this
+// kernel has (query and output stay plain half either way). The physical K/V buffer is then 1
+// byte/element, so its own pitch/offset must be computed at elem_size=sizeof(uchar) (see
+// kv_elem_size below) -- Q/output pitch/offset calls below deliberately keep using the 1-arg
+// template form, which still defaults to sizeof(half).
+// Causal-only, no attn_mask (matches sdpa_kernel_lsc's own fp8 scope). SPARSE_BLOCK_SIZE IS
+// supported here (both 128 and 256) -- see sdpa_kernel_lsc's doc comment for the two-level
 // skip-LOAD/skip-COMPUTE mask split SPARSE_BLOCK_SIZE==128 needs on top of 256's simpler
 // single-mask case.
 #include "cm_sdpa_common.hpp"
@@ -90,7 +90,7 @@ _GENX_MAIN_ void KERNEL_NAME(
 #if KV_FP8E4M3
     // 256-entry half LUT, index == raw fp8e4m3 byte value -- see hf8_e4m3_ref.py's
     // build_hf8_decode_lut_f16 (host-side) / cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut
-    // (device-side gather consumer), which sdpa_kernel_lsc_fp8 always uses.
+    // (device-side gather consumer), which sdpa_kernel_lsc (KVElemT=uchar) always uses.
     , half* hf8_lut [[type("svmptr_t")]]
 #endif
     ) {
@@ -159,15 +159,15 @@ _GENX_MAIN_ void KERNEL_NAME(
     // pa_kernel_lsc_prefetch_f16 (+ its "Threads with zero valid query tokens can early exit if
     // there is no barrier" comment) for the architectural precedent this now mirrors: a
     // barrier-free kernel is free to early-return per-lane (done just below the #else, right
-    // before sdpa_kernel_lsc_prefetch), but a barrier-pipelined one (sdpa_kernel_lsc_fp8) is NOT
-    // -- every lane in a work-group must keep calling into it so every lane reaches the same
+    // before sdpa_kernel_lsc_prefetch), but a barrier-pipelined one (sdpa_kernel_lsc, KVElemT=uchar)
+    // is NOT -- every lane in a work-group must keep calling into it so every lane reaches the same
     // cm_sbarrier/cm_fence sequence, even lanes with zero (or negative) q_tokens. Returning here
     // unconditionally used to deadlock any work-group whose Q range isn't an exact multiple of
     // wg_seq_len: the trailing lanes (q_tokens<=0) would return right here without ever entering
-    // sdpa_kernel_lsc_fp8, while their sibling lanes in the same work-group (q_tokens>0) would go
+    // sdpa_kernel_lsc, while their sibling lanes in the same work-group (q_tokens>0) would go
     // on to hit its barriers -- confirmed to hang real hardware (reproduced on both the
     // block-sparse and the plain dense KV_FP8E4M3 path, since neither ever checked q_tokens
-    // again after this point). sdpa_kernel_lsc_fp8 itself already clamps q_tokens_left to
+    // again after this point). sdpa_kernel_lsc itself already clamps q_tokens_left to
     // [0,q_step] and only skips its own Q-load / final O-store for an inactive lane -- it never
     // skips the barrier pipeline -- so it's always safe to call unconditionally.
 
@@ -206,12 +206,13 @@ _GENX_MAIN_ void KERNEL_NAME(
 #if KV_FP8E4M3
     svmptr_t hf8_lut_ptr = reinterpret_cast<svmptr_t>(hf8_lut);
 
-    // Decode-once-per-work-group path: see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 doc comment.
-    // Causal-only, no attn_mask -- matches that function's own scope (a focused perf experiment,
-    // not a feature-parity replacement for sdpa_kernel_lsc_prefetch).
-    static_assert(!HAS_ATTN_MASK_INPUT, "KV_FP8E4M3 doesn't support attn_mask -- sdpa_kernel_lsc_fp8 has no attn_mask path");
+    // Decode-once-per-work-group path: see cm_sdpa_common.hpp's sdpa_kernel_lsc doc comment
+    // (KVElemT=uchar instantiation). Causal-only, no attn_mask -- matches that function's own fp8
+    // scope (a focused perf experiment, not a feature-parity replacement for
+    // sdpa_kernel_lsc_prefetch).
+    static_assert(!HAS_ATTN_MASK_INPUT, "KV_FP8E4M3 doesn't support attn_mask -- sdpa_kernel_lsc<..., uchar> has no attn_mask path");
     // Block-sparsity IS supported at both allowed SPARSE_BLOCK_SIZE values (128, 256) -- see
-    // sdpa_kernel_lsc_fp8's doc comment for the full two-level (skip-LOAD vs skip-COMPUTE)
+    // sdpa_kernel_lsc's doc comment for the full two-level (skip-LOAD vs skip-COMPUTE)
     // rationale SPARSE_BLOCK_SIZE==128 needs on top of SPARSE_BLOCK_SIZE==256's simpler single-mask
     // case. Any OTHER value is a hard compile error here, not silently wrong.
     static_assert(SPARSE_BLOCK_SIZE == 1 || SPARSE_BLOCK_SIZE == 128 || SPARSE_BLOCK_SIZE == 256,
@@ -220,7 +221,7 @@ _GENX_MAIN_ void KERNEL_NAME(
                   "work-group's 256-token span or fail to divide it evenly");
 
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
-    // Quad-buffered (see sdpa_kernel_lsc_fp8's load_slm_KV pipeline) -- same sizing convention as
+    // Quad-buffered (see sdpa_kernel_lsc's load_slm_KV pipeline) -- same sizing convention as
     // cm_sdpa_vlen.cm's non-prefetch sdpa_kernel_lsc call site.
     constexpr uint K_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
     constexpr uint V_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
@@ -228,7 +229,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     auto slm_K = cm_slm_alloc(K_SLM_SIZE);
     auto slm_V = cm_slm_alloc(V_SLM_SIZE);
 
-    // sdpa_kernel_lsc_fp8's load_slm_KV pipeline synchronizes the whole work-group via
+    // sdpa_kernel_lsc's load_slm_KV pipeline synchronizes the whole work-group via
     // cm_sbarrier/cm_fence, so every lane MUST run the exact same number of kv_pos loop
     // iterations -- unlike sdpa_kernel_lsc_prefetch below (no barriers, no SLM sharing), which is
     // safe with the per-lane `kv_stop` computed above (causal_kv_stop derived from this work-item's
@@ -240,7 +241,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     // the single-WG shapes test_sdpa_prefill_fp8.py's SLM tests use). Recompute a work-group-uniform
     // bound instead, from wg_id (not wg_local_id) -- the LAST lane's causal extent -- so every lane
     // runs the same iteration count; each lane's own tighter causal mask (causal_left, derived from
-    // its own q_start, computed inside sdpa_kernel_lsc_fp8) still correctly zeroes out whatever
+    // its own q_start, computed inside sdpa_kernel_lsc) still correctly zeroes out whatever
     // extra tail this over-extension computes for it, exactly like sdpa_kernel_lsc_prefetch's own
     // per-sub-tile causal_left masking.
     int kv_stop_wg = kv_len;
@@ -252,7 +253,7 @@ _GENX_MAIN_ void KERNEL_NAME(
 #if SPARSE_BLOCK_SIZE == 128
     // The two q_block rows (q_block=2*wg_id and 2*wg_id+1) this work-group's 256-token span
     // actually covers -- computed from wg_id (NOT q_start), so every lane in the work-group
-    // derives the exact same two pointers. Only used for sdpa_kernel_lsc_fp8's work-group-uniform
+    // derives the exact same two pointers. Only used for sdpa_kernel_lsc's work-group-uniform
     // skip-LOAD decision; see that function's doc comment for the full rationale. hi stays 0 (never
     // dereferenced) when this work-group's span has only one valid q_block left (q_len not a
     // multiple of 256).
@@ -273,7 +274,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     svmptr_t sparse_mask_wg_lo_ptr = 0, sparse_mask_wg_hi_ptr = 0;
 #endif
 
-    sdpa_kernel_lsc_fp8<(bool)CMFLA_IS_CAUSAL, num_heads, num_kv_heads, head_size, 0, SPARSE_BLOCK_SIZE>(
+    sdpa_kernel_lsc<(bool)CMFLA_IS_CAUSAL, num_heads, num_kv_heads, head_size, 0, SPARSE_BLOCK_SIZE, uchar>(
         slm_K,
         slm_V,
         wg_local_id,
@@ -292,7 +293,7 @@ _GENX_MAIN_ void KERNEL_NAME(
         o_seq_pitch,
         hf8_lut_ptr,
         // sparse_mask_ptr: this work-item's own row (already WG-uniform at SPARSE_BLOCK_SIZE==256,
-        // genuinely per-lane at SPARSE_BLOCK_SIZE==128 -- see sdpa_kernel_lsc_fp8's doc comment).
+        // genuinely per-lane at SPARSE_BLOCK_SIZE==128 -- see sdpa_kernel_lsc's doc comment).
         // Used for skip-COMPUTE in both cases (and also skip-LOAD at 256, where the two decisions
         // coincide).
         sparse_mask_ptr,

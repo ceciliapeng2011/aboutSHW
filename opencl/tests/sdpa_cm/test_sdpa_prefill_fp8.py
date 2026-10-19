@@ -3,10 +3,10 @@ fp8e4m3 K/V correctness for cm_sdpa_opt_prefill.cm's KV_FP8E4M3 path: the single
 general-purpose SDPA prefill kernel (supports causal masking, a dense additive attn_mask, and a
 sparse block-table mask, all in one kernel -- the "real" OCL sdpa_opt/BlockSparseAttention v1 ABI
 mirror) decodes fp8e4m3-packed K/V bytes to half once per work-group, staged through SLM (see
-cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 -- measured faster than an earlier per-work-item decode
+cm_sdpa_common.hpp's sdpa_kernel_lsc -- measured faster than an earlier per-work-item decode
 variant, which has since been removed) instead of relying on a separate reorder/dequant pass over
 the whole K/V buffer. KV_FP8E4M3 is causal-only with no dense attn_mask support -- matches
-sdpa_kernel_lsc_fp8's own scope.
+sdpa_kernel_lsc's own scope.
 
 This is the single-source counterpart of test_sdpa_prefill_fp8_ring.py's KV_RING_FP8E4M3 test for
 the narrower dual-source (ring+current) kernel -- same methodology, applied to the more general
@@ -54,10 +54,10 @@ TRANSPOSE_ORDER_SWAPPED = base.TRANSPOSE_ORDER_SWAPPED
 def build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, is_causal,
                               q_order, k_order, v_order, o_order,
                               sparse_block_size=1, scale_factor=None):
-    # KV_FP8E4M3=1 calls cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 -- decode-once-per-work-group,
+    # KV_FP8E4M3=1 calls cm_sdpa_common.hpp's sdpa_kernel_lsc -- decode-once-per-work-group,
     # staged through SLM, always via the LUT decode -- instead of sdpa_kernel_lsc_prefetch's
-    # per-work-item decode. No attn_mask support (see sdpa_kernel_lsc_fp8's doc comment).
-    # Block-sparsity IS supported at sparse_block_size in (128, 256) -- see sdpa_kernel_lsc_fp8's
+    # per-work-item decode. No attn_mask support (see sdpa_kernel_lsc's doc comment).
+    # Block-sparsity IS supported at sparse_block_size in (128, 256) -- see sdpa_kernel_lsc's
     # doc comment for the two-level skip-LOAD/skip-COMPUTE mask split 128 needs on top of 256's
     # simpler single-mask case. Any other value is a hard compile error in cm_sdpa_opt_prefill.cm's
     # static_assert, not silently wrong.
@@ -129,7 +129,7 @@ def run_prefill_fp8(q, k_hf8, v_hf8, is_causal,
         t_mask = cl.tensor(block_mask.to(torch.bool).numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
     # KV_FP8E4M3 always needs the 256-entry half LUT (see hf8_e4m3_ref.build_hf8_decode_lut_f16) --
-    # sdpa_kernel_lsc_fp8 always uses the LUT decode -- matching cm_sdpa_opt_prefill.cm's
+    # sdpa_kernel_lsc always uses the LUT decode -- matching cm_sdpa_opt_prefill.cm's
     # `#if KV_FP8E4M3` hf8_lut param, which is always last in the signature.
     t_lut = cl.tensor(build_hf8_decode_lut_f16())
     args += [t_lut]
@@ -218,7 +218,7 @@ def test_fp8_matches_fp16_causal_multi_wg():
     # by wg_local_id) never actually truncates kv_stop below kv_len for ANY lane -- kv_stop stays
     # accidentally uniform across the work-group. With a longer sequence that needs multiple Q
     # work-groups (q_len=1024 here -> wg_count=4 at q_step=wg_size=16), kv_stop genuinely differs by
-    # wg_local_id, and sdpa_kernel_lsc_fp8's cm_sbarrier/cm_fence work-group barriers deadlock the
+    # wg_local_id, and sdpa_kernel_lsc's cm_sbarrier/cm_fence work-group barriers deadlock the
     # moment lanes stop reaching them in lockstep. cm_sdpa_opt_prefill.cm now recomputes a
     # work-group-uniform kv_stop_wg (from wg_id, not wg_local_id) specifically for this path -- this
     # test's q_len=1024 is the smallest shape here that actually exercises wg_count>1 and would have
@@ -234,7 +234,7 @@ def test_fp8_matches_fp16_causal_ragged_q_len():
     # group below for the full root-cause writeup): cm_sdpa_opt_prefill.cm used to `return` early
     # for any lane with q_tokens<=0 BEFORE it could even reach the KV_FP8E4M3 branch, so a
     # ragged last work-group (q_len not an exact multiple of wg_seq_len==256) would strand some
-    # lanes outside sdpa_kernel_lsc_fp8's barrier pipeline while their work-group siblings entered
+    # lanes outside sdpa_kernel_lsc's barrier pipeline while their work-group siblings entered
     # it -- a deadlock, reproduced on this exact dense/sparse_block_size=1 configuration before the
     # fix. q_len=kv_len=896 == 3*256 + 128: the last (4th) work-group only has its first half
     # (wg_local_id<8) with any valid query tokens, so this directly exercises the "some lanes
@@ -249,7 +249,7 @@ def test_fp8_matches_fp16_causal_ragged_q_len():
 # ---- sparse_block_size==256 (block-granular skip inside the barrier-pipelined SLM path) ----
 # cm_sdpa_opt_prefill.cm allows SPARSE_BLOCK_SIZE==256 (== wg_seq_len) -- the one block size that's
 # work-group-uniform by construction (every lane in a WG maps to the same q_block, see
-# sdpa_kernel_lsc_fp8's doc comment), so no cross-lane mask merging is needed. SPARSE_BLOCK_SIZE==128
+# sdpa_kernel_lsc's doc comment), so no cross-lane mask merging is needed. SPARSE_BLOCK_SIZE==128
 # stays a hard compile error (static_assert in cm_sdpa_opt_prefill.cm) -- NOT exercised here since it
 # can't even compile; build_prefill_kernel_fp8's own assert would also catch an accidental
 # sparse_block_size=128 call before reaching the kernel build.
@@ -311,7 +311,7 @@ def test_fp8_sparse_all_masked_row_outputs_zero_not_nan():
     """Not a bit-exact oracle comparison -- torch's own softmax-of-all-(-inf) reference would
     itself be NaN for an entirely-masked row (see the "avoid an all-masked row" comment on the
     dense sparse tests above: there is no valid oracle to diff against). Instead this directly
-    checks the documented guard (cur_sum==0 -> output 0, not NaN; see sdpa_kernel_lsc_fp8's
+    checks the documented guard (cur_sum==0 -> output 0, not NaN; see sdpa_kernel_lsc's
     end-of-function comment) actually holds when an ENTIRE q_block is skipped by the block-sparse
     path, at a multi-work-group shape (q_block 1 here is a work-group other than the first, so this
     also exercises the cross-work-group kv_stop_wg path simultaneously)."""
@@ -337,7 +337,7 @@ def test_fp8_sparse_all_masked_row_outputs_zero_not_nan():
 # ---- sparse_block_size==128 (two-level skip-LOAD/skip-COMPUTE mask split) ----
 # The genuinely harder case: sparse_block_size==128 is HALF a work-group's 256-token span, so two
 # different lanes in the SAME work-group can land on two different q_blocks and legitimately
-# disagree about which KV chunks to skip. sdpa_kernel_lsc_fp8's sparse_block_size==128 branch
+# disagree about which KV chunks to skip. sdpa_kernel_lsc's sparse_block_size==128 branch
 # resolves this with a work-group-level OR-merged mask (sparse_mask_wg_lo/hi_base, computed by
 # cm_sdpa_opt_prefill.cm from wg_id so it's identical for every lane) for the barrier-pipelined
 # skip-LOAD decision, while each lane still applies its OWN finer-grained mask for skip-COMPUTE
@@ -349,18 +349,18 @@ def test_fp8_sparse_all_masked_row_outputs_zero_not_nan():
 # sparse_block_size=1, completely unaffected by sparsity): cm_sdpa_opt_prefill.cm used to `return`
 # early for any lane with q_tokens<=0 BEFORE even reaching the KV_FP8E4M3 branch, so the ragged last
 # work-group's trailing lanes would bail out of the kernel entirely while their siblings
-# (q_tokens>0) went on to enter sdpa_kernel_lsc_fp8's barrier pipeline -- a pre-existing bug present
+# (q_tokens>0) went on to enter sdpa_kernel_lsc's barrier pipeline -- a pre-existing bug present
 # since this path was first added, never exercised because every prior test's q_len happened to
 # already be a multiple of 256. Fixed by mirroring cm_pa_xe2.hpp's pa_lsc_u8 / pa_kernel_lsc_prefetch_f16
 # precedent: the barrier-free sdpa_kernel_lsc_prefetch path keeps its per-lane early return (safe, no
 # barriers to strand a sibling lane out of), but the barrier-pipelined KV_FP8E4M3 path now calls into
-# sdpa_kernel_lsc_fp8 unconditionally for EVERY lane regardless of q_tokens -- that function already
+# sdpa_kernel_lsc unconditionally for EVERY lane regardless of q_tokens -- that function already
 # clamped q_tokens_left to [0,q_step] and only skipped its own Q-load/final-O-store for an inactive
 # lane, never the barrier pipeline itself, so no change was needed there. See
 # test_fp8_matches_fp16_causal_ragged_q_len above for the regression test (a q_len NOT a multiple of
 # 256) proving this. One remaining consequence: with q_len allowed to NOT be a multiple of 256,
 # num_q_blocks (q_len/128) can be ODD for the last work-group, so sparse_mask_wg_hi_base's `hi <
-# num_q_blocks` guard (both here and in sdpa_kernel_lsc_fp8) is live, exercised code now, not dead
+# num_q_blocks` guard (both here and in sdpa_kernel_lsc) is live, exercised code now, not dead
 # defensive code for an unreachable case.
 def test_fp8_matches_fp16_causal_sparse128_single_wg():
     # q_len=kv_len=256 is already a meaningful test here (unlike sparse_block_size==256, where it

@@ -171,7 +171,7 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
                        density=1.0):
     """KV_FP8E4M3=1 counterpart of bench_prefill, same shape/dispatch/timing convention -- K/V are
     uploaded as raw fp8e4m3 bytes (1 byte/elem) instead of half (2 bytes/elem), decoded to half
-    once per work-group and staged through SLM (see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 --
+    once per work-group and staged through SLM (see cm_sdpa_common.hpp's sdpa_kernel_lsc --
     measured faster than an earlier per-work-item decode variant, both bit-manipulation and
     LUT-gather, which has since been removed). Values/correctness don't matter here (this is a
     pure perf probe, see test_sdpa_prefill_fp8.py for correctness) -- only the byte pattern's
@@ -182,7 +182,7 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
     mask on top of the fp8 decode -- the mask is faked at the requested density exactly like
     bench_prefill_block_mask_synthetic's fake_block_mask, so this measures the COMBINED win of fp8
     + block-sparsity (not each in isolation). SPARSE_BLOCK_SIZE must be in (1, 128, 256) -- same
-    restriction cm_sdpa_opt_prefill.cm's static_assert enforces (see sdpa_kernel_lsc_fp8's doc
+    restriction cm_sdpa_opt_prefill.cm's static_assert enforces (see sdpa_kernel_lsc's doc
     comment).
 
     order: see bench_prefill's docstring."""
@@ -220,7 +220,7 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc_fp8 always uses the LUT
+    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc always uses the LUT
     # decode.
     t_lut = cl.tensor(build_hf8_decode_lut_f16())
     args += [t_lut]
@@ -589,7 +589,7 @@ def bench_prefill_fp8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc_fp8 always uses the LUT
+    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc always uses the LUT
     # decode.
     t_lut = cl.tensor(build_hf8_decode_lut_f16())
     args += [t_lut]
@@ -641,7 +641,7 @@ if __name__ == "__main__":
     # test_sdpa_prefill_fp8.py for correctness). An earlier per-work-item decode variant (every one
     # of the wg_local_size=16 lanes in a work-group redundantly decoding the same K/V bytes, both a
     # bit-manipulation and a LUT-gather version) was measured slower than this decode-once-per-WG
-    # approach and has since been removed -- see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8.
+    # approach and has since been removed -- see cm_sdpa_common.hpp's sdpa_kernel_lsc.
     # seq_len=32768 added: FlashVSR's real-world token count is ~32k, so this is the actually
     # relevant scale, beyond the original 16384 cap -- also useful to see whether the SLM path's
     # unexplained seq_len=16384 dip (82.9% vs 95.5-99.7% at smaller sizes) continues or recovers.
@@ -668,7 +668,7 @@ if __name__ == "__main__":
     print("\n=== Stage 4: SDPA prefill + block mask + fp8, fp16-sparse baseline vs KV_FP8E4M3=1, "
           "same shapes, FlashVSR-realistic density (~0.35) -- measures the COMBINED win of fp8 + "
           "block-sparsity, not each in isolation. sparse_block_size=256 is the WG-uniform, "
-          "simplest case (see sdpa_kernel_lsc_fp8's doc comment); 256 and 128 must both work today "
+          "simplest case (see sdpa_kernel_lsc's doc comment); 256 and 128 must both work today "
           "(both bit-exact per test_sdpa_prefill_fp8.py) but only 256 is swept at every seq_len "
           "here to bound total run time -- 128's two-level mask-merge overhead is checked "
           "separately, once, at the largest (32768) size below. ===")
@@ -680,7 +680,7 @@ if __name__ == "__main__":
                  is_causal=True)
 
     print("\n=== Stage 4b: same as above but sparse_block_size=128 (the harder two-level "
-          "skip-LOAD/skip-COMPUTE mask split -- see sdpa_kernel_lsc_fp8's doc comment), only at "
+          "skip-LOAD/skip-COMPUTE mask split -- see sdpa_kernel_lsc's doc comment), only at "
           "seq_len=32768 (FlashVSR's real scale) to see the overhead vs. 256 above without "
           "re-running the full size sweep twice ===")
     run_case(bench_prefill_block_mask_synthetic, 32768, sparse_block_size=128,
