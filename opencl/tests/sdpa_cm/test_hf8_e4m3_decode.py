@@ -11,10 +11,10 @@ verified to match torch.float8_e4m3fn's decode bit-for-bit, see hf8_e4m3_ref.py'
 docstring / __main__ sanity check).
 
 test_hf8_e4m3_decode_lut_full_byte_range below is the equivalent isolated unit test for the
-LUT-gather decode alternative, hf8_e4m3_decode_to_f16_lut (see KV_FP8_DECODE_LUT in
-cm_sdpa_opt_prefill.cm / test_sdpa_prefill_fp8.py's KV_FP8_DECODE_LUT=1 full-kernel tests) --
-same full-byte-range, bit-exact methodology, oracle built from hf8_e4m3_ref.build_hf8_decode_lut_f16
-instead.
+LUT-gather decode alternative, hf8_e4m3_decode_to_f16_lut (see KV_FP8E4M3 in
+cm_sdpa_opt_prefill.cm / test_sdpa_prefill_fp8.py's full-kernel tests, which exercise
+sdpa_kernel_lsc_fp8 -- the only fp8 kernel path, always LUT-decode) -- same full-byte-range,
+bit-exact methodology, oracle built from hf8_e4m3_ref.build_hf8_decode_lut_f16 instead.
 """
 import functools
 import os
@@ -96,8 +96,9 @@ def test_hf8_e4m3_decode_lut_full_byte_range():
     """LUT-gather counterpart of test_hf8_e4m3_decode_full_byte_range above: same full 0-255 byte
     domain, same bit-exact (NaN-safe) methodology, but exercising hf8_e4m3_decode_to_f16_lut (a
     cm_ptr_load<half,...,DataSize::U16> gather against a 256-entry half LUT) instead of the
-    bit-manipulation decode -- see KV_FP8_DECODE_LUT in cm_sdpa_opt_prefill.cm for where this path
-    is wired into the full attention kernel."""
+    bit-manipulation decode -- see sdpa_kernel_lsc_fp8 in cm_sdpa_common.hpp (always LUT-decode) for
+    where this path is wired into the full attention kernel, via KV_FP8E4M3 in
+    cm_sdpa_opt_prefill.cm."""
     kernel = build_hf8_lut_decode_test_kernel()
 
     bytes_in = np.arange(256, dtype=np.uint8)

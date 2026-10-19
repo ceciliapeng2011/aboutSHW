@@ -33,10 +33,10 @@
 // as `exp + 8` directly) so this never relies on signed/unsigned promotion rules -- every
 // element stays in-range or wraps and un-wraps consistently in 16-bit modular arithmetic.
 //
-// Declared up front (ahead of sdpa_kernel_lsc_prefetch/sdpa_accumulate_kv_source below, its only
-// two callers) because this compiler resolves an unqualified call inside a template body against
-// declarations visible at the template's definition point, not at instantiation -- a forward
-// reference here is a hard "undeclared identifier" error, unlike full two-phase C++ lookup.
+// Declared up front (ahead of sdpa_accumulate_kv_source below, its only caller) because this
+// compiler resolves an unqualified call inside a template body against declarations visible at
+// the template's definition point, not at instantiation -- a forward reference here is a hard
+// "undeclared identifier" error, unlike full two-phase C++ lookup.
 template <int N>
 CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16(vector_ref<uchar, N> raw) {
     vector<uchar, N> sign_u8 = (raw >> 7) & 1;
@@ -75,14 +75,15 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16(vector_ref<uchar, N> raw) {
 // fp8e4m3 ("hf8") -> fp16 LUT-gather decode: an ADDITIONAL decode path alongside
 // hf8_e4m3_decode_to_f16 above, which stays completely untouched (same input/output contract,
 // bit-exact against the same oracle -- see hf8_e4m3_ref.py's build_hf8_decode_lut_f16). Only
-// sdpa_kernel_lsc_prefetch's KV_FP8_DECODE_LUT path below ever calls this; the dual-source ring
-// kernel (sdpa_accumulate_kv_source/sdpa_kernel_lsc_prefetch_2src) is out of scope and always
+// sdpa_kernel_lsc_fp8 below ever calls this (decode-once-per-work-group, measured faster than
+// the per-work-item bit-manipulation decode -- see that function's doc comment); the dual-source
+// ring kernel (sdpa_accumulate_kv_source/sdpa_kernel_lsc_prefetch_2src) is out of scope and always
 // uses the bit-manipulation decode.
 //
 // fp8e4m3 has only 256 possible byte values, so the entire decode is representable as a 256-entry
 // half lookup table, built once on the HOST (hf8_e4m3_ref.py's build_hf8_decode_lut_f16) and
 // uploaded as a plain half[256] array (512 bytes) alongside K/V -- see hf8_lut_base below, threaded
-// down from KV_FP8_DECODE_LUT's extra kernel param in cm_sdpa_opt_prefill.cm.
+// down from KV_FP8E4M3's extra kernel param in cm_sdpa_opt_prefill.cm.
 //
 // Layout: NOT packed into uint32 (the originally-expected fallback for a toolchain with no
 // sub-dword gather). A direct compile+run probe against this toolchain's
@@ -106,19 +107,6 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, s
     vector<uint, N> offsets = idx * (uint)sizeof(half);
     return cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
         reinterpret_cast<half*>(lut_base), offsets);
-}
-
-// Compile-time dispatch between the two decode paths above, so sdpa_kernel_lsc_prefetch's K/V
-// load sites below can stay a single call each regardless of KV_FP8_DECODE_LUT -- lut_base is
-// simply unused (and the LUT branch dead-code-eliminated by if constexpr) when use_lut is false,
-// so this has zero effect on the default (KV_FP8_DECODE_LUT=0) codegen path.
-template <int N, bool use_lut>
-CM_INLINE vector<half, N> hf8_e4m3_decode_dispatch(vector_ref<uchar, N> raw, svmptr_t lut_base) {
-    if constexpr (use_lut) {
-        return hf8_e4m3_decode_to_f16_lut<N>(raw, lut_base);
-    } else {
-        return hf8_e4m3_decode_to_f16<N>(raw);
-    }
 }
 
 #ifdef CM_HAS_LSC_UNTYPED_2D
@@ -297,24 +285,21 @@ void sdpa_kernel_lsc(uint slm_K,
 // sdpa_kernel_lsc_fp8: fp8e4m3 KV-cache counterpart of sdpa_kernel_lsc above, built to test the
 // "decode-once-per-work-group" hypothesis -- see cm_pa_xe2.hpp's pa_lsc_u8/load_slm_KV_active for
 // the architectural precedent this mirrors (int8 affine dequant staged into SLM once per
-// work-group instead of once per work-item), ported here to fp8e4m3 LUT-gather decode. Unlike
-// sdpa_kernel_lsc_prefetch's fp8 path above (every one of the wg_local_size=16 work-items in a
-// work-group independently decodes the SAME underlying K/V bytes at every kv_pos, since that
-// kernel has no SLM/work-group sharing), this function's load_slm_KV lambda decodes each
-// (kv_pos, head_size column range) byte range to half EXACTLY ONCE per work-group -- half the
-// work-group's lanes decode+stage K, the other half decode+stage V -- and every lane then reads
-// the already-decoded half data back out of SLM via the unmodified (type-agnostic)
-// ugemm_KQ/ugemm_PV0/ugemm_PV1 helpers below: by the time those run, SLM already holds plain half
-// regardless of K/V's original on-the-wire dtype, so no change is needed there.
+// work-group instead of once per work-item), ported here to fp8e4m3 LUT-gather decode. A prior
+// per-work-item decode path (every one of the wg_local_size=16 work-items in a work-group
+// independently decoding the SAME underlying K/V bytes at every kv_pos) was measured slower than
+// this decode-once-per-work-group approach and has since been removed -- this function's
+// load_slm_KV lambda decodes each (kv_pos, head_size column range) byte range to half EXACTLY ONCE
+// per work-group -- half the work-group's lanes decode+stage K, the other half decode+stage V --
+// and every lane then reads the already-decoded half data back out of SLM via the unmodified
+// (type-agnostic) ugemm_KQ/ugemm_PV0/ugemm_PV1 helpers below: by the time those run, SLM already
+// holds plain half regardless of K/V's original on-the-wire dtype, so no change is needed there.
 //
 // Deliberately a SEPARATE function (not a KVElemT template parameter bolted onto sdpa_kernel_lsc
 // above) so sdpa_kernel_lsc itself -- and its existing callers cm_sdpa_vlen.cm/cm_sdpa_xe.hpp --
-// stay byte-for-byte untouched. See KV_FP8_DECODE_SLM in cm_sdpa_opt_prefill.cm for the new call
-// site. Always uses hf8_e4m3_decode_to_f16_lut (the measured-faster LUT-gather decode -- see that
-// function's doc comment above) rather than the bit-manipulation decode: this function exists
-// specifically to test whether staging that already-faster decode once per work-group (instead of
-// once per work-item) closes more of the remaining fp16 gap, not to re-litigate which decode
-// algorithm is faster in isolation.
+// stay byte-for-byte untouched. See KV_FP8E4M3 in cm_sdpa_opt_prefill.cm for the call site.
+// Always uses hf8_e4m3_decode_to_f16_lut (the measured-faster LUT-gather decode -- see that
+// function's doc comment above) rather than the bit-manipulation decode.
 //
 // Causal-only, no dense attn_mask -- matches sdpa_kernel_lsc's own existing capability (this is
 // still a focused perf experiment on the decode-once hypothesis, not a feature-parity requirement
@@ -382,7 +367,7 @@ void sdpa_kernel_lsc_fp8(uint slm_K,
                          uint o_pitch_bytes,
                          // 256-entry half LUT base for hf8_e4m3_decode_to_f16_lut (index == raw
                          // fp8e4m3 byte value) -- see hf8_e4m3_ref.py's build_hf8_decode_lut_f16
-                         // (host side) and KV_FP8_DECODE_SLM's extra kernel param in
+                         // (host side) and KV_FP8E4M3's extra kernel param in
                          // cm_sdpa_opt_prefill.cm (device side, where this pointer comes from).
                          svmptr_t hf8_lut_base [[type("svmptr_t")]],
                          // XAttention/block-sparsity mask row for THIS WORK-ITEM's own q_block
@@ -820,17 +805,7 @@ template <bool use_causal_mask,
           int is_qkv_fused,
           int wg_local_size,
           bool has_attn_mask = false,
-          int sparse_block_size = 1,
-          // KVElemT: half for today's fp16 K/V (default -- unchanged behavior) or uchar for an
-          // fp8e4m3-packed K/V, decoded to half in-register right before each DPAS (see
-          // hf8_e4m3_decode_to_f16 / sdpa_accumulate_kv_source above, whose proven K/V-load
-          // if-constexpr pattern this mirrors verbatim). See KV_FP8E4M3 in cm_sdpa_opt_prefill.cm.
-          typename KVElemT = half,
-          // fp8_lut_decode: selects hf8_e4m3_decode_to_f16_lut (gather against hf8_lut_base below)
-          // instead of the default bit-manipulation hf8_e4m3_decode_to_f16 -- only meaningful when
-          // KVElemT=uchar (fp8_kv below); ignored otherwise. See KV_FP8_DECODE_LUT in
-          // cm_sdpa_opt_prefill.cm.
-          bool fp8_lut_decode = false>
+          int sparse_block_size = 1>
 void sdpa_kernel_lsc_prefetch(int wg_local_id,
                               int q_start,
                               int kv_stop,
@@ -862,11 +837,7 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
                               // bool per sparse_block_size-sized KV chunk for this (batch,head,q_block) row,
                               // 1=keep/0=skip. Already offset by the caller to point at this work-item's row
                               // -- see cm_sdpa_opt_prefill.cm / block_sparse_attention_prefill.cm.
-                              svmptr_t sparse_mask_base [[type("svmptr_t")]] = 0,
-                              // 256-entry half LUT base for hf8_e4m3_decode_to_f16_lut (see
-                              // fp8_lut_decode above); unused (and never dereferenced) unless
-                              // fp8_lut_decode is true.
-                              svmptr_t hf8_lut_base [[type("svmptr_t")]] = 0) {
+                              svmptr_t sparse_mask_base [[type("svmptr_t")]] = 0) {
     uint o_pitch = o_pitch_bytes;
     // round up head_size to multiple of 16
     // block_2d_desc will automatically handle the tailing block
@@ -905,12 +876,8 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
         }
     }
 
-    static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
-                  "KVElemT must be half (fp16 K/V, default) or uchar (fp8e4m3-packed K/V)");
-    constexpr bool fp8_kv = std::is_same<KVElemT, uchar>::value;
-
-    lsc::block_2d_desc<KVElemT, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<KVElemT, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
     // Mask surface is [Sq,Sk] (q rows outer, kv cols inner) -- same row range (q_tokens_left,
     // starting at this tile's q_start via the caller's pointer offset) as b2dQ above, so a plain
     // (non-transpose) load followed by an on-chip Transpose2DMatrix gives the [kv,q] layout St
@@ -918,8 +885,8 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
     lsc::block_2d_desc<half, 1, q_step, kv_step> b2dMask(mask_base, q_tokens_left - 1, kv_len * sizeof(half) - 1, mask_pitch_bytes - 1, 0, 0);
 
     static_assert(wg_local_size == 16);
-    lsc::block_2d_desc<KVElemT, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<KVElemT, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
 
     int causal_left = q_start;
 
@@ -973,18 +940,7 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
 
             b2dK.set_block_y(kv_pos);
-            if constexpr (fp8_kv) {
-                // K path (simple case): raw fp8e4m3 bytes load as a plain 2D block (same tile
-                // shape as the half path, 1 byte/elem instead of 2), decoded to half in-register
-                // right before cm_dpas -- mirrors sdpa_accumulate_kv_source's identical K-load
-                // branch verbatim.
-                matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
-                cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(0));
-                Kmat.format<half>() =
-                    hf8_e4m3_decode_dispatch<num_K * REG_M * REG_K, fp8_lut_decode>(Kmat_u8.format<uchar>(), hf8_lut_base);
-            } else {
-                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
-            }
+            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
 #    pragma unroll
             for (int k = 0; k < num_K; k++)
                 St2.row(b * num_K + k) =
@@ -994,14 +950,7 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
             for (int ri = 1; ri < padded_head_size / REG_K; ri++) {
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri * REG_K));
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri * REG_N));
-                if constexpr (fp8_kv) {
-                    matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
-                    cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(ri * REG_K));
-                    Kmat.format<half>() =
-                        hf8_e4m3_decode_dispatch<num_K * REG_M * REG_K, fp8_lut_decode>(Kmat_u8.format<uchar>(), hf8_lut_base);
-                } else {
-                    cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
-                }
+                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
 #    pragma unroll
                 for (int k = 0; k < num_K; k++) {
                     St2.row(b * num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(St2.row(b * num_K + k),
@@ -1089,36 +1038,7 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
 #    pragma unroll
             for (int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
                 matrix<half, REG_K / 2, REG_N * 2> Vmat;
-                if constexpr (fp8_kv) {
-                    // V path (harder case): hardware cm_load<lsc::VNNI> only knows how to
-                    // half-pair-interleave 2-byte (half) source elements, so for fp8 the raw bytes
-                    // are loaded as a PLAIN (non-VNNI) 2D block, decoded to half, then the exact
-                    // VNNI2 interleave is reproduced manually via select<>() -- verbatim copy of
-                    // sdpa_accumulate_kv_source's identical V-load branch (see that function's doc
-                    // comment for the full rationale / precedent).
-                    //
-                    // An fp8-decode-call-batching variant (decoding several REG_N-wide chunks --
-                    // or even the whole head_size row -- per hf8_e4m3_decode_to_f16 call instead of
-                    // one call per chunk) was tried as a perf optimization: an isolated
-                    // decode-only microbenchmark showed ~5-8x lower per-element decode cost when
-                    // batched, since this compiler's decode call carries large fixed per-call
-                    // overhead. In the full kernel, however, that didn't translate into a
-                    // measurable win (within run-to-run noise vs. this unbatched version), and
-                    // batching the whole row crashed the compiler's VISA builder at head_size=128
-                    // (num_Vchunks>4) for reasons unrelated to this buffer's own (sub-2KB) size --
-                    // most likely overall register/live-range pressure from the rest of the
-                    // head_size=128 instantiation. Kept this simpler, unbatched, already bit-exact
-                    // form instead -- see this change's commit message for the full measurement.
-                    matrix<uchar, REG_K, REG_N> Vmat_u8;
-                    cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(ci * REG_N));
-                    matrix<half, REG_K, REG_N> Vmat_nat;
-                    Vmat_nat.format<half>() =
-                        hf8_e4m3_decode_dispatch<REG_K * REG_N, fp8_lut_decode>(Vmat_u8.format<uchar>(), hf8_lut_base);
-                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
-                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
-                } else {
-                    cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
-                }
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
 #    pragma unroll
                 for (int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(rO[ri + p].format<float>(),

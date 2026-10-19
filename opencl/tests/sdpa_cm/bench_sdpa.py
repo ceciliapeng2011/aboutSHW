@@ -167,49 +167,33 @@ def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causa
 
 
 def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causal=True,
-                       batch=1, n_warmup=10, n_iters=50, order=None, use_lut_decode=False,
-                       use_slm_decode=False, sparse_block_size=1, density=1.0):
+                       batch=1, n_warmup=10, n_iters=50, order=None, sparse_block_size=1,
+                       density=1.0):
     """KV_FP8E4M3=1 counterpart of bench_prefill, same shape/dispatch/timing convention -- K/V are
     uploaded as raw fp8e4m3 bytes (1 byte/elem) instead of half (2 bytes/elem), decoded to half
-    in-register by the kernel (see cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16 /
-    sdpa_kernel_lsc_prefetch<...,KVElemT=uchar>). Values/correctness don't matter here (this is a
+    once per work-group and staged through SLM (see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 --
+    measured faster than an earlier per-work-item decode variant, both bit-manipulation and
+    LUT-gather, which has since been removed). Values/correctness don't matter here (this is a
     pure perf probe, see test_sdpa_prefill_fp8.py for correctness) -- only the byte pattern's
     on-the-wire size (half the K/V bytes moved vs. fp16) and the V-path's extra decode/
     VNNI-repack software overhead are what's being measured against the fp16 baseline.
 
-    use_lut_decode=True benchmarks the KV_FP8_DECODE_LUT=1 alternative instead (the 256-entry
-    half-LUT cm_ptr_load<...,DataSize::U16> gather decode, see cm_sdpa_common.hpp's
-    hf8_e4m3_decode_to_f16_lut) -- same on-the-wire K/V byte size as the bit-manipulation path
-    above, only the in-register decode differs, so comparing the two in isolation measures purely
-    the decode-cost delta between "bit-twiddle in registers" and "gather one 256-entry table".
-
-    use_slm_decode=True benchmarks the KV_FP8_DECODE_SLM=1 alternative instead (sdpa_kernel_lsc_fp8
-    -- decode-once-per-work-group, LUT decode staged through SLM and shared via
-    ugemm_KQ/ugemm_PV0/ugemm_PV1 across all wg_local_size=16 lanes, instead of every lane
-    redundantly decoding the same bytes). Mutually exclusive with use_lut_decode (this path always
-    uses the LUT decode internally; the flag just selects which per-work-item baseline to build
-    instead when False).
-
     sparse_block_size>1 (with a matching density in (0,1]) additionally benchmarks a block-sparse
-    mask on top of whichever decode path is selected -- the mask is faked at the requested density
-    exactly like bench_prefill_block_mask_synthetic's fake_block_mask, so this measures the
-    COMBINED win of fp8 + block-sparsity (not each in isolation). SPARSE_BLOCK_SIZE must be in (1,
-    128, 256) -- same restriction cm_sdpa_opt_prefill.cm's static_assert enforces for
-    use_slm_decode=True (see sdpa_kernel_lsc_fp8's doc comment); applied here uniformly across all
-    three decode variants so the three stay directly comparable at the same block size, even though
-    the non-SLM decode paths (bit-manip/LUT) don't themselves require it.
+    mask on top of the fp8 decode -- the mask is faked at the requested density exactly like
+    bench_prefill_block_mask_synthetic's fake_block_mask, so this measures the COMBINED win of fp8
+    + block-sparsity (not each in isolation). SPARSE_BLOCK_SIZE must be in (1, 128, 256) -- same
+    restriction cm_sdpa_opt_prefill.cm's static_assert enforces (see sdpa_kernel_lsc_fp8's doc
+    comment).
 
     order: see bench_prefill's docstring."""
     assert sparse_block_size in (1, 128, 256), (
         "sparse_block_size must be 1 (dense), 128, or 256 -- matches "
-        "cm_sdpa_opt_prefill.cm's KV_FP8_DECODE_SLM static_assert")
+        "cm_sdpa_opt_prefill.cm's KV_FP8E4M3 static_assert")
     if order is None:
         order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_size)
     kernel = prefill_fp8.build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, is_causal,
-                                                   order, order, order, order, sparse_block_size,
-                                                   use_lut_decode=use_lut_decode,
-                                                   use_slm_decode=use_slm_decode)
+                                                   order, order, order, order, sparse_block_size)
 
     q_phys = prefill.to_physical(q, order)
     k_hf8 = encode_f16_to_hf8(prefill.to_physical(k, order).contiguous().numpy())
@@ -236,13 +220,12 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    t_lut = None
-    if use_lut_decode or use_slm_decode:
-        t_lut = cl.tensor(build_hf8_decode_lut_f16())
-        args += [t_lut]
+    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc_fp8 always uses the LUT
+    # decode.
+    t_lut = cl.tensor(build_hf8_decode_lut_f16())
+    args += [t_lut]
 
-    kernel_name = ("cm_sdpa_opt_prefill_fp8slm" if use_slm_decode else
-                   "cm_sdpa_opt_prefill_fp8lut" if use_lut_decode else "cm_sdpa_opt_prefill_fp8")
+    kernel_name = "cm_sdpa_opt_prefill_fp8"
     cl.finish()
     for _ in range(n_warmup):
         kernel.enqueue(kernel_name, GWS, LWS, *args)
@@ -254,8 +237,7 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
     total_flops = flops_for(num_heads, seq_len, seq_len, head_size, causal_savings=is_causal,
                              density=effective_density) * batch
     order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
-    decode_tag = ("KV_FP8_DECODE_SLM=1" if use_slm_decode else
-                  "KV_FP8_DECODE_LUT=1" if use_lut_decode else "KV_FP8E4M3=1")
+    decode_tag = "KV_FP8E4M3=1"
     sparse_tag = (f" block={sparse_block_size} density(req/eff)={density:.2f}/{effective_density:.3f}"
                   if sparse_block_size > 1 else "")
     label = (f"prefill* seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
@@ -566,8 +548,8 @@ def bench_prefill_block_mask_synthetic_qkv(q_len, kv_len, num_heads=32, num_kv_h
 
 
 def bench_prefill_fp8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size=128,
-                           batch=1, n_warmup=10, n_iters=50, order=None, use_lut_decode=False,
-                           use_slm_decode=False, sparse_block_size=1, density=1.0):
+                           batch=1, n_warmup=10, n_iters=50, order=None, sparse_block_size=1,
+                           density=1.0):
     """q_len != kv_len variant of bench_prefill_fp8 -- needed for FlashVSR's REAL streaming
     KV-cache self-attention shape (steady-state q_len=19,200/kv_len=76,800, see
     fake_block_mask_qkv's docstring). Non-causal only, same restriction as
@@ -575,14 +557,12 @@ def bench_prefill_fp8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size
     is_causal=False -- see bench_sdpa.py's FlashVSR-config __main__ section comment)."""
     assert sparse_block_size in (1, 128, 256), (
         "sparse_block_size must be 1 (dense), 128, or 256 -- matches "
-        "cm_sdpa_opt_prefill.cm's KV_FP8_DECODE_SLM static_assert")
+        "cm_sdpa_opt_prefill.cm's KV_FP8E4M3 static_assert")
     if order is None:
         order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size)
     kernel = prefill_fp8.build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, False,
-                                                   order, order, order, order, sparse_block_size,
-                                                   use_lut_decode=use_lut_decode,
-                                                   use_slm_decode=use_slm_decode)
+                                                   order, order, order, order, sparse_block_size)
 
     q_phys = prefill.to_physical(q, order)
     k_hf8 = encode_f16_to_hf8(prefill.to_physical(k, order).contiguous().numpy())
@@ -609,13 +589,12 @@ def bench_prefill_fp8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    t_lut = None
-    if use_lut_decode or use_slm_decode:
-        t_lut = cl.tensor(build_hf8_decode_lut_f16())
-        args += [t_lut]
+    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc_fp8 always uses the LUT
+    # decode.
+    t_lut = cl.tensor(build_hf8_decode_lut_f16())
+    args += [t_lut]
 
-    kernel_name = ("cm_sdpa_opt_prefill_fp8slm" if use_slm_decode else
-                   "cm_sdpa_opt_prefill_fp8lut" if use_lut_decode else "cm_sdpa_opt_prefill_fp8")
+    kernel_name = "cm_sdpa_opt_prefill_fp8"
     cl.finish()
     for _ in range(n_warmup):
         kernel.enqueue(kernel_name, GWS, LWS, *args)
@@ -627,8 +606,7 @@ def bench_prefill_fp8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size
     total_flops = flops_for(num_heads, q_len, kv_len, head_size, causal_savings=False,
                              density=effective_density) * batch
     order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
-    decode_tag = ("KV_FP8_DECODE_SLM=1" if use_slm_decode else
-                  "KV_FP8_DECODE_LUT=1" if use_lut_decode else "KV_FP8E4M3=1")
+    decode_tag = "KV_FP8E4M3=1"
     sparse_tag = (f" block={sparse_block_size} density(req/eff)={density:.2f}/{effective_density:.3f}"
                   if sparse_block_size > 1 else "")
     label = (f"prefill* q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} "
@@ -656,25 +634,20 @@ if __name__ == "__main__":
     print("\n=== Stage 1a: SDPA prefill (dense, MHA no GQA, for comparison) ===")
     run_case(bench_prefill, 8192, num_kv_heads=32)
 
-    print("\n=== Stage 1a: SDPA prefill, fp16 vs KV_FP8E4M3=1 (bit-manip decode) vs "
-          "KV_FP8_DECODE_LUT=1 (LUT-gather decode) vs KV_FP8_DECODE_SLM=1 (decode-once-per-WG, "
-          "LUT decode staged through SLM) (same shapes as above) ===")
-    # Same head_size=128/num_heads=32/num_kv_heads=8 dense-causal config as the sweep above, all
-    # four variants printed back-to-back per seq_len for a direct four-way GFLOPS/latency
-    # comparison (see test_sdpa_prefill_fp8.py for correctness of all three fp8 decode paths).
-    # KV_FP8_DECODE_SLM=1 tests the hypothesis that sdpa_kernel_lsc_prefetch's per-work-item
-    # fp8->half decode (every one of the wg_local_size=16 lanes in a work-group redundantly
-    # decodes the same K/V bytes) -- not the decode algorithm itself -- is what's keeping fp8 so
-    # far from fp16 throughput; see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 for the SLM-staged,
-    # decode-once-per-work-group alternative this exercises.
+    print("\n=== Stage 1a: SDPA prefill, fp16 vs KV_FP8E4M3=1 (decode-once-per-WG, LUT decode "
+          "staged through SLM) (same shapes as above) ===")
+    # Same head_size=128/num_heads=32/num_kv_heads=8 dense-causal config as the sweep above, fp16
+    # and fp8 printed back-to-back per seq_len for a direct GFLOPS/latency comparison (see
+    # test_sdpa_prefill_fp8.py for correctness). An earlier per-work-item decode variant (every one
+    # of the wg_local_size=16 lanes in a work-group redundantly decoding the same K/V bytes, both a
+    # bit-manipulation and a LUT-gather version) was measured slower than this decode-once-per-WG
+    # approach and has since been removed -- see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8.
     # seq_len=32768 added: FlashVSR's real-world token count is ~32k, so this is the actually
     # relevant scale, beyond the original 16384 cap -- also useful to see whether the SLM path's
     # unexplained seq_len=16384 dip (82.9% vs 95.5-99.7% at smaller sizes) continues or recovers.
     for seq_len in [2048, 4096, 8192, 16384, 32768]:
         run_case(bench_prefill, seq_len)
         run_case(bench_prefill_fp8, seq_len)
-        run_case(bench_prefill_fp8, seq_len, use_lut_decode=True)
-        run_case(bench_prefill_fp8, seq_len, use_slm_decode=True)
 
     print("\n=== Stage 2a: SDPA decode (dense, single-token generate) ===")
     for kv_len in [512, 1024, 2048, 4096, 8192, 16384, 32768]:
@@ -692,24 +665,19 @@ if __name__ == "__main__":
         for density in (0.99, 0.9, 0.6, 0.3, 0.1):
             run_case(bench_prefill_block_mask_synthetic, seq_len, density=density, is_causal=False)
 
-    print("\n=== Stage 4: SDPA prefill + block mask + fp8, fp16-sparse baseline vs "
-          "KV_FP8E4M3=1 (bit-manip) vs KV_FP8_DECODE_LUT=1 vs KV_FP8_DECODE_SLM=1, same shapes, "
-          "FlashVSR-realistic density (~0.35) -- measures the COMBINED win of fp8 + "
+    print("\n=== Stage 4: SDPA prefill + block mask + fp8, fp16-sparse baseline vs KV_FP8E4M3=1, "
+          "same shapes, FlashVSR-realistic density (~0.35) -- measures the COMBINED win of fp8 + "
           "block-sparsity, not each in isolation. sparse_block_size=256 is the WG-uniform, "
-          "simplest case for KV_FP8_DECODE_SLM (see sdpa_kernel_lsc_fp8's doc comment); 256 and 128"
-          " must both work today (both bit-exact per test_sdpa_prefill_fp8.py) but only 256 is "
-          "swept at every seq_len here to bound total run time -- 128's two-level mask-merge "
-          "overhead is checked separately, once, at the largest (32768) size below. ===")
+          "simplest case (see sdpa_kernel_lsc_fp8's doc comment); 256 and 128 must both work today "
+          "(both bit-exact per test_sdpa_prefill_fp8.py) but only 256 is swept at every seq_len "
+          "here to bound total run time -- 128's two-level mask-merge overhead is checked "
+          "separately, once, at the largest (32768) size below. ===")
     SPARSE_DENSITY = 0.35
     for seq_len in [4096, 8192, 16384, 32768]:
         run_case(bench_prefill_block_mask_synthetic, seq_len, sparse_block_size=256,
                  density=SPARSE_DENSITY, is_causal=True)
         run_case(bench_prefill_fp8, seq_len, sparse_block_size=256, density=SPARSE_DENSITY,
                  is_causal=True)
-        run_case(bench_prefill_fp8, seq_len, sparse_block_size=256, density=SPARSE_DENSITY,
-                 is_causal=True, use_lut_decode=True)
-        run_case(bench_prefill_fp8, seq_len, sparse_block_size=256, density=SPARSE_DENSITY,
-                 is_causal=True, use_slm_decode=True)
 
     print("\n=== Stage 4b: same as above but sparse_block_size=128 (the harder two-level "
           "skip-LOAD/skip-COMPUTE mask split -- see sdpa_kernel_lsc_fp8's doc comment), only at "
@@ -719,10 +687,6 @@ if __name__ == "__main__":
              density=SPARSE_DENSITY, is_causal=True)
     run_case(bench_prefill_fp8, 32768, sparse_block_size=128, density=SPARSE_DENSITY,
              is_causal=True)
-    run_case(bench_prefill_fp8, 32768, sparse_block_size=128, density=SPARSE_DENSITY,
-             is_causal=True, use_lut_decode=True)
-    run_case(bench_prefill_fp8, 32768, sparse_block_size=128, density=SPARSE_DENSITY,
-             is_causal=True, use_slm_decode=True)
 
     print("\n=== FlashVSR configs: DiT self-/cross-attention (MHA heads=12/12 hd=128) ===")
     # Shapes from /home/ceciliapeng/repos/reports/flashvsr_v1.1_full_inference_pipeline.md, for the
@@ -782,4 +746,4 @@ if __name__ == "__main__":
                   density=0.3, order=order)
         run_case(bench_prefill_fp8_qkv, STEADY_Q_LEN, STEADY_KV_LEN_REAL,
                   num_heads=12, num_kv_heads=12, head_size=128, sparse_block_size=128,
-                  density=0.3, order=order, use_slm_decode=True)
+                  density=0.3, order=order)

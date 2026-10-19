@@ -2,9 +2,11 @@
 fp8e4m3 K/V correctness for cm_sdpa_opt_prefill.cm's KV_FP8E4M3 path: the single-source,
 general-purpose SDPA prefill kernel (supports causal masking, a dense additive attn_mask, and a
 sparse block-table mask, all in one kernel -- the "real" OCL sdpa_opt/BlockSparseAttention v1 ABI
-mirror) decodes fp8e4m3-packed K/V bytes to half in-register (right before the QK^T / P@V DPAS
-calls, see cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16 / sdpa_kernel_lsc_prefetch<...,
-KVElemT=uchar>) instead of relying on a separate reorder/dequant pass over the whole K/V buffer.
+mirror) decodes fp8e4m3-packed K/V bytes to half once per work-group, staged through SLM (see
+cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 -- measured faster than an earlier per-work-item decode
+variant, which has since been removed) instead of relying on a separate reorder/dequant pass over
+the whole K/V buffer. KV_FP8E4M3 is causal-only with no dense attn_mask support -- matches
+sdpa_kernel_lsc_fp8's own scope.
 
 This is the single-source counterpart of test_sdpa_prefill_fp8_ring.py's KV_RING_FP8E4M3 test for
 the narrower dual-source (ring+current) kernel -- same methodology, applied to the more general
@@ -39,7 +41,7 @@ from hf8_e4m3_ref import encode_f16_to_hf8, decode_hf8_to_f16, build_hf8_decode_
 # test_sdpa_prefill_block_mask's import above already put pageatten/ on sys.path (see
 # bench_sdpa.py's identical comment) -- generate_block_mask_with_ratio builds a realistic,
 # non-trivial (not all-True/all-False) causal block-sparse pattern per head, used below by the
-# KV_FP8_DECODE_SLM sparse multi-work-group tests.
+# sparse multi-work-group tests.
 from generate_block_mask import generate_block_mask_with_ratio
 
 torch.manual_seed(55)
@@ -51,41 +53,30 @@ TRANSPOSE_ORDER_SWAPPED = base.TRANSPOSE_ORDER_SWAPPED
 @functools.cache
 def build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, is_causal,
                               q_order, k_order, v_order, o_order,
-                              sparse_block_size=1, scale_factor=None, use_lut_decode=False,
-                              use_slm_decode=False):
-    # use_lut_decode=True selects KV_FP8_DECODE_LUT=1 (cm_sdpa_common.hpp's
-    # hf8_e4m3_decode_to_f16_lut gather path) instead of the default bit-manipulation decode --
-    # see run_prefill_fp8's matching use_lut_decode param for the extra hf8_lut kernel arg this
-    # needs. KERNEL_NAME is suffixed so the two variants never collide as distinct compiled
-    # programs (not strictly required -- each cl.kernels() call is its own program object -- but
-    # keeps -mCM_printregusage output/debugging unambiguous).
-    #
-    # use_slm_decode=True selects KV_FP8_DECODE_SLM=1 (cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 --
-    # decode-once-per-work-group, staged through SLM, always via the LUT decode) instead of
-    # sdpa_kernel_lsc_prefetch's per-work-item decode. No attn_mask support (see sdpa_kernel_lsc_fp8's
-    # doc comment). Block-sparsity IS supported at sparse_block_size in (128, 256) -- see
-    # sdpa_kernel_lsc_fp8's doc comment for the two-level skip-LOAD/skip-COMPUTE mask split 128
-    # needs on top of 256's simpler single-mask case. Any other value is a hard compile error in
-    # cm_sdpa_opt_prefill.cm's static_assert, not silently wrong.
+                              sparse_block_size=1, scale_factor=None):
+    # KV_FP8E4M3=1 calls cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 -- decode-once-per-work-group,
+    # staged through SLM, always via the LUT decode -- instead of sdpa_kernel_lsc_prefetch's
+    # per-work-item decode. No attn_mask support (see sdpa_kernel_lsc_fp8's doc comment).
+    # Block-sparsity IS supported at sparse_block_size in (128, 256) -- see sdpa_kernel_lsc_fp8's
+    # doc comment for the two-level skip-LOAD/skip-COMPUTE mask split 128 needs on top of 256's
+    # simpler single-mask case. Any other value is a hard compile error in cm_sdpa_opt_prefill.cm's
+    # static_assert, not silently wrong.
     if scale_factor is None:
         scale_factor = 1.0 / (head_size ** 0.5)
-    assert not (use_slm_decode and sparse_block_size not in (1, 128, 256)), (
-        "KV_FP8_DECODE_SLM's block-sparsity support requires sparse_block_size in (128, 256)")
+    assert sparse_block_size in (1, 128, 256), (
+        "KV_FP8E4M3's block-sparsity support requires sparse_block_size in (1, 128, 256)")
     src = r'''#include "cm_sdpa_opt_prefill.cm"'''
-    kernel_name = ("cm_sdpa_opt_prefill_fp8slm" if use_slm_decode else
-                   "cm_sdpa_opt_prefill_fp8lut" if use_lut_decode else "cm_sdpa_opt_prefill_fp8")
     opts = (
         f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256 -mCM_printregusage '
         f"-I{base.CWD} -I{base.FLASHATTN_DIR} -I{base.PAGEATTEN_DIR} "
-        f"-DKERNEL_NAME={kernel_name} "
+        f"-DKERNEL_NAME=cm_sdpa_opt_prefill_fp8 "
         f"-DCMFLA_NUM_HEADS={num_heads} -DCMFLA_NUM_KV_HEADS={num_kv_heads} "
         f"-DCMFLA_HEAD_SIZE={head_size} -DCMFLA_SCALE_FACTOR={scale_factor} "
         f"-DCMFLA_IS_CAUSAL={int(is_causal)} "
         f"-DQ_TRANSPOSE_ORDER={q_order} -DK_TRANSPOSE_ORDER={k_order} "
         f"-DV_TRANSPOSE_ORDER={v_order} -DOUTPUT_TRANSPOSE_ORDER={o_order} "
         f"-DHAS_ATTN_MASK_INPUT=0 -DHAS_SCALE_INPUT=0 "
-        f"-DSPARSE_BLOCK_SIZE={sparse_block_size} -DKV_FP8E4M3=1 "
-        f"-DKV_FP8_DECODE_LUT={int(use_lut_decode)} -DKV_FP8_DECODE_SLM={int(use_slm_decode)}"
+        f"-DSPARSE_BLOCK_SIZE={sparse_block_size} -DKV_FP8E4M3=1"
     )
     return cl.kernels(src, opts)
 
@@ -104,26 +95,14 @@ def _encode_kv_to_hf8(t_half_logical):
 def run_prefill_fp8(q, k_hf8, v_hf8, is_causal,
                      q_order=TRANSPOSE_ORDER_IDENTITY, k_order=TRANSPOSE_ORDER_IDENTITY,
                      v_order=TRANSPOSE_ORDER_IDENTITY, o_order=TRANSPOSE_ORDER_IDENTITY,
-                     sparse_block_size=1, block_mask=None, use_lut_decode=False,
-                     use_slm_decode=False):
+                     sparse_block_size=1, block_mask=None):
     # k_hf8/v_hf8: uint8 tensors, logical [B,Hkv,kv_len,D] (same logical shape convention as
     # k/v half tensors elsewhere in this module).
-    # use_lut_decode=True runs the KV_FP8_DECODE_LUT=1 kernel variant instead, which needs one
-    # extra kernel arg (the 256-entry half LUT, see hf8_e4m3_ref.build_hf8_decode_lut_f16) appended
-    # after the (optional) sparse-block-mask args -- matching cm_sdpa_opt_prefill.cm's
-    # `#if KV_FP8E4M3 && KV_FP8_DECODE_LUT` hf8_lut param, which is always last in the signature.
-    # use_slm_decode=True runs the KV_FP8_DECODE_SLM=1 variant (sdpa_kernel_lsc_fp8,
-    # decode-once-per-work-group) instead -- it always needs the hf8_lut arg too (that path always
-    # uses the LUT decode, see cm_sdpa_opt_prefill.cm's `#if KV_FP8E4M3 && (KV_FP8_DECODE_LUT ||
-    # KV_FP8_DECODE_SLM)` guard), and supports sparse_block_size in (1, 128, 256) (asserted in
-    # build_prefill_kernel_fp8 -- 256 is WG-uniform by construction; 128 uses a two-level
-    # skip-LOAD/skip-COMPUTE mask split instead, see sdpa_kernel_lsc_fp8's doc comment).
     batch, num_heads, q_len, head_size = q.shape
     _, num_kv_heads, kv_len, _ = k_hf8.shape
 
     kernel = build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, is_causal,
-                                       q_order, k_order, v_order, o_order, sparse_block_size,
-                                       use_lut_decode=use_lut_decode, use_slm_decode=use_slm_decode)
+                                       q_order, k_order, v_order, o_order, sparse_block_size)
 
     q_phys = base.to_physical(q, q_order)
     k_phys = base.to_physical(k_hf8, k_order)
@@ -149,14 +128,13 @@ def run_prefill_fp8(q, k_hf8, v_hf8, is_causal,
         num_q_blocks, num_k_blocks = block_mask.shape[2], block_mask.shape[3]
         t_mask = cl.tensor(block_mask.to(torch.bool).numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    t_lut = None
-    if use_lut_decode or use_slm_decode:
-        t_lut = cl.tensor(build_hf8_decode_lut_f16())
-        args += [t_lut]
+    # KV_FP8E4M3 always needs the 256-entry half LUT (see hf8_e4m3_ref.build_hf8_decode_lut_f16) --
+    # sdpa_kernel_lsc_fp8 always uses the LUT decode -- matching cm_sdpa_opt_prefill.cm's
+    # `#if KV_FP8E4M3` hf8_lut param, which is always last in the signature.
+    t_lut = cl.tensor(build_hf8_decode_lut_f16())
+    args += [t_lut]
 
-    kernel_name = ("cm_sdpa_opt_prefill_fp8slm" if use_slm_decode else
-                   "cm_sdpa_opt_prefill_fp8lut" if use_lut_decode else "cm_sdpa_opt_prefill_fp8")
-    kernel.enqueue(kernel_name, GWS, LWS, *args)
+    kernel.enqueue("cm_sdpa_opt_prefill_fp8", GWS, LWS, *args)
 
     out_phys = torch.from_numpy(t_out.numpy())
     return base.from_physical(out_phys, o_order, batch, num_heads, q_len, head_size)
@@ -175,14 +153,12 @@ def _make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size, seed):
 def _check_against_roundtripped_oracle(q, k, v, is_causal,
                                         q_order=TRANSPOSE_ORDER_IDENTITY, k_order=TRANSPOSE_ORDER_IDENTITY,
                                         v_order=TRANSPOSE_ORDER_IDENTITY, o_order=TRANSPOSE_ORDER_IDENTITY,
-                                        sparse_block_size=1, mask=None, use_lut_decode=False,
-                                        use_slm_decode=False):
+                                        sparse_block_size=1, mask=None):
     k_hf8, k_rt = _encode_kv_to_hf8(k)
     v_hf8, v_rt = _encode_kv_to_hf8(v)
 
     out_fp8 = run_prefill_fp8(q, k_hf8, v_hf8, is_causal, q_order, k_order, v_order, o_order,
-                               sparse_block_size=sparse_block_size, block_mask=mask,
-                               use_lut_decode=use_lut_decode, use_slm_decode=use_slm_decode)
+                               sparse_block_size=sparse_block_size, block_mask=mask)
     if sparse_block_size > 1:
         ref = bm.run_prefill_sparse(q, k_rt, v_rt, is_causal, sparse_block_size, mask,
                                      q_order, k_order, v_order, o_order)
@@ -197,178 +173,45 @@ def _check_against_roundtripped_oracle(q, k, v, is_causal,
     return out_fp8, ref
 
 
+# ---- dense (sparse_block_size=1) full-kernel tests ----
 def test_fp8_matches_fp16_noncausal_dense_identity():
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=201)
+                         head_size=64, seed=216)
     _check_against_roundtripped_oracle(q, k, v, is_causal=False)
     print("test_fp8_matches_fp16_noncausal_dense_identity PASSED")
 
 
 def test_fp8_matches_fp16_causal_dense_identity():
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=202)
+                         head_size=64, seed=217)
     _check_against_roundtripped_oracle(q, k, v, is_causal=True)
     print("test_fp8_matches_fp16_causal_dense_identity PASSED")
 
 
-def test_fp8_matches_fp16_noncausal_sparse_identity():
-    sparse_block_size = 128
-    q_len = kv_len = 256
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=q_len, kv_len=kv_len,
-                         head_size=64, seed=203)
-    num_q_blocks = (q_len + sparse_block_size - 1) // sparse_block_size
-    num_k_blocks = (kv_len + sparse_block_size - 1) // sparse_block_size
-    g = torch.Generator().manual_seed(204)
-    mask = torch.randint(0, 2, [1, 4, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
-    mask[:, :, :, 0] = True  # avoid an all-masked row (NaN in the torch-softmax oracle)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False,
-                                        sparse_block_size=sparse_block_size, mask=mask)
-    print("test_fp8_matches_fp16_noncausal_sparse_identity PASSED")
-
-
-def test_fp8_matches_fp16_causal_sparse_identity():
-    sparse_block_size = 128
-    q_len = kv_len = 256
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=q_len, kv_len=kv_len,
-                         head_size=64, seed=205)
-    num_q_blocks = (q_len + sparse_block_size - 1) // sparse_block_size
-    num_k_blocks = (kv_len + sparse_block_size - 1) // sparse_block_size
-    g = torch.Generator().manual_seed(206)
-    mask = torch.randint(0, 2, [1, 4, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
-    mask[:, :, :, 0] = True  # k_block 0 is always causally visible, incl. for q_block 0
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask)
-    print("test_fp8_matches_fp16_causal_sparse_identity PASSED")
-
-
-def test_fp8_matches_fp16_noncausal_dense_swapped():
-    # K/V (and, for simplicity, Q/O too) in TRANSPOSE_ORDER_SWAPPED ([B,S,H,D]) -- new coverage
-    # vs. test_sdpa_prefill_fp8_ring.py, which only ever exercises IDENTITY.
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=207)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False,
-                                        q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
-                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED)
-    print("test_fp8_matches_fp16_noncausal_dense_swapped PASSED")
-
-
-def test_fp8_matches_fp16_noncausal_sparse_swapped():
-    sparse_block_size = 128
-    q_len = kv_len = 256
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=q_len, kv_len=kv_len,
-                         head_size=64, seed=208)
-    num_q_blocks = (q_len + sparse_block_size - 1) // sparse_block_size
-    num_k_blocks = (kv_len + sparse_block_size - 1) // sparse_block_size
-    g = torch.Generator().manual_seed(209)
-    mask = torch.randint(0, 2, [1, 4, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
-    mask[:, :, :, 0] = True
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False,
-                                        q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
-                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
-                                        sparse_block_size=sparse_block_size, mask=mask)
-    print("test_fp8_matches_fp16_noncausal_sparse_swapped PASSED")
-
-
-def test_fp8_matches_fp16_gqa():
-    q, k, v = _make_qkv(batch=1, num_heads=8, num_kv_heads=2, q_len=256, kv_len=256,
-                         head_size=64, seed=210)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False)
-    print("test_fp8_matches_fp16_gqa PASSED")
-
-
-def test_fp8_matches_fp16_head_size_128():
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=128, seed=211)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False)
-    print("test_fp8_matches_fp16_head_size_128 PASSED")
-
-
-# ---- KV_FP8_DECODE_LUT=1 (hf8_e4m3_decode_to_f16_lut gather path) full-kernel tests ----
-# Same methodology/oracle as the bit-manipulation-decode tests above (roundtrip-through-fp8 on the
-# host, then compare the KV_FP8_DECODE_LUT=1 kernel's own decode against that same roundtripped
-# K/V run through the trusted KV_FP8E4M3=0 kernel) -- just with use_lut_decode=True threaded
-# through _check_against_roundtripped_oracle/run_prefill_fp8/build_prefill_kernel_fp8. Covers
-# dense+causal, sparse-block-mask, and head_size=128 -- the three axes most likely to expose a
-# LUT-path-specific bug (register/offset-vector handling differs from the bit-manipulation path)
-# without re-running every combination test_fp8_matches_fp16_* above already covers for the
-# non-LUT decode.
-def test_fp8_lut_matches_fp16_causal_dense_identity():
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=212)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_lut_decode=True)
-    print("test_fp8_lut_matches_fp16_causal_dense_identity PASSED")
-
-
-def test_fp8_lut_matches_fp16_causal_sparse_identity():
-    sparse_block_size = 128
-    q_len = kv_len = 256
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=q_len, kv_len=kv_len,
-                         head_size=64, seed=213)
-    num_q_blocks = (q_len + sparse_block_size - 1) // sparse_block_size
-    num_k_blocks = (kv_len + sparse_block_size - 1) // sparse_block_size
-    g = torch.Generator().manual_seed(214)
-    mask = torch.randint(0, 2, [1, 4, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
-    mask[:, :, :, 0] = True  # k_block 0 is always causally visible, incl. for q_block 0
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_lut_decode=True)
-    print("test_fp8_lut_matches_fp16_causal_sparse_identity PASSED")
-
-
-def test_fp8_lut_matches_fp16_head_size_128():
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=128, seed=215)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False, use_lut_decode=True)
-    print("test_fp8_lut_matches_fp16_head_size_128 PASSED")
-
-
-# ---- KV_FP8_DECODE_SLM=1 (sdpa_kernel_lsc_fp8, decode-once-per-work-group) full-kernel tests ----
-# Same methodology/oracle as the two decode families above, just selecting the SLM-staged path
-# instead (see cm_sdpa_common.hpp's sdpa_kernel_lsc_fp8 doc comment). That function supports
-# causal/non-causal dense attention (no attn_mask -- same scope as its sdpa_kernel_lsc ancestor)
-# plus block-sparsity at sparse_block_size in (128, 256) (added later -- see the dedicated
-# "sparse_block_size==256"/"sparse_block_size==128" test groups further below). These first tests
-# stay within the original dense-only surface: dense causal and non-causal, identity and swapped
-# layout, head_size=128 (the actual benchmark shape bench_sdpa.py exercises).
-def test_fp8_slm_matches_fp16_noncausal_dense_identity():
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=216)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=False, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_noncausal_dense_identity PASSED")
-
-
-def test_fp8_slm_matches_fp16_causal_dense_identity():
-    q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
-                         head_size=64, seed=217)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_dense_identity PASSED")
-
-
-def test_fp8_slm_matches_fp16_causal_dense_swapped():
+def test_fp8_matches_fp16_causal_dense_swapped():
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
                          head_size=64, seed=218)
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
                                         q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
-                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_dense_swapped PASSED")
+                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED)
+    print("test_fp8_matches_fp16_causal_dense_swapped PASSED")
 
 
-def test_fp8_slm_matches_fp16_head_size_128():
+def test_fp8_matches_fp16_head_size_128():
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
                          head_size=128, seed=219)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_head_size_128 PASSED")
+    _check_against_roundtripped_oracle(q, k, v, is_causal=True)
+    print("test_fp8_matches_fp16_head_size_128 PASSED")
 
 
-def test_fp8_slm_matches_fp16_gqa():
+def test_fp8_matches_fp16_gqa():
     q, k, v = _make_qkv(batch=1, num_heads=8, num_kv_heads=2, q_len=256, kv_len=256,
                          head_size=64, seed=220)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_gqa PASSED")
+    _check_against_roundtripped_oracle(q, k, v, is_causal=True)
+    print("test_fp8_matches_fp16_gqa PASSED")
 
 
-def test_fp8_slm_matches_fp16_causal_multi_wg():
+def test_fp8_matches_fp16_causal_multi_wg():
     # Regression test for a real deadlock found while benchmarking this path: with q_len=kv_len=256
     # (every other test above), a single Q work-group covers the whole sequence (wg_seq_len==256),
     # so cm_sdpa_opt_prefill.cm's per-lane `causal_kv_stop = q_start + wg_seq_len` (q_start varies
@@ -382,14 +225,14 @@ def test_fp8_slm_matches_fp16_causal_multi_wg():
     # hung before that fix.
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=1024, kv_len=1024,
                          head_size=64, seed=221)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_multi_wg PASSED")
+    _check_against_roundtripped_oracle(q, k, v, is_causal=True)
+    print("test_fp8_matches_fp16_causal_multi_wg PASSED")
 
 
-def test_fp8_slm_matches_fp16_causal_ragged_q_len():
+def test_fp8_matches_fp16_causal_ragged_q_len():
     # Regression test for a second, DIFFERENT real deadlock (see the NOTE above the sparse128 test
     # group below for the full root-cause writeup): cm_sdpa_opt_prefill.cm used to `return` early
-    # for any lane with q_tokens<=0 BEFORE it could even reach the KV_FP8_DECODE_SLM branch, so a
+    # for any lane with q_tokens<=0 BEFORE it could even reach the KV_FP8E4M3 branch, so a
     # ragged last work-group (q_len not an exact multiple of wg_seq_len==256) would strand some
     # lanes outside sdpa_kernel_lsc_fp8's barrier pipeline while their work-group siblings entered
     # it -- a deadlock, reproduced on this exact dense/sparse_block_size=1 configuration before the
@@ -399,25 +242,24 @@ def test_fp8_slm_matches_fp16_causal_ragged_q_len():
     # uses an exact multiple of 256 and would NOT have caught this.
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=896, kv_len=896,
                          head_size=64, seed=225)
-    _check_against_roundtripped_oracle(q, k, v, is_causal=True, use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_ragged_q_len PASSED")
+    _check_against_roundtripped_oracle(q, k, v, is_causal=True)
+    print("test_fp8_matches_fp16_causal_ragged_q_len PASSED")
 
 
-# ---- KV_FP8_DECODE_SLM=1 + sparse_block_size==256 (block-granular skip inside the barrier-
-# pipelined SLM path) ----
-# cm_sdpa_opt_prefill.cm now allows SPARSE_BLOCK_SIZE==256 (== wg_seq_len) for KV_FP8_DECODE_SLM
-# -- the one block size that's work-group-uniform by construction (every lane in a WG maps to the
-# same q_block, see sdpa_kernel_lsc_fp8's doc comment), so no cross-lane mask merging is needed.
-# SPARSE_BLOCK_SIZE==128 stays a hard compile error (static_assert in cm_sdpa_opt_prefill.cm) --
-# NOT exercised here since it can't even compile; build_prefill_kernel_fp8's own assert would also
-# catch an accidental sparse_block_size=128 call before reaching the kernel build.
+# ---- sparse_block_size==256 (block-granular skip inside the barrier-pipelined SLM path) ----
+# cm_sdpa_opt_prefill.cm allows SPARSE_BLOCK_SIZE==256 (== wg_seq_len) -- the one block size that's
+# work-group-uniform by construction (every lane in a WG maps to the same q_block, see
+# sdpa_kernel_lsc_fp8's doc comment), so no cross-lane mask merging is needed. SPARSE_BLOCK_SIZE==128
+# stays a hard compile error (static_assert in cm_sdpa_opt_prefill.cm) -- NOT exercised here since it
+# can't even compile; build_prefill_kernel_fp8's own assert would also catch an accidental
+# sparse_block_size=128 call before reaching the kernel build.
 #
 # Per this feature's mandatory test protocol: every test below uses a MULTI-work-group shape
 # (q_len=kv_len=1024 -> 4 work-groups of 256 tokens each) and a REALISTIC, non-trivial,
 # partially-sparse mask (generate_block_mask_with_ratio's ~35%-dense causal block pattern, built
 # independently per head) -- a single-work-group test or an all-dense/all-empty mask would not
 # exercise the new per-work-group block-skip-before-barrier-priming path at all.
-def test_fp8_slm_matches_fp16_causal_sparse_multi_wg():
+def test_fp8_matches_fp16_causal_sparse_multi_wg():
     sparse_block_size = 256
     q_len = kv_len = 1024
     num_heads = num_kv_heads = 4
@@ -427,12 +269,11 @@ def test_fp8_slm_matches_fp16_causal_sparse_multi_wg():
         num_heads, seq_len=q_len, trunk_sz=q_len, sparse_block_sz=sparse_block_size,
         true_ratio=0.35, is_causal=True)
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print(f"test_fp8_slm_matches_fp16_causal_sparse_multi_wg PASSED (density={density:.2f})")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print(f"test_fp8_matches_fp16_causal_sparse_multi_wg PASSED (density={density:.2f})")
 
 
-def test_fp8_slm_matches_fp16_noncausal_sparse_multi_wg():
+def test_fp8_matches_fp16_noncausal_sparse_multi_wg():
     sparse_block_size = 256
     q_len = kv_len = 1024
     num_heads = num_kv_heads = 4
@@ -442,12 +283,11 @@ def test_fp8_slm_matches_fp16_noncausal_sparse_multi_wg():
         num_heads, seq_len=q_len, trunk_sz=q_len, sparse_block_sz=sparse_block_size,
         true_ratio=0.35, is_causal=False)
     _check_against_roundtripped_oracle(q, k, v, is_causal=False,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print(f"test_fp8_slm_matches_fp16_noncausal_sparse_multi_wg PASSED (density={density:.2f})")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print(f"test_fp8_matches_fp16_noncausal_sparse_multi_wg PASSED (density={density:.2f})")
 
 
-def test_fp8_slm_matches_fp16_causal_sparse_multi_wg_gqa_swapped():
+def test_fp8_matches_fp16_causal_sparse_multi_wg_gqa_swapped():
     # Extra coverage in one combined test (not a full matrix): GQA (num_kv_heads<num_heads -- the
     # sparse_block_mask row index is per Q head, not per kv-head-group, see cm_sdpa_opt_prefill.cm's
     # mask_row_off derivation) + TRANSPOSE_ORDER_SWAPPED layout, on top of the same multi-WG /
@@ -463,19 +303,18 @@ def test_fp8_slm_matches_fp16_causal_sparse_multi_wg_gqa_swapped():
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
                                         q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
                                         v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print(f"test_fp8_slm_matches_fp16_causal_sparse_multi_wg_gqa_swapped PASSED (density={density:.2f})")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print(f"test_fp8_matches_fp16_causal_sparse_multi_wg_gqa_swapped PASSED (density={density:.2f})")
 
 
-def test_fp8_slm_sparse_all_masked_row_outputs_zero_not_nan():
+def test_fp8_sparse_all_masked_row_outputs_zero_not_nan():
     """Not a bit-exact oracle comparison -- torch's own softmax-of-all-(-inf) reference would
     itself be NaN for an entirely-masked row (see the "avoid an all-masked row" comment on the
     dense sparse tests above: there is no valid oracle to diff against). Instead this directly
     checks the documented guard (cur_sum==0 -> output 0, not NaN; see sdpa_kernel_lsc_fp8's
-    end-of-function comment) actually holds when an ENTIRE q_block is skipped by the new
-    block-sparse+SLM path, at a multi-work-group shape (q_block 1 here is a work-group other than
-    the first, so this also exercises the cross-work-group kv_stop_wg path simultaneously)."""
+    end-of-function comment) actually holds when an ENTIRE q_block is skipped by the block-sparse
+    path, at a multi-work-group shape (q_block 1 here is a work-group other than the first, so this
+    also exercises the cross-work-group kv_stop_wg path simultaneously)."""
     sparse_block_size = 256
     q_len = kv_len = 1024
     num_heads = num_kv_heads = 2
@@ -488,15 +327,14 @@ def test_fp8_slm_sparse_all_masked_row_outputs_zero_not_nan():
     k_hf8, _ = _encode_kv_to_hf8(k)
     v_hf8, _ = _encode_kv_to_hf8(v)
     out = run_prefill_fp8(q, k_hf8, v_hf8, is_causal=True, sparse_block_size=sparse_block_size,
-                           block_mask=mask, use_slm_decode=True)
+                           block_mask=mask)
     masked_rows = out[:, :, 256:512, :]
     assert torch.isfinite(masked_rows).all(), "all-masked q_block produced NaN/Inf, not 0"
     assert torch.all(masked_rows == 0), "all-masked q_block should output exactly 0 (NaN-guard)"
-    print("test_fp8_slm_sparse_all_masked_row_outputs_zero_not_nan PASSED")
+    print("test_fp8_sparse_all_masked_row_outputs_zero_not_nan PASSED")
 
 
-# ---- KV_FP8_DECODE_SLM=1 + sparse_block_size==128 (two-level skip-LOAD/skip-COMPUTE mask split)
-# ----
+# ---- sparse_block_size==128 (two-level skip-LOAD/skip-COMPUTE mask split) ----
 # The genuinely harder case: sparse_block_size==128 is HALF a work-group's 256-token span, so two
 # different lanes in the SAME work-group can land on two different q_blocks and legitimately
 # disagree about which KV chunks to skip. sdpa_kernel_lsc_fp8's sparse_block_size==128 branch
@@ -507,24 +345,24 @@ def test_fp8_slm_sparse_all_masked_row_outputs_zero_not_nan():
 #
 # NOTE: every shape below still uses q_len/kv_len as an exact multiple of 256 (wg_seq_len), for
 # simplicity, but this is no longer a correctness REQUIREMENT. A q_len that isn't a multiple of 256
-# used to deadlock the KV_FP8_DECODE_SLM path unconditionally (confirmed on the plain DENSE path
-# too, sparse_block_size=1, completely unaffected by sparsity): cm_sdpa_opt_prefill.cm used to
-# `return` early for any lane with q_tokens<=0 BEFORE even reaching the KV_FP8_DECODE_SLM branch,
-# so the ragged last work-group's trailing lanes would bail out of the kernel entirely while their
-# siblings (q_tokens>0) went on to enter sdpa_kernel_lsc_fp8's barrier pipeline -- a pre-existing
-# bug present since KV_FP8_DECODE_SLM was first added, never exercised because every prior test's
-# q_len happened to already be a multiple of 256. Fixed by mirroring cm_pa_xe2.hpp's pa_lsc_u8 /
-# pa_kernel_lsc_prefetch_f16 precedent: the barrier-free sdpa_kernel_lsc_prefetch path keeps its
-# per-lane early return (safe, no barriers to strand a sibling lane out of), but the
-# barrier-pipelined KV_FP8_DECODE_SLM path now calls into sdpa_kernel_lsc_fp8 unconditionally for
-# EVERY lane regardless of q_tokens -- that function already clamped q_tokens_left to [0,q_step]
-# and only skipped its own Q-load/final-O-store for an inactive lane, never the barrier pipeline
-# itself, so no change was needed there. See test_fp8_slm_matches_fp16_causal_ragged_q_len below for
-# the regression test (a q_len NOT a multiple of 256) proving this. One remaining consequence: with
-# q_len allowed to NOT be a multiple of 256, num_q_blocks (q_len/128) can be ODD for the last
-# work-group, so sparse_mask_wg_hi_base's `hi < num_q_blocks` guard (both here and in
-# sdpa_kernel_lsc_fp8) is live, exercised code now, not dead defensive code for an unreachable case.
-def test_fp8_slm_matches_fp16_causal_sparse128_single_wg():
+# used to deadlock this path unconditionally (confirmed on the plain DENSE path too,
+# sparse_block_size=1, completely unaffected by sparsity): cm_sdpa_opt_prefill.cm used to `return`
+# early for any lane with q_tokens<=0 BEFORE even reaching the KV_FP8E4M3 branch, so the ragged last
+# work-group's trailing lanes would bail out of the kernel entirely while their siblings
+# (q_tokens>0) went on to enter sdpa_kernel_lsc_fp8's barrier pipeline -- a pre-existing bug present
+# since this path was first added, never exercised because every prior test's q_len happened to
+# already be a multiple of 256. Fixed by mirroring cm_pa_xe2.hpp's pa_lsc_u8 / pa_kernel_lsc_prefetch_f16
+# precedent: the barrier-free sdpa_kernel_lsc_prefetch path keeps its per-lane early return (safe, no
+# barriers to strand a sibling lane out of), but the barrier-pipelined KV_FP8E4M3 path now calls into
+# sdpa_kernel_lsc_fp8 unconditionally for EVERY lane regardless of q_tokens -- that function already
+# clamped q_tokens_left to [0,q_step] and only skipped its own Q-load/final-O-store for an inactive
+# lane, never the barrier pipeline itself, so no change was needed there. See
+# test_fp8_matches_fp16_causal_ragged_q_len above for the regression test (a q_len NOT a multiple of
+# 256) proving this. One remaining consequence: with q_len allowed to NOT be a multiple of 256,
+# num_q_blocks (q_len/128) can be ODD for the last work-group, so sparse_mask_wg_hi_base's `hi <
+# num_q_blocks` guard (both here and in sdpa_kernel_lsc_fp8) is live, exercised code now, not dead
+# defensive code for an unreachable case.
+def test_fp8_matches_fp16_causal_sparse128_single_wg():
     # q_len=kv_len=256 is already a meaningful test here (unlike sparse_block_size==256, where it
     # would be trivially single-q_block): ONE work-group spans BOTH of this shape's two q_blocks,
     # so this already exercises the lo/hi merge within a single work-group.
@@ -538,12 +376,11 @@ def test_fp8_slm_matches_fp16_causal_sparse128_single_wg():
     mask = torch.randint(0, 2, [1, num_heads, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
     mask[:, :, :, 0] = True
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_sparse128_single_wg PASSED")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print("test_fp8_matches_fp16_causal_sparse128_single_wg PASSED")
 
 
-def test_fp8_slm_matches_fp16_noncausal_sparse128_multi_wg():
+def test_fp8_matches_fp16_noncausal_sparse128_multi_wg():
     sparse_block_size = 128
     q_len = kv_len = 1024  # 4 work-groups, 8 q_blocks / 8 k_blocks at 128 granularity
     num_heads = num_kv_heads = 4
@@ -554,12 +391,11 @@ def test_fp8_slm_matches_fp16_noncausal_sparse128_multi_wg():
     mask = torch.randint(0, 2, [1, num_heads, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
     mask[:, :, :, 0] = True
     _check_against_roundtripped_oracle(q, k, v, is_causal=False,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_noncausal_sparse128_multi_wg PASSED")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print("test_fp8_matches_fp16_noncausal_sparse128_multi_wg PASSED")
 
 
-def test_fp8_slm_matches_fp16_causal_sparse128_ragged_q_len():
+def test_fp8_matches_fp16_causal_sparse128_ragged_q_len():
     # Regression test combining BOTH fixed bugs at once: sparse_block_size==128's work-group-uniform
     # skip-LOAD merge (sparse_mask_wg_lo/hi_base) AND a ragged q_len (not a multiple of 256). q_len
     # =kv_len=896 -> num_q_blocks=num_k_blocks=7 (ODD), so the last work-group's
@@ -577,12 +413,11 @@ def test_fp8_slm_matches_fp16_causal_sparse128_ragged_q_len():
     mask = torch.randint(0, 2, [1, num_heads, num_q_blocks, num_k_blocks], generator=g).to(torch.bool)
     mask[:, :, :, 0] = True
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_sparse128_ragged_q_len PASSED")
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print("test_fp8_matches_fp16_causal_sparse128_ragged_q_len PASSED")
 
 
-def test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_realistic_density():
+def test_fp8_matches_fp16_causal_sparse128_multi_wg_realistic_density():
     sparse_block_size = 128
     q_len = kv_len = 1024
     num_heads = num_kv_heads = 4
@@ -592,13 +427,12 @@ def test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_realistic_density():
         num_heads, seq_len=q_len, trunk_sz=q_len, sparse_block_sz=sparse_block_size,
         true_ratio=0.3, is_causal=True)
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_realistic_density PASSED "
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print("test_fp8_matches_fp16_causal_sparse128_multi_wg_realistic_density PASSED "
           f"(density={density:.2f})")
 
 
-def test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_gqa_swapped():
+def test_fp8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped():
     sparse_block_size = 128
     q_len = kv_len = 1024
     num_heads, num_kv_heads = 8, 2
@@ -610,9 +444,8 @@ def test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_gqa_swapped():
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
                                         q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
                                         v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
-                                        sparse_block_size=sparse_block_size, mask=mask,
-                                        use_slm_decode=True)
-    print("test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_gqa_swapped PASSED "
+                                        sparse_block_size=sparse_block_size, mask=mask)
+    print("test_fp8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped PASSED "
           f"(density={density:.2f})")
 
 
@@ -620,29 +453,18 @@ if __name__ == "__main__":
     cl.profiling(True)
     test_fp8_matches_fp16_noncausal_dense_identity()
     test_fp8_matches_fp16_causal_dense_identity()
-    test_fp8_matches_fp16_noncausal_sparse_identity()
-    test_fp8_matches_fp16_causal_sparse_identity()
-    test_fp8_matches_fp16_noncausal_dense_swapped()
-    test_fp8_matches_fp16_noncausal_sparse_swapped()
-    test_fp8_matches_fp16_gqa()
+    test_fp8_matches_fp16_causal_dense_swapped()
     test_fp8_matches_fp16_head_size_128()
-    test_fp8_lut_matches_fp16_causal_dense_identity()
-    test_fp8_lut_matches_fp16_causal_sparse_identity()
-    test_fp8_lut_matches_fp16_head_size_128()
-    test_fp8_slm_matches_fp16_noncausal_dense_identity()
-    test_fp8_slm_matches_fp16_causal_dense_identity()
-    test_fp8_slm_matches_fp16_causal_dense_swapped()
-    test_fp8_slm_matches_fp16_head_size_128()
-    test_fp8_slm_matches_fp16_gqa()
-    test_fp8_slm_matches_fp16_causal_multi_wg()
-    test_fp8_slm_matches_fp16_causal_ragged_q_len()
-    test_fp8_slm_matches_fp16_causal_sparse_multi_wg()
-    test_fp8_slm_matches_fp16_noncausal_sparse_multi_wg()
-    test_fp8_slm_matches_fp16_causal_sparse_multi_wg_gqa_swapped()
-    test_fp8_slm_sparse_all_masked_row_outputs_zero_not_nan()
-    test_fp8_slm_matches_fp16_causal_sparse128_single_wg()
-    test_fp8_slm_matches_fp16_noncausal_sparse128_multi_wg()
-    test_fp8_slm_matches_fp16_causal_sparse128_ragged_q_len()
-    test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_realistic_density()
-    test_fp8_slm_matches_fp16_causal_sparse128_multi_wg_gqa_swapped()
+    test_fp8_matches_fp16_gqa()
+    test_fp8_matches_fp16_causal_multi_wg()
+    test_fp8_matches_fp16_causal_ragged_q_len()
+    test_fp8_matches_fp16_causal_sparse_multi_wg()
+    test_fp8_matches_fp16_noncausal_sparse_multi_wg()
+    test_fp8_matches_fp16_causal_sparse_multi_wg_gqa_swapped()
+    test_fp8_sparse_all_masked_row_outputs_zero_not_nan()
+    test_fp8_matches_fp16_causal_sparse128_single_wg()
+    test_fp8_matches_fp16_noncausal_sparse128_multi_wg()
+    test_fp8_matches_fp16_causal_sparse128_ragged_q_len()
+    test_fp8_matches_fp16_causal_sparse128_multi_wg_realistic_density()
+    test_fp8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped()
     print("ALL PASSED")
