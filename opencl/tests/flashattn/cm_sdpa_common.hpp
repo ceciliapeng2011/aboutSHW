@@ -72,14 +72,15 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16(vector_ref<uchar, N> raw) {
     return bits.format<half>();
 }
 
-// fp8e4m3 ("hf8") -> fp16 LUT-gather decode: an ADDITIONAL decode path alongside
-// hf8_e4m3_decode_to_f16 above, which stays completely untouched (same input/output contract,
-// bit-exact against the same oracle -- see hf8_e4m3_ref.py's build_hf8_decode_lut_f16). Only
-// sdpa_kernel_lsc below (when instantiated with KVElemT=uchar) ever calls this
-// (decode-once-per-work-group, measured faster than the per-work-item bit-manipulation decode --
-// see that function's doc comment); the dual-source ring kernel
-// (sdpa_accumulate_kv_source/sdpa_kernel_lsc_prefetch_2src) is out of scope and always uses the
-// bit-manipulation decode.
+// fp8e4m3 ("hf8") -> fp16 LUT-gather decode, gathering straight from a global/SVM-resident LUT.
+// Superseded by hf8_e4m3_decode_to_f16_lut_slm below for sdpa_kernel_lsc's KVElemT=uchar path
+// (an A/B/C perf comparison -- this global-gather form, the bit-manipulation
+// hf8_e4m3_decode_to_f16 above, and the SLM-gather form below -- measured the SLM-gather form
+// consistently ~12% faster across seq_len 2048-32768; see cm_sdpa_opt_prefill.cm's KV_FP8E4M3 doc
+// comment). Kept here as a tested, documented primitive (see test_hf8_e4m3_decode.py) and NOT
+// currently called by any production kernel in this file, same input/output contract as
+// hf8_e4m3_decode_to_f16, bit-exact against the same oracle (hf8_e4m3_ref.py's
+// build_hf8_decode_lut_f16).
 //
 // fp8e4m3 has only 256 possible byte values, so the entire decode is representable as a 256-entry
 // half lookup table, built once on the HOST (hf8_e4m3_ref.py's build_hf8_decode_lut_f16) and
@@ -110,6 +111,25 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, s
         reinterpret_cast<half*>(lut_base), offsets);
 }
 
+// fp8e4m3 ("hf8") -> fp16 LUT-gather decode, SLM variant: same 256-entry half LUT as
+// hf8_e4m3_decode_to_f16_lut above, but the LUT bytes have already been copied into SLM once per
+// work-group (see cm_sdpa_opt_prefill.cm's KV_FP8E4M3 cooperative LUT fill) before this is ever
+// called, and the gather targets that SLM copy instead of global/SVM memory. This is the decode
+// sdpa_kernel_lsc's KVElemT=uchar path uses -- measured consistently faster than both the
+// global-gather and bit-manipulation alternatives (see hf8_e4m3_decode_to_f16_lut's doc comment
+// above). lut_slm_base is the SLM byte-offset base returned by cm_slm_alloc for the LUT's
+// sub-allocation (NOT a raw pointer). cm_slm_read's address vector is in ELEMENT units (scaled by
+// sizeof(half) internally), unlike hf8_e4m3_decode_to_f16_lut's cm_ptr_load call above, which
+// needs the *sizeof(half) done by hand -- see opencl/tests/x_attn/sort.hpp's cm_slm_read usage for
+// the same convention elsewhere in this repo.
+template <int N>
+CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut_slm(vector_ref<uchar, N> raw, uint lut_slm_base) {
+    vector<uint, N> idx = raw;
+    vector<half, N> result;
+    cm_slm_read<half, N>(lut_slm_base, idx, result);
+    return result;
+}
+
 #ifdef CM_HAS_LSC_UNTYPED_2D
 // sdpa_kernel_lsc: flash-attention body shared by the plain fp16 KV-cache path (KVElemT=half,
 // the default) and the fp8e4m3 KV-cache path (KVElemT=uchar). The two used to be separate
@@ -127,9 +147,10 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, s
 // no change is needed there. When KVElemT=half, load_slm_KV instead loads K/V directly as half
 // (no decode), i.e. byte-for-byte the original sdpa_kernel_lsc behavior.
 //
-// Always uses hf8_e4m3_decode_to_f16_lut (the measured-faster LUT-gather decode -- see that
-// function's doc comment above) rather than the bit-manipulation decode, for the KVElemT=uchar
-// case. See KV_FP8E4M3 in cm_sdpa_opt_prefill.cm for that call site.
+// Always uses hf8_e4m3_decode_to_f16_lut_slm (LUT-gather from a work-group-local SLM copy of the
+// 256-entry LUT -- see that function's doc comment above; measured fastest of the three decode
+// strategies tried) for the KVElemT=uchar case. See KV_FP8E4M3 in cm_sdpa_opt_prefill.cm for that
+// call site and the LUT's one-time SLM fill.
 //
 // Causal-only, no dense attn_mask (this is still a focused perf experiment on the decode-once
 // hypothesis for the fp8 case, not a feature-parity requirement with sdpa_kernel_lsc_prefetch's
@@ -195,11 +216,12 @@ void sdpa_kernel_lsc(uint slm_K,
                      // whether that's the identity (heads-outer) or swapped (heads-inner) layout --
                      // mirrors sdpa_kernel_lsc_prefetch's own o_pitch_bytes param.
                      uint o_pitch_bytes = num_heads * head_size * sizeof(half),
-                     // 256-entry half LUT base for hf8_e4m3_decode_to_f16_lut (index == raw
-                     // fp8e4m3 byte value), only read when KVElemT=uchar -- see hf8_e4m3_ref.py's
-                     // build_hf8_decode_lut_f16 (host side) and KV_FP8E4M3's extra kernel param in
-                     // cm_sdpa_opt_prefill.cm (device side, where this pointer comes from).
-                     svmptr_t hf8_lut_base [[type("svmptr_t")]] = 0,
+                     // SLM byte-offset base of the 256-entry half LUT's SLM sub-allocation
+                     // (cm_slm_alloc's return value), only read when KVElemT=uchar -- see
+                     // hf8_e4m3_decode_to_f16_lut_slm above and KV_FP8E4M3's cooperative LUT fill
+                     // in cm_sdpa_opt_prefill.cm (device side, where this comes from) /
+                     // hf8_e4m3_ref.py's build_hf8_decode_lut_f16 (host side, the LUT's contents).
+                     uint lut_slm_base = 0,
                      // XAttention/block-sparsity mask row for THIS WORK-ITEM's own q_block
                      // (only read when sparse_block_size>1). Already offset by the caller to
                      // this (batch,q_head,q_block) row, same convention as
@@ -291,7 +313,7 @@ void sdpa_kernel_lsc(uint slm_K,
                     b2dK.set_block_y(kv_pos);
                     for (int k = REG_K * wg_local_id; k < padded_head_size; k += REG_K * (local_size / 2)) {
                         cm_load<lsc::Normal>(temp0_u8, b2dK.set_block_x(k));
-                        temp0 = hf8_e4m3_decode_to_f16_lut<kv_step * REG_K>(temp0_u8, hf8_lut_base);
+                        temp0 = hf8_e4m3_decode_to_f16_lut_slm<kv_step * REG_K>(temp0_u8, lut_slm_base);
                         cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), temp0);
                     }
                 } else {
@@ -319,7 +341,7 @@ void sdpa_kernel_lsc(uint slm_K,
 #    pragma unroll
                     for (int k = REG_N * (wg_local_id - (local_size / 2)); k < padded_head_size; k += REG_N * (local_size / 2)) {
                         cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(k));
-                        Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16_lut<REG_K * REG_N>(Vmat_u8.format<uchar>(), hf8_lut_base);
+                        Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<REG_K * REG_N>(Vmat_u8.format<uchar>(), lut_slm_base);
                         temp2.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
                         temp2.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
                         cm_slm_block_write(slm_V, slm_offset + k * REG_K * sizeof(half), temp2.format<half>());

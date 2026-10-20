@@ -171,12 +171,13 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
                        density=1.0):
     """KV_FP8E4M3=1 counterpart of bench_prefill, same shape/dispatch/timing convention -- K/V are
     uploaded as raw fp8e4m3 bytes (1 byte/elem) instead of half (2 bytes/elem), decoded to half
-    once per work-group and staged through SLM (see cm_sdpa_common.hpp's sdpa_kernel_lsc --
-    measured faster than an earlier per-work-item decode variant, both bit-manipulation and
-    LUT-gather, which has since been removed). Values/correctness don't matter here (this is a
-    pure perf probe, see test_sdpa_prefill_fp8.py for correctness) -- only the byte pattern's
-    on-the-wire size (half the K/V bytes moved vs. fp16) and the V-path's extra decode/
-    VNNI-repack software overhead are what's being measured against the fp16 baseline.
+    once per work-group and staged through SLM, via LUT-gather from a work-group-local SLM copy of
+    the 256-entry LUT (see cm_sdpa_common.hpp's sdpa_kernel_lsc / hf8_e4m3_decode_to_f16_lut_slm --
+    measured ~12% faster than gathering the same LUT straight from global/SVM memory, and faster
+    still than a bit-manipulation decode). Values/correctness don't matter here (this is a pure
+    perf probe, see test_sdpa_prefill_fp8.py for correctness) -- only the byte pattern's on-the-wire
+    size (half the K/V bytes moved vs. fp16) and the V-path's extra decode/VNNI-repack software
+    overhead are what's being measured against the fp16 baseline.
 
     sparse_block_size>1 (with a matching density in (0,1]) additionally benchmarks a block-sparse
     mask on top of the fp8 decode -- the mask is faked at the requested density exactly like
@@ -220,8 +221,10 @@ def bench_prefill_fp8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_c
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    # KV_FP8E4M3 always needs the 256-entry half LUT -- sdpa_kernel_lsc always uses the LUT
-    # decode.
+    # KV_FP8E4M3's kernel ABI always requires the 256-entry half LUT argument, even at
+    # KV_FP8E4M3's LUT is copied into SLM once per work-group by the kernel itself (see
+    # cm_sdpa_opt_prefill.cm's cooperative LUT fill) -- this upload just seeds that global/SVM
+    # source copy.
     t_lut = cl.tensor(build_hf8_decode_lut_f16())
     args += [t_lut]
 

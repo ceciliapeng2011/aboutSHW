@@ -28,14 +28,18 @@
 // KV_FP8E4M3 (default 0): when set, key/value are read as fp8e4m3-packed bytes (1
 // byte/element) instead of plain half, decoded to half once per work-group and staged through SLM
 // -- calls cm_sdpa_common.hpp's sdpa_kernel_lsc instantiated with KVElemT=uchar instead of
-// sdpa_kernel_lsc_prefetch, always using the LUT-gather decode (see sdpa_kernel_lsc's doc comment;
-// a per-work-item decode variant -- both the default bit-manipulation decode and an opt-in
-// LUT-gather decode -- was measured slower and has since been removed). Mirrors KV_RING_FP8E4M3's
-// convention in cm_sdpa_opt_prefill_multisource.cm, applied here to the single K/V source this
-// kernel has (query and output stay plain half either way). The physical K/V buffer is then 1
-// byte/element, so its own pitch/offset must be computed at elem_size=sizeof(uchar) (see
-// kv_elem_size below) -- Q/output pitch/offset calls below deliberately keep using the 1-arg
-// template form, which still defaults to sizeof(half).
+// sdpa_kernel_lsc_prefetch, using LUT-gather from a work-group-local SLM copy of the 256-entry LUT
+// (see the cooperative LUT SLM fill below and hf8_e4m3_decode_to_f16_lut_slm's doc comment in
+// cm_sdpa_common.hpp). This was picked from an A/B/C comparison against a global/SVM LUT-gather
+// and a bit-manipulation decode (both still decode-once-per-work-group) -- the SLM-gather form
+// measured consistently ~12% faster across seq_len 2048-32768; a separate, still-slower
+// per-work-item decode variant (not decode-once-per-work-group at all) was measured slower still
+// and has long since been removed. Mirrors KV_RING_FP8E4M3's convention in
+// cm_sdpa_opt_prefill_multisource.cm, applied here to the single K/V source this kernel has (query
+// and output stay plain half either way). The physical K/V buffer is then 1 byte/element, so its
+// own pitch/offset must be computed at elem_size=sizeof(uchar) (see kv_elem_size below) --
+// Q/output pitch/offset calls below deliberately keep using the 1-arg template form, which still
+// defaults to sizeof(half).
 // Causal-only, no attn_mask (matches sdpa_kernel_lsc's own fp8 scope). SPARSE_BLOCK_SIZE IS
 // supported here (both 128 and 256) -- see sdpa_kernel_lsc's doc comment for the two-level
 // skip-LOAD/skip-COMPUTE mask split SPARSE_BLOCK_SIZE==128 needs on top of 256's simpler
@@ -89,8 +93,10 @@ _GENX_MAIN_ void KERNEL_NAME(
 #endif
 #if KV_FP8E4M3
     // 256-entry half LUT, index == raw fp8e4m3 byte value -- see hf8_e4m3_ref.py's
-    // build_hf8_decode_lut_f16 (host-side) / cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut
-    // (device-side gather consumer), which sdpa_kernel_lsc (KVElemT=uchar) always uses.
+    // build_hf8_decode_lut_f16 (host-side). Copied into SLM once per work-group below (the
+    // cooperative LUT fill), then gathered from there by
+    // cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut_slm -- this global pointer itself is only
+    // ever read during that one-time SLM fill, never gathered from directly.
     , half* hf8_lut [[type("svmptr_t")]]
 #endif
     ) {
@@ -225,9 +231,41 @@ _GENX_MAIN_ void KERNEL_NAME(
     // cm_sdpa_vlen.cm's non-prefetch sdpa_kernel_lsc call site.
     constexpr uint K_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
     constexpr uint V_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
-    cm_slm_init(K_SLM_SIZE + V_SLM_SIZE);
+    // LUT's own 512-byte (256-entry half) SLM sub-allocation -- cm_slm_init must see the total up
+    // front, so K_SLM_SIZE/V_SLM_SIZE/LUT_SLM_SIZE are all summed into the one call below.
+    constexpr uint LUT_SLM_SIZE = 256 * sizeof(half);
+    cm_slm_init(K_SLM_SIZE + V_SLM_SIZE + LUT_SLM_SIZE);
     auto slm_K = cm_slm_alloc(K_SLM_SIZE);
     auto slm_V = cm_slm_alloc(V_SLM_SIZE);
+    auto slm_lut = cm_slm_alloc(LUT_SLM_SIZE);
+    // Cooperative one-shot fill: every lane in the work-group loads its own disjoint slice of the
+    // 256-entry LUT from global/SVM memory and writes it into the SLM copy -- done ONCE per
+    // work-group (unlike load_slm_KV's per-kv_pos K/V staging below), strided by local_size so
+    // this works for any local_size that divides 256 evenly (today's callers always use 16).
+    // Followed by a barrier so every lane sees a fully-populated LUT before load_slm_KV's first
+    // gather call (hf8_e4m3_decode_to_f16_lut_slm) below ever runs. Measured ~12% faster overall
+    // than gathering straight from hf8_lut in global/SVM memory every time (see this file's
+    // KV_FP8E4M3 doc comment for the full A/B/C comparison).
+    {
+        // cm_ptr_load's plain scalar-offset block-load overload only supports U32/U64 granularity
+        // (a "transposed" load), not half -- so this reuses the same per-lane GATHER overload
+        // cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut uses (cm_ptr_load<half, VectorSize::N1,
+        // DataSize::U16, ...>(ptr, offsets)), just with a sequential index vector instead of fp8
+        // byte values.
+        constexpr int LUT_CHUNK = 8;  // 8 half = 16 bytes/lane/iteration
+        vector<uint, LUT_CHUNK> lane_iota;
+        cmtl::cm_vector_assign(lane_iota.select_all(), 0, 1);  // 0,1,...,LUT_CHUNK-1
+        for (int e = LUT_CHUNK * wg_local_id; e < 256; e += LUT_CHUNK * local_size) {
+            vector<uint, LUT_CHUNK> idx = (uint)e + lane_iota;
+            vector<uint, LUT_CHUNK> byte_offsets = idx * (uint)sizeof(half);
+            vector<half, LUT_CHUNK> lut_chunk =
+                cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
+                    reinterpret_cast<half*>(hf8_lut_ptr), byte_offsets);
+            cm_slm_block_write(slm_lut, (int)(e * sizeof(half)), lut_chunk);
+        }
+    }
+    cm_slm_fence(CM_LOCAL_BARRIER);
+    cm_barrier();
 
     // sdpa_kernel_lsc's load_slm_KV pipeline synchronizes the whole work-group via
     // cm_sbarrier/cm_fence, so every lane MUST run the exact same number of kv_pos loop
@@ -291,7 +329,7 @@ _GENX_MAIN_ void KERNEL_NAME(
         reinterpret_cast<svmptr_t>((uint8_t*)value + v_off),
         reinterpret_cast<svmptr_t>((uint8_t*)output + o_off),
         o_seq_pitch,
-        hf8_lut_ptr,
+        slm_lut,
         // sparse_mask_ptr: this work-item's own row (already WG-uniform at SPARSE_BLOCK_SIZE==256,
         // genuinely per-lane at SPARSE_BLOCK_SIZE==128 -- see sdpa_kernel_lsc's doc comment).
         // Used for skip-COMPUTE in both cases (and also skip-LOAD at 256, where the two decisions

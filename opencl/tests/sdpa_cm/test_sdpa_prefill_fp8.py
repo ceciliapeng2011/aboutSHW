@@ -55,7 +55,8 @@ def build_prefill_kernel_fp8(num_heads, num_kv_heads, head_size, is_causal,
                               q_order, k_order, v_order, o_order,
                               sparse_block_size=1, scale_factor=None):
     # KV_FP8E4M3=1 calls cm_sdpa_common.hpp's sdpa_kernel_lsc -- decode-once-per-work-group,
-    # staged through SLM, always via the LUT decode -- instead of sdpa_kernel_lsc_prefetch's
+    # staged through SLM, via LUT-gather from a work-group-local SLM copy of the 256-entry LUT
+    # (see hf8_e4m3_decode_to_f16_lut_slm's doc comment) -- instead of sdpa_kernel_lsc_prefetch's
     # per-work-item decode. No attn_mask support (see sdpa_kernel_lsc's doc comment).
     # Block-sparsity IS supported at sparse_block_size in (128, 256) -- see sdpa_kernel_lsc's
     # doc comment for the two-level skip-LOAD/skip-COMPUTE mask split 128 needs on top of 256's
