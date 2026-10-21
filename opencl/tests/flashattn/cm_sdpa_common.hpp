@@ -1002,7 +1002,43 @@ CM_INLINE void sdpa_accumulate_kv_source(
     matrix_ref<half, ((head_size + 16 - 1) / 16 * 16) / REG_K, REG_K * REG_N> rQ,
     vector_ref<float, q_step> cur_max,
     vector_ref<float, q_step> cur_sum,
-    matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO) {
+    matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO,
+    // SLM byte-offset base of a work-group-local copy of the 256-entry half decode LUT
+    // (hf8_e4m3_ref.py's build_hf8_decode_lut_f16), only read when KVElemT=uchar -- see
+    // hf8_e4m3_decode_to_f16_lut_slm's doc comment. An EARLIER version of this function used
+    // hf8_e4m3_decode_to_f16_lut (per-call global/SVM gather, no SLM staging) instead: correct, but
+    // measured catastrophically slower here (~4.6x slower than the plain-half ring at FlashVSR's
+    // realistic kv_len_ring=57600 shape) -- unlike sdpa_kernel_lsc's decode-ONCE-per-work-group
+    // amortization, this per-work-item loop calls the decode function on every tile of every
+    // kv_base iteration, so a genuine global-memory gather (as opposed to a cheap SLM read) is
+    // paid that many times over, not once. The SLM copy is filled cooperatively, once, by the
+    // caller (cm_sdpa_opt_prefill_multisource.cm) before this is ever invoked. Only ever non-zero
+    // for the ring source (see sdpa_kernel_lsc_prefetch_2src's two call sites below); current
+    // always stays half.
+    //
+    // KNOWN REMAINING PERF GAP (not fixed by the SLM move above): even with lut_slm_base, the
+    // fp8 ring is still measured ~3.2x SLOWER than the plain-half ring at that same realistic
+    // shape (bench_sdpa_multisource.py's "steady" chunk, dense: fp16 ~571ms vs fp8ring ~1841ms on
+    // a 64-EU Arc Xe2 GPU) -- NOT a bug, a structural property of this function's per-work-item
+    // design. sdpa_kernel_lsc's SLM-LUT win is real because that kernel decodes each (kv_pos,
+    // column-range) byte range into SLM EXACTLY ONCE per work-group (half the WG's lanes decode
+    // K, the other half decode V; every lane then reads the shared result back out of SLM) --
+    // the decode cost is amortized over wg_local_size(16) lanes. This function has NO such
+    // work-group cooperation: every one of the 16 lanes in a work-group independently re-loads
+    // (cache-absorbed, cheap) AND re-decodes (real ALU + SLM-gather instructions, NOT free) the
+    // exact same underlying K/V bytes at the exact same kv_pos -- so the decode cost here is
+    // paid 16x over, not once, regardless of which decode primitive is used. This workload is
+    // compute-bound (DPAS-heavy, ~51% XMX utilization even in the plain-half case -- see
+    // bench_sdpa_multisource.py), so that 16x-undamortized extra per-lane instruction stream
+    // cannot be hidden behind memory latency the way it might be in a bandwidth-bound kernel.
+    // Closing this gap for real would mean porting this kernel to sdpa_kernel_lsc's heavier
+    // SLM-staged K/V double-buffer + cm_sbarrier/cm_fence pipeline -- which this file's own
+    // "Two-source variant" header comment deliberately scopes OUT of, to keep this kernel family
+    // small, independently-testable, and barrier-free. Treat fp8 ring here as "correct and the
+    // best available per-lane decode," not as "as fast as fp16" -- a caller that needs fp8-ring
+    // speed parity with fp16 would need that larger architectural change as separate follow-up
+    // work, not a tweak to this function.
+    uint lut_slm_base = 0) {
     static_assert(sparse_block_size > 1, "dense dual-source is out of scope -- use sdpa_kernel_lsc_prefetch for single-source dense attention");
     static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
                   "KVElemT must be half (fp16 K/V, default) or uchar (fp8e4m3-packed ring K/V)");
@@ -1069,7 +1105,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
                 // right before cm_dpas -- no separate reorder kernel, no extra buffer.
                 matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
                 cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(0));
-                Kmat.format<half>() = hf8_e4m3_decode_to_f16<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>());
+                Kmat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>(), lut_slm_base);
             } else {
                 cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
             }
@@ -1085,7 +1121,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
                 if constexpr (fp8_kv) {
                     matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
                     cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(ri * REG_K));
-                    Kmat.format<half>() = hf8_e4m3_decode_to_f16<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>());
+                    Kmat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>(), lut_slm_base);
                 } else {
                     cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
                 }
@@ -1156,7 +1192,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
                     matrix<uchar, REG_K, REG_N> Vmat_u8;
                     cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(ci * REG_N));
                     matrix<half, REG_K, REG_N> Vmat_nat;
-                    Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16<REG_K * REG_N>(Vmat_u8.format<uchar>());
+                    Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<REG_K * REG_N>(Vmat_u8.format<uchar>(), lut_slm_base);
                     Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
                     Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
                 } else {
@@ -1196,6 +1232,13 @@ void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
                                    svmptr_t k_base_cur [[type("svmptr_t")]],
                                    svmptr_t v_base_cur [[type("svmptr_t")]],
                                    svmptr_t sparse_mask_cur [[type("svmptr_t")]],
+                                   // SLM byte-offset base of the work-group-local 256-entry half
+                                   // decode LUT, only read when fp8_ring_kv -- see
+                                   // sdpa_accumulate_kv_source's lut_slm_base doc comment. Threaded
+                                   // down from cm_sdpa_opt_prefill_multisource.cm's KV_RING_FP8E4M3
+                                   // cooperative LUT SLM fill (done once by the caller, before this
+                                   // is ever invoked).
+                                   uint lut_slm_base = 0,
                                    uint o_pitch_bytes = num_heads * head_size * sizeof(half),
                                    float q_prescale_rt = q_prescale) {
     uint o_pitch = o_pitch_bytes;
@@ -1238,7 +1281,7 @@ void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
     sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size,
                                typename std::conditional<fp8_ring_kv, uchar, half>::type>(
         wg_local_id, kv_len_ring, k_pitch_bytes_ring, v_pitch_bytes_ring,
-        k_base_ring, v_base_ring, sparse_mask_ring, rQ, cur_max, cur_sum, rO);
+        k_base_ring, v_base_ring, sparse_mask_ring, rQ, cur_max, cur_sum, rO, lut_slm_base);
     sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(
         wg_local_id, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
         k_base_cur, v_base_cur, sparse_mask_cur, rQ, cur_max, cur_sum, rO);

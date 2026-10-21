@@ -29,7 +29,7 @@ from clops import cl
 
 import test_sdpa_prefill as base
 import test_sdpa_prefill_block_mask_multisource as ms
-from hf8_e4m3_ref import encode_f16_to_hf8, decode_hf8_to_f16
+from hf8_e4m3_ref import encode_f16_to_hf8, decode_hf8_to_f16, build_hf8_decode_lut_f16
 
 torch.manual_seed(44)
 
@@ -96,8 +96,13 @@ def run_prefill_sparse_multisource_fp8ring(q, k_ring_hf8_bytes, v_ring_hf8_bytes
 
     t_mask = cl.tensor(block_mask.to(torch.bool).numpy())
 
+    # KV_RING_FP8E4M3 always needs the 256-entry half LUT (see
+    # hf8_e4m3_ref.build_hf8_decode_lut_f16) -- matching cm_sdpa_opt_prefill_multisource.cm's
+    # `#if KV_RING_FP8E4M3` hf8_lut param, which is always last in the signature.
+    t_lut = cl.tensor(build_hf8_decode_lut_f16())
+
     args = [t_q, t_k_ring, t_v_ring, t_k_cur, t_v_cur, t_out, q_len, kv_len_ring, kv_len_cur,
-            t_mask, num_q_blocks, num_k_blocks_ring, num_k_blocks_cur]
+            t_mask, num_q_blocks, num_k_blocks_ring, num_k_blocks_cur, t_lut]
     kernel.enqueue("cm_sdpa_opt_prefill_multisource_fp8ring", GWS, LWS, *args)
 
     out_phys = torch.from_numpy(t_out.numpy())

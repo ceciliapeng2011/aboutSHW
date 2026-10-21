@@ -35,14 +35,26 @@
 // helpers, just with each source's own kv_len).
 //
 // KV_RING_FP8E4M3 (default 0): when set, key_ring/value_ring are read as fp8e4m3-packed bytes (1
-// byte/element) instead of plain half, decoded to half in-register right at DPAS time -- see
-// cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16/sdpa_accumulate_kv_source<...,KVElemT=uchar>. Only
+// byte/element) instead of plain half, decoded to half in-register right at DPAS time via a
+// work-group-local SLM copy of the 256-entry decode LUT -- see cm_sdpa_common.hpp's
+// hf8_e4m3_decode_to_f16_lut_slm/sdpa_accumulate_kv_source<...,KVElemT=uchar>, and this kernel's
+// own cooperative LUT-fill block below (right after wg_local_id/local_size are computed, and
+// BEFORE the q_tokens<=0 early-return, since its barrier must be reached by every lane). Only
 // the ring source is ever affected; key_cur/value_cur always stay plain half (current is
 // transient, quantizing it buys no persistent-memory win -- see
 // flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md Sec 3.1's identical rationale for
 // the analogous int8 design). The physical ring buffer is then 1 byte/element, so its own
 // pitch/offset must be computed at elem_size=sizeof(uchar) (see kv_ring_elem_size below) --
 // current's pitch/offset are untouched (still implicitly sizeof(half) via the 1-arg template call).
+//
+// PERF: fp8 ring is NOT a speed win over plain half here -- measured ~3.2x SLOWER at FlashVSR's
+// realistic steady-state shape (bench_sdpa_multisource.py), because this kernel's per-work-item
+// (no SLM/barrier K/V sharing) design re-decodes the same K/V bytes independently in every one of
+// a work-group's 16 lanes, unamortized -- see sdpa_accumulate_kv_source's lut_slm_base doc
+// comment in cm_sdpa_common.hpp ("KNOWN REMAINING PERF GAP") for the full explanation and why
+// closing it is out of scope for this deliberately simple/barrier-free kernel family. KV_RING_FP8E4M3's
+// value here is the persistent-memory footprint halving (the real motivation, matching
+// flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md's ring-cache design), not latency.
 #include "cm_sdpa_common.hpp"
 #include "cm_sdpa_opt_common.hpp"
 
@@ -77,7 +89,18 @@ _GENX_MAIN_ void KERNEL_NAME(
     bool* sparse_block_mask [[type("svmptr_t")]],
     int num_q_blocks,
     int num_k_blocks_ring,
-    int num_k_blocks_cur) {
+    int num_k_blocks_cur
+#if KV_RING_FP8E4M3
+    // 256-entry half LUT, index == raw fp8e4m3 byte value (hf8_e4m3_ref.py's
+    // build_hf8_decode_lut_f16) -- copied into a work-group-local SLM buffer once below (the
+    // cooperative LUT fill), then gathered from there by hf8_e4m3_decode_to_f16_lut_slm. This
+    // global pointer itself is only ever read during that one-time SLM fill, never gathered from
+    // directly -- see cm_sdpa_opt_prefill.cm's identical KV_FP8E4M3 setup and
+    // cm_sdpa_common.hpp's sdpa_accumulate_kv_source doc comment for why a per-call global gather
+    // (this kernel's earlier approach) was measured catastrophically slow instead.
+    , half* hf8_lut [[type("svmptr_t")]]
+#endif
+    ) {
     constexpr int num_heads = CMFLA_NUM_HEADS;
     constexpr int num_kv_heads = CMFLA_NUM_KV_HEADS;
     constexpr int head_size = CMFLA_HEAD_SIZE;
@@ -95,6 +118,39 @@ _GENX_MAIN_ void KERNEL_NAME(
     auto local_size = cm_local_size(2);
     int wg_seq_len = local_size * q_step;
     int q_start = wg_id * wg_seq_len + wg_local_id * q_step;
+
+#if KV_RING_FP8E4M3
+    // Cooperative one-shot SLM fill for the 256-entry half decode LUT -- verbatim copy of
+    // cm_sdpa_opt_prefill.cm's KV_FP8E4M3 cooperative LUT fill (see hf8_e4m3_decode_to_f16_lut_slm's
+    // doc comment in cm_sdpa_common.hpp). MUST run, and its barrier MUST be reached, by EVERY lane
+    // in the work-group -- including one with zero valid q_tokens -- so this runs before the
+    // q_tokens<=0 early-return a few lines below: an unconditional per-lane return before a
+    // barrier any sibling lane still needs to reach would deadlock the work-group (the exact
+    // pitfall cm_sdpa_opt_prefill.cm's own KV_FP8E4M3 doc comment documents for its barrier-
+    // pipelined K/V staging; this kernel has no barrier anywhere else, but the LUT fill introduces
+    // exactly one, so the same rule applies).
+    constexpr uint LUT_SLM_SIZE = 256 * sizeof(half);
+    cm_slm_init(LUT_SLM_SIZE);
+    uint slm_lut = cm_slm_alloc(LUT_SLM_SIZE);
+    {
+        svmptr_t hf8_lut_ptr = reinterpret_cast<svmptr_t>(hf8_lut);
+        constexpr int LUT_CHUNK = 8;  // 8 half = 16 bytes/lane/iteration
+        vector<uint, LUT_CHUNK> lane_iota;
+        cmtl::cm_vector_assign(lane_iota.select_all(), 0, 1);  // 0,1,...,LUT_CHUNK-1
+        for (int e = LUT_CHUNK * wg_local_id; e < 256; e += LUT_CHUNK * local_size) {
+            vector<uint, LUT_CHUNK> idx = (uint)e + lane_iota;
+            vector<uint, LUT_CHUNK> byte_offsets = idx * (uint)sizeof(half);
+            vector<half, LUT_CHUNK> lut_chunk =
+                cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
+                    reinterpret_cast<half*>(hf8_lut_ptr), byte_offsets);
+            cm_slm_block_write(slm_lut, (int)(e * sizeof(half)), lut_chunk);
+        }
+    }
+    cm_slm_fence(CM_LOCAL_BARRIER);
+    cm_barrier();
+#else
+    uint slm_lut = 0;
+#endif
 
     // Ring-only byte-size-per-element: 1 (uchar/fp8e4m3) when KV_RING_FP8E4M3, else sizeof(half)
     // (today's unchanged default) -- current's pitch/offset calls below deliberately keep using
@@ -165,6 +221,7 @@ _GENX_MAIN_ void KERNEL_NAME(
         reinterpret_cast<svmptr_t>((uint8_t*)key_cur + k_off_cur),
         reinterpret_cast<svmptr_t>((uint8_t*)value_cur + v_off_cur),
         sparse_mask_cur,
+        slm_lut,
         o_seq_pitch,
         q_prescale_rt);
 }
