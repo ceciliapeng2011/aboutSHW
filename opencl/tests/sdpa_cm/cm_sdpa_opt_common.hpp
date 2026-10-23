@@ -32,10 +32,10 @@
 // IDENTITY (heads outer) -> tokens are head_size apart (heads live in separate seq_len*head_size
 // chunks, handled by get_head_byte_offset below).
 //
-// elem_size defaults to sizeof(half) (every existing caller's behavior, unchanged). An fp8e4m3
-// ring buffer (see KV_RING_FP8E4M3 in cm_sdpa_opt_prefill_multisource.cm) packs 1 byte/element
-// instead of 2, so its own pitch/offset must be computed with elem_size=sizeof(uchar) -- callers
-// opt in explicitly by passing the second template argument.
+// elem_size defaults to sizeof(half) (every existing caller's behavior, unchanged). An int8-packed
+// cache buffer (see KV_CACHE_COMPRESSION in cm_sdpa_opt_prefill_dualsource.cm) packs 1
+// byte/element instead of 2, so its own pitch/offset must be computed with elem_size=sizeof(uchar)
+// -- callers opt in explicitly by passing the second template argument.
 template<int order, int elem_size = sizeof(half)>
 inline uint get_seq_pitch_bytes(int seq_len, int num_heads, int head_size) {
     if constexpr (order == TRANSPOSE_ORDER_SWAPPED)

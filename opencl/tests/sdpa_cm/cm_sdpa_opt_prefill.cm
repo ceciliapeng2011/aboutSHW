@@ -25,22 +25,21 @@
 // itself supports (sdpa_gen_opt.cpp's OUTPUT_TRANSPOSE_ORDER_PRESENT assert). head_size stays
 // innermost/contiguous either way, matching the transpose-fusion invariant.
 //
-// KV_FP8E4M3 (default 0): when set, key/value are read as fp8e4m3-packed bytes (1
-// byte/element) instead of plain half, decoded to half once per work-group and staged through SLM
-// -- calls cm_sdpa_common.hpp's sdpa_kernel_lsc instantiated with KVElemT=uchar instead of
-// sdpa_kernel_lsc_prefetch, using LUT-gather from a work-group-local SLM copy of the 256-entry LUT
-// (see the cooperative LUT SLM fill below and hf8_e4m3_decode_to_f16_lut_slm's doc comment in
-// cm_sdpa_common.hpp). This was picked from an A/B/C comparison against a global/SVM LUT-gather
-// and a bit-manipulation decode (both still decode-once-per-work-group) -- the SLM-gather form
-// measured consistently ~12% faster across seq_len 2048-32768; a separate, still-slower
-// per-work-item decode variant (not decode-once-per-work-group at all) was measured slower still
-// and has long since been removed. Mirrors KV_RING_FP8E4M3's convention in
-// cm_sdpa_opt_prefill_multisource.cm, applied here to the single K/V source this kernel has (query
-// and output stay plain half either way). The physical K/V buffer is then 1 byte/element, so its
-// own pitch/offset must be computed at elem_size=sizeof(uchar) (see kv_elem_size below) --
-// Q/output pitch/offset calls below deliberately keep using the 1-arg template form, which still
-// defaults to sizeof(half).
-// Causal-only, no attn_mask (matches sdpa_kernel_lsc's own fp8 scope). SPARSE_BLOCK_SIZE IS
+// KV_CACHE_COMPRESSION (default 0=NONE, matches pageatten/test_pa.py's own
+// KV_CACHE_COMPRESSION_{NONE,BY_TOKEN,BY_CHANNEL} enum/JIT-constant convention): when 1 or 2,
+// key/value are read as int8-packed bytes (1 byte/element, affine uint8 quantization -- see
+// cm_int8_kv_decode.hpp) instead of plain half, decoded to half once per work-group and staged
+// through SLM -- calls cm_sdpa_common.hpp's sdpa_kernel_lsc instantiated with KVElemT=uchar instead
+// of sdpa_kernel_lsc_prefetch. K is quantized BY_CHANNEL when ==2 (one scale/zp pair per 16-token
+// sub-block per head_size channel) or BY_TOKEN when ==1 (one pair per token); V is always BY_TOKEN
+// regardless of mode -- matches opencl/tests/pageatten/kv_cache_quant_utils.py's own K/V asymmetry
+// exactly (see int8_kv_ref.py, the host-side oracle this wraps). Mirrors
+// KV_CACHE_COMPRESSION's convention in cm_sdpa_opt_prefill_dualsource.cm, applied here to the
+// single K/V source this kernel has (query and output stay plain half either way). The physical
+// K/V buffer is then 1 byte/element, so its own pitch/offset must be computed at
+// elem_size=sizeof(uchar) (see kv_elem_size below) -- Q/output pitch/offset calls below
+// deliberately keep using the 1-arg template form, which still defaults to sizeof(half).
+// Causal-only, no attn_mask (matches sdpa_kernel_lsc's own int8 scope). SPARSE_BLOCK_SIZE IS
 // supported here (both 128 and 256) -- see sdpa_kernel_lsc's doc comment for the two-level
 // skip-LOAD/skip-COMPUTE mask split SPARSE_BLOCK_SIZE==128 needs on top of 256's simpler
 // single-mask case.
@@ -66,8 +65,8 @@ namespace KERNEL_NAME {
 #ifndef SPARSE_BLOCK_SIZE
 #define SPARSE_BLOCK_SIZE 1
 #endif
-#ifndef KV_FP8E4M3
-#define KV_FP8E4M3 0
+#ifndef KV_CACHE_COMPRESSION
+#define KV_CACHE_COMPRESSION 0
 #endif
 
 _GENX_MAIN_ void KERNEL_NAME(
@@ -91,13 +90,15 @@ _GENX_MAIN_ void KERNEL_NAME(
     , int num_q_blocks
     , int num_k_blocks
 #endif
-#if KV_FP8E4M3
-    // 256-entry half LUT, index == raw fp8e4m3 byte value -- see hf8_e4m3_ref.py's
-    // build_hf8_decode_lut_f16 (host-side). Copied into SLM once per work-group below (the
-    // cooperative LUT fill), then gathered from there by
-    // cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut_slm -- this global pointer itself is only
-    // ever read during that one-time SLM fill, never gathered from directly.
-    , half* hf8_lut [[type("svmptr_t")]]
+#if KV_CACHE_COMPRESSION
+    // Int8 dequant scale/zero-point tensors -- see cm_int8_kv_decode.hpp and int8_kv_ref.py (the
+    // host-side encode reference). key_scale/key_zp are [kv_len/16, head_size] when
+    // KV_CACHE_COMPRESSION==2 (BY_CHANNEL) or [kv_len] when ==1 (BY_TOKEN); value_scale/value_zp
+    // are always [kv_len] (V is always BY_TOKEN).
+    , half* key_scale [[type("svmptr_t")]]
+    , half* key_zp [[type("svmptr_t")]]
+    , half* value_scale [[type("svmptr_t")]]
+    , half* value_zp [[type("svmptr_t")]]
 #endif
     ) {
     constexpr int num_heads = CMFLA_NUM_HEADS;
@@ -126,10 +127,10 @@ _GENX_MAIN_ void KERNEL_NAME(
     int wg_seq_len = local_size * q_step;
     int q_start = wg_id * wg_seq_len + wg_local_id * q_step;
 
-    // K/V-only byte-size-per-element: 1 (uchar/fp8e4m3) when KV_FP8E4M3, else sizeof(half)
+    // K/V-only byte-size-per-element: 1 (uchar/int8) when KV_CACHE_COMPRESSION, else sizeof(half)
     // (today's unchanged default) -- Q/output pitch/offset calls below deliberately keep using the
     // 1-arg template form, which still defaults to sizeof(half) regardless of this macro.
-#if KV_FP8E4M3
+#if KV_CACHE_COMPRESSION
     constexpr int kv_elem_size = sizeof(uchar);
 #else
     constexpr int kv_elem_size = sizeof(half);
@@ -161,7 +162,7 @@ _GENX_MAIN_ void KERNEL_NAME(
 #endif
 
     // NOTE: the early "this lane has no valid query tokens" return is NOT done here anymore --
-    // see the KV_FP8E4M3 branch below for why, and cm_pa_xe2.hpp's pa_lsc_u8/
+    // see the KV_CACHE_COMPRESSION branch below for why, and cm_pa_xe2.hpp's pa_lsc_u8/
     // pa_kernel_lsc_prefetch_f16 (+ its "Threads with zero valid query tokens can early exit if
     // there is no barrier" comment) for the architectural precedent this now mirrors: a
     // barrier-free kernel is free to early-return per-lane (done just below the #else, right
@@ -172,8 +173,8 @@ _GENX_MAIN_ void KERNEL_NAME(
     // wg_seq_len: the trailing lanes (q_tokens<=0) would return right here without ever entering
     // sdpa_kernel_lsc, while their sibling lanes in the same work-group (q_tokens>0) would go
     // on to hit its barriers -- confirmed to hang real hardware (reproduced on both the
-    // block-sparse and the plain dense KV_FP8E4M3 path, since neither ever checked q_tokens
-    // again after this point). sdpa_kernel_lsc itself already clamps q_tokens_left to
+    // block-sparse and the plain dense KV_CACHE_COMPRESSION path, since neither ever checked
+    // q_tokens again after this point). sdpa_kernel_lsc itself already clamps q_tokens_left to
     // [0,q_step] and only skips its own Q-load / final O-store for an inactive lane -- it never
     // skips the barrier pipeline -- so it's always safe to call unconditionally.
 
@@ -209,63 +210,44 @@ _GENX_MAIN_ void KERNEL_NAME(
     svmptr_t sparse_mask_ptr = 0;
 #endif
 
-#if KV_FP8E4M3
-    svmptr_t hf8_lut_ptr = reinterpret_cast<svmptr_t>(hf8_lut);
-
+#if KV_CACHE_COMPRESSION
     // Decode-once-per-work-group path: see cm_sdpa_common.hpp's sdpa_kernel_lsc doc comment
-    // (KVElemT=uchar instantiation). Causal-only, no attn_mask -- matches that function's own fp8
+    // (KVElemT=uchar instantiation). Causal-only, no attn_mask -- matches that function's own int8
     // scope (a focused perf experiment, not a feature-parity replacement for
     // sdpa_kernel_lsc_prefetch).
-    static_assert(!HAS_ATTN_MASK_INPUT, "KV_FP8E4M3 doesn't support attn_mask -- sdpa_kernel_lsc<..., uchar> has no attn_mask path");
+    static_assert(!HAS_ATTN_MASK_INPUT, "KV_CACHE_COMPRESSION doesn't support attn_mask -- sdpa_kernel_lsc<..., uchar> has no attn_mask path");
     // Block-sparsity IS supported at both allowed SPARSE_BLOCK_SIZE values (128, 256) -- see
     // sdpa_kernel_lsc's doc comment for the full two-level (skip-LOAD vs skip-COMPUTE)
     // rationale SPARSE_BLOCK_SIZE==128 needs on top of SPARSE_BLOCK_SIZE==256's simpler single-mask
     // case. Any OTHER value is a hard compile error here, not silently wrong.
     static_assert(SPARSE_BLOCK_SIZE == 1 || SPARSE_BLOCK_SIZE == 128 || SPARSE_BLOCK_SIZE == 256,
-                  "KV_FP8E4M3's block-sparsity support requires SPARSE_BLOCK_SIZE in {128, "
+                  "KV_CACHE_COMPRESSION's block-sparsity support requires SPARSE_BLOCK_SIZE in {128, "
                   "256} -- any other value would either misalign with the barrier-pipelined "
                   "work-group's 256-token span or fail to divide it evenly");
 
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
     // Quad-buffered (see sdpa_kernel_lsc's load_slm_KV pipeline) -- same sizing convention as
-    // cm_sdpa_vlen.cm's non-prefetch sdpa_kernel_lsc call site.
+    // cm_sdpa_vlen.cm's non-prefetch sdpa_kernel_lsc call site. No LUT SLM allocation needed --
+    // int8 affine decode reads scale/zp directly from SVM inside load_slm_KV (cm_int8_kv_decode.hpp),
+    // same as K/V data itself.
     constexpr uint K_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
     constexpr uint V_SLM_SIZE = (4 * kv_step * padded_head_size * sizeof(half));
-    // LUT's own 512-byte (256-entry half) SLM sub-allocation -- cm_slm_init must see the total up
-    // front, so K_SLM_SIZE/V_SLM_SIZE/LUT_SLM_SIZE are all summed into the one call below.
-    constexpr uint LUT_SLM_SIZE = 256 * sizeof(half);
-    cm_slm_init(K_SLM_SIZE + V_SLM_SIZE + LUT_SLM_SIZE);
+    cm_slm_init(K_SLM_SIZE + V_SLM_SIZE);
     auto slm_K = cm_slm_alloc(K_SLM_SIZE);
     auto slm_V = cm_slm_alloc(V_SLM_SIZE);
-    auto slm_lut = cm_slm_alloc(LUT_SLM_SIZE);
-    // Cooperative one-shot fill: every lane in the work-group loads its own disjoint slice of the
-    // 256-entry LUT from global/SVM memory and writes it into the SLM copy -- done ONCE per
-    // work-group (unlike load_slm_KV's per-kv_pos K/V staging below), strided by local_size so
-    // this works for any local_size that divides 256 evenly (today's callers always use 16).
-    // Followed by a barrier so every lane sees a fully-populated LUT before load_slm_KV's first
-    // gather call (hf8_e4m3_decode_to_f16_lut_slm) below ever runs. Measured ~12% faster overall
-    // than gathering straight from hf8_lut in global/SVM memory every time (see this file's
-    // KV_FP8E4M3 doc comment for the full A/B/C comparison).
-    {
-        // cm_ptr_load's plain scalar-offset block-load overload only supports U32/U64 granularity
-        // (a "transposed" load), not half -- so this reuses the same per-lane GATHER overload
-        // cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut uses (cm_ptr_load<half, VectorSize::N1,
-        // DataSize::U16, ...>(ptr, offsets)), just with a sequential index vector instead of fp8
-        // byte values.
-        constexpr int LUT_CHUNK = 8;  // 8 half = 16 bytes/lane/iteration
-        vector<uint, LUT_CHUNK> lane_iota;
-        cmtl::cm_vector_assign(lane_iota.select_all(), 0, 1);  // 0,1,...,LUT_CHUNK-1
-        for (int e = LUT_CHUNK * wg_local_id; e < 256; e += LUT_CHUNK * local_size) {
-            vector<uint, LUT_CHUNK> idx = (uint)e + lane_iota;
-            vector<uint, LUT_CHUNK> byte_offsets = idx * (uint)sizeof(half);
-            vector<half, LUT_CHUNK> lut_chunk =
-                cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
-                    reinterpret_cast<half*>(hf8_lut_ptr), byte_offsets);
-            cm_slm_block_write(slm_lut, (int)(e * sizeof(half)), lut_chunk);
-        }
-    }
-    cm_slm_fence(CM_LOCAL_BARRIER);
-    cm_barrier();
+
+    // Scale/zp tensors are always a fixed, TRANSPOSE_ORDER-independent [B, num_kv_heads, ...,
+    // head_size-or-1] layout (see int8_kv_ref.py) -- unlike key/value's own byte layout, there's no
+    // meaningful "swapped" convention for quantization metadata, so this is plain [B,Hkv,...]
+    // element arithmetic, not get_seq_pitch_bytes/get_head_byte_offset. K is [num_sub_blocks,
+    // head_size] per (b,hkv) when BY_CHANNEL, else [kv_len]; V is always [kv_len].
+#if KV_CACHE_COMPRESSION == 2
+    int num_k_sub_blocks = (kv_len + 15) / 16;
+    uint k_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)num_k_sub_blocks * (uint)head_size;
+#else
+    uint k_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len;
+#endif
+    uint v_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len;
 
     // sdpa_kernel_lsc's load_slm_KV pipeline synchronizes the whole work-group via
     // cm_sbarrier/cm_fence, so every lane MUST run the exact same number of kv_pos loop
@@ -276,7 +258,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     // lanes with a larger one are done, deadlocking the work-group as soon as a WG's Q range spans
     // more than one wg_local_id's worth of causal depth (i.e. as soon as a sequence needs more than
     // one Q work-group -- this is confirmed on real hardware: it hangs for seq_len=2048 but not for
-    // the single-WG shapes test_sdpa_prefill_fp8.py's SLM tests use). Recompute a work-group-uniform
+    // the single-WG shapes test_sdpa_prefill_int8.py's SLM tests use). Recompute a work-group-uniform
     // bound instead, from wg_id (not wg_local_id) -- the LAST lane's causal extent -- so every lane
     // runs the same iteration count; each lane's own tighter causal mask (causal_left, derived from
     // its own q_start, computed inside sdpa_kernel_lsc) still correctly zeroes out whatever
@@ -312,7 +294,8 @@ _GENX_MAIN_ void KERNEL_NAME(
     svmptr_t sparse_mask_wg_lo_ptr = 0, sparse_mask_wg_hi_ptr = 0;
 #endif
 
-    sdpa_kernel_lsc<(bool)CMFLA_IS_CAUSAL, num_heads, num_kv_heads, head_size, 0, SPARSE_BLOCK_SIZE, uchar>(
+    sdpa_kernel_lsc<(bool)CMFLA_IS_CAUSAL, num_heads, num_kv_heads, head_size, 0, SPARSE_BLOCK_SIZE, uchar,
+                    KV_CACHE_COMPRESSION == 2>(
         slm_K,
         slm_V,
         wg_local_id,
@@ -329,7 +312,10 @@ _GENX_MAIN_ void KERNEL_NAME(
         reinterpret_cast<svmptr_t>((uint8_t*)value + v_off),
         reinterpret_cast<svmptr_t>((uint8_t*)output + o_off),
         o_seq_pitch,
-        slm_lut,
+        reinterpret_cast<svmptr_t>(key_scale + k_meta_off),
+        reinterpret_cast<svmptr_t>(key_zp + k_meta_off),
+        reinterpret_cast<svmptr_t>(value_scale + v_meta_off),
+        reinterpret_cast<svmptr_t>(value_zp + v_meta_off),
         // sparse_mask_ptr: this work-item's own row (already WG-uniform at SPARSE_BLOCK_SIZE==256,
         // genuinely per-lane at SPARSE_BLOCK_SIZE==128 -- see sdpa_kernel_lsc's doc comment).
         // Used for skip-COMPUTE in both cases (and also skip-LOAD at 256, where the two decisions

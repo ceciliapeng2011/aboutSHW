@@ -3,6 +3,7 @@
 //
 
 #include "cm_attention_common.hpp"
+#include "cm_int8_kv_decode.hpp"
 
 // Number of kv sub-tiles (kv_step rows each) processed per online-softmax update in
 // sdpa_kernel_lsc_prefetch. Larger amortizes the rO rescale + softmax bookkeeping over
@@ -13,148 +14,29 @@
 
 // online_softmax_update_tree and transpose_St_to_P_half are defined in cm_attention_common.hpp
 
-// fp8e4m3 ("hf8") -> fp16 in-register decode, bit-identical to the real OpenVINO intel_gpu
-// plugin's _intel_convert_hf8_to_f16 (XeTLA-derived) scalar reference -- see
-// thirdparty/openvino/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/include/f8_utils.cl
-// (read-only reference; not included/linked, this is an independent CM re-implementation since
-// that file is plain OpenCL C, a different toolchain from CM/ESIMD).
-//
-// e4m3 fields: sign(1) | exp(4, bias 7) | mant(3). fp16 fields: sign(1) | exp(5, bias 15) |
-// mant(10). Three cases, vectorized via predicated merge (house style: see cur_sum.merge(...)
-// above and online_softmax_update_tree's branch-free reductions):
-//   * exp==0xF && mant==0x7  -> NaN                       (hf8's single NaN encoding)
-//   * exp==0   && mant==0    -> +-0
-//   * exp==0   && mant!=0    -> denormal hf8: renormalize by counting leading zeros of the
-//                                3-bit mantissa (lz_count in {0,1,2}; mant is never 0 here) and
-//                                shifting the implicit bit into place.
-//   * otherwise               -> normal: just re-bias the exponent (+8, since -7+15==+8) and
-//                                left-shift the 3-bit mantissa into fp16's 10-bit field.
-// All-ushort arithmetic is used throughout (including the denormal path's `exp - 7 + 15`, done
-// as `exp + 8` directly) so this never relies on signed/unsigned promotion rules -- every
-// element stays in-range or wraps and un-wraps consistently in 16-bit modular arithmetic.
-//
-// Declared up front (ahead of sdpa_accumulate_kv_source below, its only caller) because this
-// compiler resolves an unqualified call inside a template body against declarations visible at
-// the template's definition point, not at instantiation -- a forward reference here is a hard
-// "undeclared identifier" error, unlike full two-phase C++ lookup.
-template <int N>
-CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16(vector_ref<uchar, N> raw) {
-    vector<uchar, N> sign_u8 = (raw >> 7) & 1;
-    vector<uchar, N> exp_u8 = (raw >> 3) & 0xF;
-    vector<uchar, N> mant_u8 = raw & 0x7;
-    vector<ushort, N> sign = sign_u8;
-    vector<ushort, N> exp = exp_u8;
-    vector<ushort, N> mant = mant_u8;
-
-    vector<unsigned short, N> is_nan = (exp == 0xF) & (mant == 0x7);
-    vector<unsigned short, N> is_zero = (exp == 0) & (mant == 0);
-    vector<unsigned short, N> is_denorm = (exp == 0) & (mant != 0);
-
-    // lz_count: leading zeros of the 3-bit mantissa, MSB-first (only meaningful where
-    // is_denorm, but computed branch-free for every lane).
-    vector<ushort, N> lz_count = 2;
-    lz_count.merge((ushort)1, mant > 1);
-    lz_count.merge((ushort)0, mant > 3);
-
-    vector<ushort, N> base_exp = exp + 8;  // == exp - 7 + 15 (normal-case re-bias)
-    vector<ushort, N> dst_exp = base_exp;
-    dst_exp.merge(base_exp - lz_count, is_denorm);
-
-    vector<ushort, N> dst_mant = mant;
-    vector<ushort, N> denorm_mant = (mant << (lz_count + 1)) & 0x7;
-    dst_mant.merge(denorm_mant, is_denorm);
-
-    vector<ushort, N> dst_val = (dst_exp << 10) | (dst_mant << 7);
-    dst_val.merge((ushort)0, is_zero);
-    dst_val.merge((ushort)0x7fff, is_nan);
-
-    vector<ushort, N> bits = (sign << 15) | dst_val;
-    return bits.format<half>();
-}
-
-// fp8e4m3 ("hf8") -> fp16 LUT-gather decode, gathering straight from a global/SVM-resident LUT.
-// Superseded by hf8_e4m3_decode_to_f16_lut_slm below for sdpa_kernel_lsc's KVElemT=uchar path
-// (an A/B/C perf comparison -- this global-gather form, the bit-manipulation
-// hf8_e4m3_decode_to_f16 above, and the SLM-gather form below -- measured the SLM-gather form
-// consistently ~12% faster across seq_len 2048-32768; see cm_sdpa_opt_prefill.cm's KV_FP8E4M3 doc
-// comment). Kept here as a tested, documented primitive (see test_hf8_e4m3_decode.py) and NOT
-// currently called by any production kernel in this file, same input/output contract as
-// hf8_e4m3_decode_to_f16, bit-exact against the same oracle (hf8_e4m3_ref.py's
-// build_hf8_decode_lut_f16).
-//
-// fp8e4m3 has only 256 possible byte values, so the entire decode is representable as a 256-entry
-// half lookup table, built once on the HOST (hf8_e4m3_ref.py's build_hf8_decode_lut_f16) and
-// uploaded as a plain half[256] array (512 bytes) alongside K/V -- see hf8_lut_base below, threaded
-// down from KV_FP8E4M3's extra kernel param in cm_sdpa_opt_prefill.cm.
-//
-// Layout: NOT packed into uint32 (the originally-expected fallback for a toolchain with no
-// sub-dword gather). A direct compile+run probe against this toolchain's
-// /cm/builtin/cm/cm_lsc.h (not just this repo's own prior gather usages in cm_pa_xe1.hpp /
-// x_attn/estimate.hpp, which only ever gather at uint/4-byte granularity via the SurfaceIndex-
-// bound cm_load<...>(SurfaceIndex, offsets[, pred]) overload set) found that cm_ptr_load -- the
-// raw-pointer sibling of that overload set, already used elsewhere in this repo for non-gather
-// block loads, see find_block.hpp's cm_ptr_load<uint,N,...>(ptr, scalar_offset) -- also supports a
-// genuine per-lane offset VECTOR directly against a plain T* pointer at true 2-byte (DataSize::U16)
-// granularity, confirmed against the CM language spec
-// (/home/ceciliapeng/CM/CM_spec/cmlangspec/cmlangspec.html) and verified bit-exact end to end on
-// real hardware. No predicate vector is needed either (the Pred parameter defaults to all-true),
-// so this is a plain 2-argument call. That made the uint32-packed/extract-low-half-of-a-dword
-// fallback originally expected to be necessary unneeded.
-template <int N>
-CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, svmptr_t lut_base) {
-    // Widen to uint before the *sizeof(half) multiply: raw is 0..255, so plain uchar arithmetic
-    // would overflow (255*2==510) well before a later widening could save it -- go via
-    // vector<uint, N> from the start so the multiply itself happens at full width.
-    vector<uint, N> idx = raw;
-    vector<uint, N> offsets = idx * (uint)sizeof(half);
-    return cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
-        reinterpret_cast<half*>(lut_base), offsets);
-}
-
-// fp8e4m3 ("hf8") -> fp16 LUT-gather decode, SLM variant: same 256-entry half LUT as
-// hf8_e4m3_decode_to_f16_lut above, but the LUT bytes have already been copied into SLM once per
-// work-group (see cm_sdpa_opt_prefill.cm's KV_FP8E4M3 cooperative LUT fill) before this is ever
-// called, and the gather targets that SLM copy instead of global/SVM memory. This is the decode
-// sdpa_kernel_lsc's KVElemT=uchar path uses -- measured consistently faster than both the
-// global-gather and bit-manipulation alternatives (see hf8_e4m3_decode_to_f16_lut's doc comment
-// above). lut_slm_base is the SLM byte-offset base returned by cm_slm_alloc for the LUT's
-// sub-allocation (NOT a raw pointer). cm_slm_read's address vector is in ELEMENT units (scaled by
-// sizeof(half) internally), unlike hf8_e4m3_decode_to_f16_lut's cm_ptr_load call above, which
-// needs the *sizeof(half) done by hand -- see opencl/tests/x_attn/sort.hpp's cm_slm_read usage for
-// the same convention elsewhere in this repo.
-template <int N>
-CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut_slm(vector_ref<uchar, N> raw, uint lut_slm_base) {
-    vector<uint, N> idx = raw;
-    vector<half, N> result;
-    cm_slm_read<half, N>(lut_slm_base, idx, result);
-    return result;
-}
-
 #ifdef CM_HAS_LSC_UNTYPED_2D
 // sdpa_kernel_lsc: flash-attention body shared by the plain fp16 KV-cache path (KVElemT=half,
-// the default) and the fp8e4m3 KV-cache path (KVElemT=uchar). The two used to be separate
-// functions (sdpa_kernel_lsc / sdpa_kernel_lsc_fp8) that differed ONLY in load_slm_KV below -- see
-// cm_pa_xe2.hpp's pa_lsc_u8/load_slm_KV_active for the architectural precedent this mirrors (int8
-// affine dequant staged into SLM once per work-group instead of once per work-item), ported here
-// to fp8e4m3 LUT-gather decode. A prior per-work-item decode path (every one of the
-// wg_local_size=16 work-items in a work-group independently decoding the SAME underlying K/V
-// bytes at every kv_pos) was measured slower than this decode-once-per-work-group approach and has
-// since been removed -- load_slm_KV decodes each (kv_pos, head_size column range) byte range to
-// half EXACTLY ONCE per work-group when KVElemT=uchar -- half the work-group's lanes decode+stage
-// K, the other half decode+stage V -- and every lane then reads the already-decoded half data back
+// the default) and the int8-packed KV-cache path (KVElemT=uchar, affine uint8 quantization -- see
+// cm_int8_kv_decode.hpp and KV_CACHE_COMPRESSION in cm_sdpa_opt_prefill.cm). Mirrors
+// opencl/tests/pageatten/cm_pa_xe2.hpp's pa_lsc_u8/load_slm_KV_active: int8 affine dequant
+// ((raw-zp)*scale, no gather/LUT) staged into SLM once per work-group instead of once per
+// work-item -- load_slm_KV decodes each (kv_pos, head_size column range) byte range to half
+// EXACTLY ONCE per work-group when KVElemT=uchar -- half the work-group's lanes decode+stage K,
+// the other half decode+stage V -- and every lane then reads the already-decoded half data back
 // out of SLM via the unmodified (type-agnostic) ugemm_KQ/ugemm_PV0/ugemm_PV1 helpers below: by the
 // time those run, SLM already holds plain half regardless of K/V's original on-the-wire dtype, so
 // no change is needed there. When KVElemT=half, load_slm_KV instead loads K/V directly as half
 // (no decode), i.e. byte-for-byte the original sdpa_kernel_lsc behavior.
 //
-// Always uses hf8_e4m3_decode_to_f16_lut_slm (LUT-gather from a work-group-local SLM copy of the
-// 256-entry LUT -- see that function's doc comment above; measured fastest of the three decode
-// strategies tried) for the KVElemT=uchar case. See KV_FP8E4M3 in cm_sdpa_opt_prefill.cm for that
-// call site and the LUT's one-time SLM fill.
+// K is quantized BY_CHANNEL (k_by_channel=true, one scale/zp pair per 16-token sub-block per
+// head_size channel) or BY_TOKEN (k_by_channel=false, one pair per token), selected by the
+// caller's KV_CACHE_COMPRESSION; V is always BY_TOKEN regardless of mode -- matches pageatten's own
+// K/V asymmetry exactly (see kv_cache_quant_utils.py's quant_per_channel_parts/
+// quant_per_token_parts, which int8_kv_ref.py thinly wraps as this kernel's host-side oracle).
 //
 // Causal-only, no dense attn_mask (this is still a focused perf experiment on the decode-once
-// hypothesis for the fp8 case, not a feature-parity requirement with sdpa_kernel_lsc_prefetch's
-// fuller causal+attn_mask+sparse_block_mask surface).
+// hypothesis for the quantized-KV case, not a feature-parity requirement with
+// sdpa_kernel_lsc_prefetch's fuller causal+attn_mask+sparse_block_mask surface).
 //
 // sparse_block_size (default 1, dense): when >1, KV chunks the mask says to skip have their ENTIRE
 // load_slm_KV+barrier-pipeline stage skipped outright (no decode, no DPAS), mirroring
@@ -192,102 +74,80 @@ CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut_slm(vector_ref<uchar, N> ra
 //     wg_sparse_mask_base (skip-LOAD) distinction in its legacy (non-OPTIMIZED_SPARSE_PIPELINE)
 //     path, specialized here to the fixed 2x relationship between sparse_block_size=128 and
 //     wg_seq_len=256 this kernel's dispatch convention (wg_local_size=16, q_step=16) always has.
-template <bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused = 0,
-          int sparse_block_size = 1, typename KVElemT = half>
-void sdpa_kernel_lsc(uint slm_K,
-                     uint slm_V,
-                     int wg_local_id,
-                     int local_size,
-                     int q_start,
-                     int kv_stop,
-                     int q_len,
-                     int kv_len,
-                     uint q_pitch_bytes,
-                     uint k_pitch_bytes,
-                     uint v_pitch_bytes,
-                     svmptr_t q_base [[type("svmptr_t")]],
-                     svmptr_t k_base [[type("svmptr_t")]],
-                     svmptr_t v_base [[type("svmptr_t")]],
-                     svmptr_t o_base [[type("svmptr_t")]],
-                     // Output row pitch in bytes, defaulting to the original hardcoded
-                     // num_heads*head_size*sizeof(half) (heads-inner-per-token layout) so existing
-                     // KVElemT=half callers see identical behavior. Pass a runtime value instead
-                     // for cm_sdpa_opt_prefill.cm's OUTPUT_TRANSPOSE_ORDER callers, regardless of
-                     // whether that's the identity (heads-outer) or swapped (heads-inner) layout --
-                     // mirrors sdpa_kernel_lsc_prefetch's own o_pitch_bytes param.
-                     uint o_pitch_bytes = num_heads * head_size * sizeof(half),
-                     // SLM byte-offset base of the 256-entry half LUT's SLM sub-allocation
-                     // (cm_slm_alloc's return value), only read when KVElemT=uchar -- see
-                     // hf8_e4m3_decode_to_f16_lut_slm above and KV_FP8E4M3's cooperative LUT fill
-                     // in cm_sdpa_opt_prefill.cm (device side, where this comes from) /
-                     // hf8_e4m3_ref.py's build_hf8_decode_lut_f16 (host side, the LUT's contents).
-                     uint lut_slm_base = 0,
-                     // XAttention/block-sparsity mask row for THIS WORK-ITEM's own q_block
-                     // (only read when sparse_block_size>1). Already offset by the caller to
-                     // this (batch,q_head,q_block) row, same convention as
-                     // sdpa_kernel_lsc_prefetch's sparse_mask_base. Used for skip-COMPUTE at
-                     // sparse_block_size==128 (see sparse_block_size's doc comment above); at
-                     // sparse_block_size==256 it's already work-group-uniform and doubles as
-                     // the skip-LOAD row too (sparse_mask_wg_lo/hi_base below are unused then).
-                     svmptr_t sparse_mask_base [[type("svmptr_t")]] = 0,
-                     // The two q_block rows (q_block=2*wg_id and 2*wg_id+1) this WORK-GROUP's
-                     // 256-token span covers -- only meaningful (and only ever non-null) when
-                     // sparse_block_size==128; computed by the caller from wg_id so every lane
-                     // sees the same two pointers. Used ONLY for the work-group-uniform
-                     // skip-LOAD decision -- see sparse_block_size's doc comment above. hi may
-                     // be 0 if this work-group's span only has one valid q_block left (q_len
-                     // not a multiple of 256).
-                     svmptr_t sparse_mask_wg_lo_base [[type("svmptr_t")]] = 0,
-                     svmptr_t sparse_mask_wg_hi_base [[type("svmptr_t")]] = 0) {
+// sdpa_accumulate_kv_source_slm: the SLM-ring/barrier pipeline for ONE source's [0, kv_stop) KV
+// range -- extracted from sdpa_kernel_lsc's body below (pure refactor, no functional change for
+// sdpa_kernel_lsc's own single-source callers) so the dual-source kernel
+// (sdpa_kernel_lsc_2src_slm) can call this SAME pipeline once per source (cache, then
+// current), reusing one SLM ring-buffer allocation and one set of online-softmax accumulators
+// across both calls -- giving the dual-source int8-cache path the same decode-once-per-work-group
+// amortization this kernel already has, instead of the retired sdpa_accumulate_kv_source's
+// per-lane-unamortized design.
+//
+// slm_buff_id_write/read are local state, reset to 0 at entry, and the SLM ring is (re-)primed
+// from kv_pos=0 of THIS source's own [0, kv_stop) range every time this is called -- safe to call
+// more than once in a row reusing the same slm_K/slm_V allocation, at the cost of one extra
+// full-barrier per call (see the entry barrier below -- the same precedent already used further
+// down for block-sparse chunk resumption). kv_stop<=0 (an empty source, e.g. chunk0's
+// not-yet-populated cache) is a no-op after that entry barrier -- constructing a block_2d_desc with
+// height kv_stop-1 would underflow for kv_stop==0, so this is checked before any descriptor is
+// built, mirroring the retired sdpa_accumulate_kv_source's identical guard. causal_left and
+// first_write are threaded by reference so a multi-segment caller
+// (sdpa_kernel_lsc_2src_slm) can carry state across segments: first_write replaces a
+// literal `kv_pos==0` check for the ugemm_PV0-vs-PV1 dispatch -- for a single call this is
+// bit-identical to the old `kv_pos==0` check (both are true only at the very first real
+// accumulation), but for a second segment called after a non-empty first one, first_write is
+// already false, forcing ugemm_PV1 (required for correctness once rO holds real accumulated state,
+// even if this segment's own local kv_pos starts back at 0).
+template <bool use_causal_mask, int head_size, int sparse_block_size, typename KVElemT, bool k_by_channel>
+CM_INLINE void sdpa_accumulate_kv_source_slm(
+    uint slm_K,
+    uint slm_V,
+    int wg_local_id,
+    int local_size,
+    int kv_stop,
+    uint k_pitch_bytes,
+    uint v_pitch_bytes,
+    svmptr_t k_base [[type("svmptr_t")]],
+    svmptr_t v_base [[type("svmptr_t")]],
+    svmptr_t k_scale_base [[type("svmptr_t")]],
+    svmptr_t k_zp_base [[type("svmptr_t")]],
+    svmptr_t v_scale_base [[type("svmptr_t")]],
+    svmptr_t v_zp_base [[type("svmptr_t")]],
+    svmptr_t sparse_mask_base [[type("svmptr_t")]],
+    svmptr_t sparse_mask_wg_lo_base [[type("svmptr_t")]],
+    svmptr_t sparse_mask_wg_hi_base [[type("svmptr_t")]],
+    matrix_ref<half, ((head_size + 16 - 1) / 16 * 16) / REG_K, REG_K * REG_N> rQ,
+    vector_ref<float, q_step> cur_max,
+    vector_ref<float, q_step> cur_sum,
+    matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO,
+    int& causal_left,
+    bool& first_write) {
     static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
-                  "KVElemT must be half (plain fp16 KV-cache) or uchar (fp8e4m3-packed KV-cache, "
-                  "LUT-decoded once per work-group in load_slm_KV)");
-    constexpr bool fp8_kv = std::is_same<KVElemT, uchar>::value;
-
-    uint o_pitch = o_pitch_bytes;
-    // round up head_size to multiple of 16
-    // block_2d_desc will automatically handle the tailing block
+                  "KVElemT must be half (plain fp16 KV-cache) or uchar (int8-packed KV-cache, "
+                  "affine-decoded once per work-group in load_slm_KV)");
+    constexpr bool int8_kv = std::is_same<KVElemT, uchar>::value;
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
-    vector<float, q_step> cur_max;
-    vector<float, q_step> cur_sum;
 
-    cur_max = -3e38f;
-    cur_sum = 0;
-    constexpr int num_P_tiles = REG_N / REG_M;
-    matrix<half, padded_head_size / REG_K, REG_K * REG_N> rQ;
-    matrix<float, padded_head_size / REG_N * num_P_tiles, REG_M * REG_N> rO;
-    rO = 0.0f;  // Zero the accumulator: the first softmax block scales rO by max_comp==0, and 0*NaN==NaN if the GRF holds stale NaN/Inf bits.
+    // Entry barrier: makes it safe to call this function more than once in a row against the SAME
+    // slm_K/slm_V allocation (see this function's doc comment) -- protects against a straggler
+    // lane still reading the PREVIOUS call's final SLM buffer while this call's load_slm_KV(0)
+    // starts overwriting the same ring slots. A plain cm_barrier() (not the split cm_sbarrier
+    // scheme) is used, matching the identical precedent used below for block-sparse chunk
+    // resumption. Run unconditionally (even when kv_stop<=0, below) and before any
+    // single-source-vs-multi-segment distinction, so every call site -- including
+    // sdpa_kernel_lsc's single call -- behaves identically with no special-casing: one harmless
+    // extra barrier per call, negligible next to the per-tile barrier count inside the loops below.
+    cm_slm_fence(CM_LOCAL_BARRIER);
+    cm_barrier();
 
-    auto q_tokens_left = q_len;
-    static_assert(q_step == REG_N);
-    static_assert(kv_step == REG_K);
-
-    if (q_tokens_left < 0)
-        q_tokens_left = 0;
-    if (q_tokens_left > q_step)
-        q_tokens_left = q_step;
-
-    if (q_tokens_left > 0) {
-        lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(reinterpret_cast<uint*>(q_base),
-                                                           q_tokens_left - 1,
-                                                           head_size * sizeof(half) - 1,
-                                                           q_pitch_bytes - 1,
-                                                           0,
-                                                           0);
-#    pragma unroll
-        for (int k = 0, ri = 0; k < padded_head_size / 2; k += REG_K / 2, ri++) {
-            cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
-            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale);
-        }
-    }
+    if (kv_stop <= 0)
+        return;
 
     // K/V element type is KVElemT: plain half for the fp16 KV-cache path (unchanged descriptor),
-    // or fp8e4m3-packed uchar (1 byte/elem, decoded to half exactly once per work-group in
-    // load_slm_KV below) for the fp8 path.
+    // or int8-packed uchar (1 byte/elem, decoded to half exactly once per work-group in
+    // load_slm_KV below) for the quantized path.
     lsc::block_2d_desc<KVElemT, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
     lsc::block_2d_desc<KVElemT, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
-
-    int causal_left = q_start;
 
     // SLM always holds decoded half regardless of K/V's on-the-wire dtype, so the buffer size and
     // quad-buffering scheme are identical for both KVElemT instantiations.
@@ -296,25 +156,44 @@ void sdpa_kernel_lsc(uint slm_K,
     int slm_buff_id_read = 0;
 
     // The ONLY place the two KVElemT instantiations differ: a plain half load straight into SLM
-    // (KVElemT=half), or a load of raw fp8e4m3 bytes + LUT-decode-to-half before the SLM write
+    // (KVElemT=half), or a load of raw int8 bytes + affine-decode-to-half before the SLM write
     // (KVElemT=uchar, "decode-once-per-work-group" -- see this function's doc comment above).
-    // Everything below this lambda (the sparse_block_size dispatch, softmax, output store) is
-    // shared verbatim between both element types.
+    // Everything below this lambda (the sparse_block_size dispatch, softmax) is shared verbatim
+    // between both element types.
     auto load_slm_KV = [&](int kv_pos) {
         if (kv_pos < kv_stop) {
             uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
             slm_buff_id_write++;
             if (wg_local_id < local_size / 2) {
-                if constexpr (fp8_kv) {
-                    // K (simple case, decode-once-per-WG): load raw fp8e4m3 bytes, LUT-decode to
-                    // half, write plain (no VNNI) half into SLM.
-                    vector<uchar, kv_step * REG_K> temp0_u8;
-                    vector<half, kv_step * REG_K> temp0;
+                if constexpr (int8_kv) {
+                    // K (decode-once-per-WG): load raw int8 bytes, affine-decode to half -- by
+                    // channel (one scale/zp pair per 16-token sub-block per head_size column,
+                    // k_by_channel=true) or by token (one pair per row, k_by_channel=false), per
+                    // cm_int8_kv_decode.hpp. Mirrors opencl/tests/pageatten/cm_pa_xe2.hpp's
+                    // pa_lsc_u8 K-path (load_slm_KV_active), generalized from its fixed-size
+                    // CMPA_BLOCK_SZ cache blocks to this kernel's flat [kv_len, head_size] K
+                    // buffer (raw and decoded data use separate buffers here, unlike pa_lsc_u8's
+                    // register-aliasing trick, to keep this new path simple to verify).
+                    vector<half, kv_step> k_scale, k_zp;
+                    if constexpr (!k_by_channel) {
+                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + (uint)kv_pos * sizeof(half)), k_scale);
+                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_zp_base + (uint)kv_pos * sizeof(half)), k_zp);
+                    }
+                    matrix<uint8_t, kv_step, REG_K> quanKmat;
+                    matrix<half, kv_step, REG_K> kmat;
                     b2dK.set_block_y(kv_pos);
                     for (int k = REG_K * wg_local_id; k < padded_head_size; k += REG_K * (local_size / 2)) {
-                        cm_load<lsc::Normal>(temp0_u8, b2dK.set_block_x(k));
-                        temp0 = hf8_e4m3_decode_to_f16_lut_slm<kv_step * REG_K>(temp0_u8, lut_slm_base);
-                        cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), temp0);
+                        if constexpr (k_by_channel) {
+                            uint k_ch_off = (uint)(kv_pos / 16) * head_size + k;
+                            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + k_ch_off * sizeof(half)), k_scale);
+                            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_zp_base + k_ch_off * sizeof(half)), k_zp);
+                        }
+                        cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+                        if constexpr (k_by_channel)
+                            int8_decode_by_channel<kv_step, REG_K>(quanKmat, k_scale, k_zp, kmat);
+                        else
+                            int8_decode_by_token<kv_step, REG_K>(quanKmat, k_scale, k_zp, kmat);
+                        cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
                     }
                 } else {
                     vector<half, kv_step * REG_K> temp0;
@@ -325,15 +204,16 @@ void sdpa_kernel_lsc(uint slm_K,
                     }
                 }
             } else {
-                if constexpr (fp8_kv) {
-                    // V (harder case, decode-once-per-WG): hardware cm_load<lsc::VNNI> only knows
-                    // how to half-pair-interleave 2-byte (half) source elements, so the raw
-                    // fp8e4m3 bytes are loaded as a PLAIN (non-VNNI) 2D block, LUT-decoded to half,
-                    // then the exact VNNI2 interleave hardware would have produced from a half
-                    // source is reproduced manually via select<>() -- verbatim copy of
-                    // sdpa_accumulate_kv_source's V-path pattern above (see that function's doc
-                    // comment for the full rationale), just staged into SLM instead of consumed
-                    // immediately by DPAS.
+                if constexpr (int8_kv) {
+                    // V (always BY_TOKEN, scale/zp per row, loaded once for the whole tile):
+                    // hardware cm_load<lsc::VNNI> only knows how to half-pair-interleave 2-byte
+                    // (half) source elements, so the raw int8 bytes are loaded as a PLAIN
+                    // (non-VNNI) 2D block, affine-decoded to half, then the exact VNNI2 interleave
+                    // hardware would have produced from a half source is reproduced manually via
+                    // select<>() -- the same manual-VNNI approach this path has always used.
+                    vector<half, kv_step> v_scale, v_zp;
+                    cm_svm_block_read(reinterpret_cast<svmptr_t>(v_scale_base + (uint)kv_pos * sizeof(half)), v_scale);
+                    cm_svm_block_read(reinterpret_cast<svmptr_t>(v_zp_base + (uint)kv_pos * sizeof(half)), v_zp);
                     matrix<uchar, REG_K, REG_N> Vmat_u8;
                     matrix<half, REG_K, REG_N> Vmat_nat;
                     matrix<half, REG_K / 2, REG_N * 2> temp2;
@@ -341,7 +221,7 @@ void sdpa_kernel_lsc(uint slm_K,
 #    pragma unroll
                     for (int k = REG_N * (wg_local_id - (local_size / 2)); k < padded_head_size; k += REG_N * (local_size / 2)) {
                         cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(k));
-                        Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<REG_K * REG_N>(Vmat_u8.format<uchar>(), lut_slm_base);
+                        int8_decode_by_token<REG_K, REG_N>(Vmat_u8, v_scale, v_zp, Vmat_nat);
                         temp2.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
                         temp2.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
                         cm_slm_block_write(slm_V, slm_offset + k * REG_K * sizeof(half), temp2.format<half>());
@@ -410,10 +290,12 @@ void sdpa_kernel_lsc(uint slm_K,
                 matrix<half, REG_N, REG_K> P;
                 Transpose2DMatrix(St, P);
 
-                if (kv_pos == 0)
+                if (first_write) {
                     ugemm_PV0(slm_V, P, rO, slm_offset);
-                else
+                    first_write = false;
+                } else {
                     ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+                }
             }
         }
         // cm_sbarrier(0);
@@ -510,18 +392,18 @@ void sdpa_kernel_lsc(uint slm_K,
                     matrix<half, REG_N, REG_K> P;
                     Transpose2DMatrix(St, P);
 
-                    // kv_pos==0 implies kv_blk==0 (kv_pos ranges over [kv_blk, blk_end)), i.e. this
-                    // is still exactly "the very first KV token this work-item ever processes",
-                    // same condition the dense path above uses -- unaffected by sparsity. If chunk
-                    // 0 itself is skipped, every later chunk's first iteration instead takes the
-                    // ugemm_PV1 branch with rO still at its zero-init value: rescaling 0 by
-                    // max_comp (finite, since cm_online_softmax_update never produces NaN/Inf here)
-                    // is exactly 0 again, so PV1 is bit-identical to PV0 in that case too -- no
-                    // separate "first ACTIVE chunk" tracking needed.
-                    if (kv_pos == 0)
+                    // first_write replaces a literal `kv_pos==0` check (see this function's doc
+                    // comment) -- if chunk 0 itself is skipped, every later chunk's first iteration
+                    // still takes this same branch (first_write still true), with rO still at its
+                    // zero-init value: PV0 and PV1 are mathematically identical there anyway
+                    // (rescaling 0 by any finite max_comp is still 0), so no separate "first ACTIVE
+                    // chunk" tracking is needed.
+                    if (first_write) {
                         ugemm_PV0(slm_V, P, rO, slm_offset);
-                    else
+                        first_write = false;
+                    } else {
                         ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+                    }
                 }
             }
         }
@@ -637,16 +519,118 @@ void sdpa_kernel_lsc(uint slm_K,
                     matrix<half, REG_N, REG_K> P;
                     Transpose2DMatrix(St, P);
 
-                    // Same "kv_pos==0 implies first-ever-write, PV1 is bit-identical to PV0 when
-                    // rO is still zero" reasoning as the sparse_block_size==256 branch above.
-                    if (kv_pos == 0)
+                    // Same first_write reasoning as the sparse_block_size==256 branch above.
+                    if (first_write) {
                         ugemm_PV0(slm_V, P, rO, slm_offset);
-                    else
+                        first_write = false;
+                    } else {
                         ugemm_PV1(slm_V, P, max_comp, rO, slm_offset);
+                    }
                 }
             }
         }
     }
+}
+
+template <bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_qkv_fused = 0,
+          int sparse_block_size = 1, typename KVElemT = half, bool k_by_channel = false>
+void sdpa_kernel_lsc(uint slm_K,
+                     uint slm_V,
+                     int wg_local_id,
+                     int local_size,
+                     int q_start,
+                     int kv_stop,
+                     int q_len,
+                     int kv_len,
+                     uint q_pitch_bytes,
+                     uint k_pitch_bytes,
+                     uint v_pitch_bytes,
+                     svmptr_t q_base [[type("svmptr_t")]],
+                     svmptr_t k_base [[type("svmptr_t")]],
+                     svmptr_t v_base [[type("svmptr_t")]],
+                     svmptr_t o_base [[type("svmptr_t")]],
+                     // Output row pitch in bytes, defaulting to the original hardcoded
+                     // num_heads*head_size*sizeof(half) (heads-inner-per-token layout) so existing
+                     // KVElemT=half callers see identical behavior. Pass a runtime value instead
+                     // for cm_sdpa_opt_prefill.cm's OUTPUT_TRANSPOSE_ORDER callers, regardless of
+                     // whether that's the identity (heads-outer) or swapped (heads-inner) layout --
+                     // mirrors sdpa_kernel_lsc_prefetch's own o_pitch_bytes param.
+                     uint o_pitch_bytes = num_heads * head_size * sizeof(half),
+                     // Int8 dequant scale/zero-point SVM pointers, only read when KVElemT=uchar --
+                     // see cm_int8_kv_decode.hpp. k_scale_base/k_zp_base are laid out
+                     // [kv_len/16, head_size] when k_by_channel, else [kv_len]; v_scale_base/
+                     // v_zp_base are always [kv_len] (V is always BY_TOKEN).
+                     svmptr_t k_scale_base [[type("svmptr_t")]] = 0,
+                     svmptr_t k_zp_base [[type("svmptr_t")]] = 0,
+                     svmptr_t v_scale_base [[type("svmptr_t")]] = 0,
+                     svmptr_t v_zp_base [[type("svmptr_t")]] = 0,
+                     // XAttention/block-sparsity mask row for THIS WORK-ITEM's own q_block
+                     // (only read when sparse_block_size>1). Already offset by the caller to
+                     // this (batch,q_head,q_block) row, same convention as
+                     // sdpa_kernel_lsc_prefetch's sparse_mask_base. Used for skip-COMPUTE at
+                     // sparse_block_size==128 (see sparse_block_size's doc comment above); at
+                     // sparse_block_size==256 it's already work-group-uniform and doubles as
+                     // the skip-LOAD row too (sparse_mask_wg_lo/hi_base below are unused then).
+                     svmptr_t sparse_mask_base [[type("svmptr_t")]] = 0,
+                     // The two q_block rows (q_block=2*wg_id and 2*wg_id+1) this WORK-GROUP's
+                     // 256-token span covers -- only meaningful (and only ever non-null) when
+                     // sparse_block_size==128; computed by the caller from wg_id so every lane
+                     // sees the same two pointers. Used ONLY for the work-group-uniform
+                     // skip-LOAD decision -- see sparse_block_size's doc comment above. hi may
+                     // be 0 if this work-group's span only has one valid q_block left (q_len
+                     // not a multiple of 256).
+                     svmptr_t sparse_mask_wg_lo_base [[type("svmptr_t")]] = 0,
+                     svmptr_t sparse_mask_wg_hi_base [[type("svmptr_t")]] = 0) {
+    static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
+                  "KVElemT must be half (plain fp16 KV-cache) or uchar (int8-packed KV-cache, "
+                  "affine-decoded once per work-group in load_slm_KV)");
+    constexpr bool int8_kv = std::is_same<KVElemT, uchar>::value;
+
+    uint o_pitch = o_pitch_bytes;
+    // round up head_size to multiple of 16
+    // block_2d_desc will automatically handle the tailing block
+    constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
+    vector<float, q_step> cur_max;
+    vector<float, q_step> cur_sum;
+
+    cur_max = -3e38f;
+    cur_sum = 0;
+    constexpr int num_P_tiles = REG_N / REG_M;
+    matrix<half, padded_head_size / REG_K, REG_K * REG_N> rQ;
+    matrix<float, padded_head_size / REG_N * num_P_tiles, REG_M * REG_N> rO;
+    rO = 0.0f;  // Zero the accumulator: the first softmax block scales rO by max_comp==0, and 0*NaN==NaN if the GRF holds stale NaN/Inf bits.
+
+    auto q_tokens_left = q_len;
+    static_assert(q_step == REG_N);
+    static_assert(kv_step == REG_K);
+
+    if (q_tokens_left < 0)
+        q_tokens_left = 0;
+    if (q_tokens_left > q_step)
+        q_tokens_left = q_step;
+
+    if (q_tokens_left > 0) {
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(reinterpret_cast<uint*>(q_base),
+                                                           q_tokens_left - 1,
+                                                           head_size * sizeof(half) - 1,
+                                                           q_pitch_bytes - 1,
+                                                           0,
+                                                           0);
+#    pragma unroll
+        for (int k = 0, ri = 0; k < padded_head_size / 2; k += REG_K / 2, ri++) {
+            cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale);
+        }
+    }
+
+    int causal_left = q_start;
+    bool first_write = true;
+
+    sdpa_accumulate_kv_source_slm<use_causal_mask, head_size, sparse_block_size, KVElemT, k_by_channel>(
+        slm_K, slm_V, wg_local_id, local_size, kv_stop, k_pitch_bytes, v_pitch_bytes,
+        k_base, v_base, k_scale_base, k_zp_base, v_scale_base, v_zp_base,
+        sparse_mask_base, sparse_mask_wg_lo_base, sparse_mask_wg_hi_base,
+        rQ, cur_max, cur_sum, rO, causal_left, first_write);
     if (q_tokens_left == 0)
         return;
 
@@ -962,106 +946,100 @@ void sdpa_kernel_lsc_prefetch(int wg_local_id,
 }
 
 // ============================================================================================
-// Two-source variant: ring (history, persistent) + current (this step's own new K/V) are two
+// Two-source variant: cache (history, persistent) + current (this step's own new K/V) are two
 // INDEPENDENT buffers that are never concatenated in memory -- the online-softmax accumulators
-// (cur_max/cur_sum/rO) are shared across both sources, so attending to "ring then current" is
-// numerically identical to attending to concat(ring, current) in one pass. See
-// flashvsr_dit_kvcache_int8_3slot_fused_multisource_design_zh.md Sec 3.3/10.4 (the real
+// (cur_max/cur_sum/rO) are shared across both sources, so attending to "cache then current" is
+// numerically identical to attending to concat(cache, current) in one pass. See
+// flashvsr_dit_kvcache_int8_3slot_fused_dualsource_design_zh.md Sec 3.3/10.4 (the real
 // BlockSparseAttention/DraftBlockMask primitives' `input[1]=key_cache.<layer>` +
-// `input[2]=k_new_f16` ABI this mirrors) and cm_sdpa_opt_prefill_multisource.cm.
+// `input[2]=k_new_f16` ABI this mirrors) and cm_sdpa_opt_prefill_dualsource.cm.
 //
 // Deliberately NOT generalized to causal masking or the dense additive attn_mask: FlashVSR's own
 // self-attention never uses either (only the sparse block-table mask), so this stays its own
 // small, independently-testable code path alongside (not merged into) sdpa_kernel_lsc_prefetch
 // above, which remains untouched.
-
-// hf8_e4m3_decode_to_f16 (fp8e4m3 -> fp16 in-register decode) is declared near the top of this
-// file, ahead of sdpa_kernel_lsc_prefetch above -- see its doc comment there for the full
-// rationale/algorithm description and why it has to precede both of its callers.
-
-// Processes one source's full KV range [0, kv_stop) into the SHARED cur_max/cur_sum/rO
-// accumulators. kv_stop<=0 (an empty source, e.g. chunk0's not-yet-populated ring, or warmup's
-// absent "current" split) is a no-op -- constructing a block_2d_desc with height kv_stop-1 would
-// underflow for kv_stop==0, so this is checked before any descriptor is built.
-// sparse_mask_base must already be offset by the caller to this source's own block-index range
-// within one combined mask buffer (ring blocks first, current blocks second).
 //
-// KVElemT: half for today's fp16 K/V (default -- unchanged behavior) or uchar for an
-// fp8e4m3-packed source, decoded to half in-register right before each DPAS (see
-// hf8_e4m3_decode_to_f16 above). Only the ring source is ever invoked with KVElemT=uchar --
-// current always stays half, see sdpa_kernel_lsc_prefetch_2src's two call sites below.
-template <int head_size, int wg_local_size, int sparse_block_size, typename KVElemT = half>
-CM_INLINE void sdpa_accumulate_kv_source(
+// Two entry points, mirroring the single-source fp16-vs-int8 fork (sdpa_kernel_lsc_prefetch above
+// vs sdpa_kernel_lsc/sdpa_accumulate_kv_source_slm): sdpa_kernel_lsc_prefetch_2src (barrier-free,
+// non-SLM, KV_CACHE_COMPRESSION==0 only -- nothing to decode-amortize, so no reason to pay for
+// SLM/barrier sharing) and sdpa_kernel_lsc_2src_slm (SLM/barrier-pipelined, required
+// whenever the cache is int8-packed). cm_sdpa_opt_prefill_dualsource.cm selects between them at
+// compile time via #if KV_CACHE_COMPRESSION, same convention as cm_sdpa_opt_prefill.cm's own
+// #if KV_CACHE_COMPRESSION split.
+// ============================================================================================
+
+// sdpa_accumulate_kv_source_prefetch: the barrier-free, non-SLM analog of
+// sdpa_accumulate_kv_source_slm -- extracted from sdpa_kernel_lsc_prefetch's core loop (the
+// descriptor setup through its "for (kv_base...)" loop) so sdpa_kernel_lsc_prefetch_2src can call
+// this SAME per-segment pipeline once per source (cache, then current), reusing one set of
+// online-softmax accumulators across both calls, numerically equivalent to one pass over
+// concat(cache, current) -- same contract as sdpa_accumulate_kv_source_slm, just without any SLM
+// staging or barriers, since this variant is only ever used when neither source needs int8 decode
+// (KV_CACHE_COMPRESSION==0): every lane loads its own K/V directly from global memory into
+// private registers (sdpa_kernel_lsc_prefetch's own approach), so there is no cross-lane shared
+// state to protect and a block-sparse skip is a plain per-lane `continue` -- no wg-uniform
+// skip-LOAD mask rows, no entry/chunk-boundary cm_barrier() needed at all (contrast
+// sdpa_accumulate_kv_source_slm's entry barrier and block-sparse chunk-boundary barriers, both
+// needed only because its SLM ring buffer IS shared across lanes).
+//
+// Deliberately narrower than sdpa_kernel_lsc_prefetch: no causal mask, no dense additive attn_mask,
+// no work-group-uniform mask rows -- same established scope restriction as this file's "Two-source
+// variant" section above (FlashVSR's own self-attention never needs causal or dense attn_mask, and
+// this path has no barrier-pipelined skip-LOAD decision to keep WG-uniform in the first place).
+//
+// kv_stop<=0 (an empty source, e.g. chunk0's not-yet-populated cache) is a no-op, checked before any
+// block_2d_desc is built (height kv_stop-1 would underflow for kv_stop==0) -- mirrors
+// sdpa_accumulate_kv_source_slm's identical guard.
+//
+// first_write is threaded by reference exactly as sdpa_accumulate_kv_source_slm's own first_write,
+// but here it replaces sdpa_kernel_lsc_prefetch's single-call-only `kv_base>0` rescale-skip check
+// (its KV_BLK>=2 optimization: rO's rescale is a no-op at kv_base==0 only because rO is still its
+// zero-initialized value there -- true for a single, self-contained call, but FALSE for a second
+// segment's call, since current's own loop also starts at local kv_base==0 while rO may already
+// hold cache's accumulated contribution). Changing the condition to
+// `kv_base > 0 || !first_write` and updating first_write=false once per EXECUTED (non-block-sparse-
+// skipped) outer iteration -- regardless of which KV_BLK branch ran -- fixes this: cache's call
+// behaves identically to a single-segment call (first_write starts true), while current's call
+// always rescales even at its own local kv_base==0 once cache has written anything real. A fully
+// block-sparse-masked-out cache segment correctly leaves first_write true (current's first executed
+// chunk still gets to skip-rescale, since rO really is still zero then) -- same property
+// sdpa_accumulate_kv_source_slm's own first_write already has (see that function's doc comment).
+template <int head_size, int sparse_block_size>
+CM_INLINE void sdpa_accumulate_kv_source_prefetch(
     int wg_local_id,
     int kv_stop,
     uint k_pitch_bytes,
     uint v_pitch_bytes,
     svmptr_t k_base [[type("svmptr_t")]],
     svmptr_t v_base [[type("svmptr_t")]],
+    // Per-lane sparse_block_mask row for THIS work-item's own q_block (already offset by the
+    // caller) -- same convention as sdpa_kernel_lsc_prefetch's own sparse_mask_base. No wg_lo/hi
+    // rows needed (see doc comment above).
     svmptr_t sparse_mask_base [[type("svmptr_t")]],
     matrix_ref<half, ((head_size + 16 - 1) / 16 * 16) / REG_K, REG_K * REG_N> rQ,
     vector_ref<float, q_step> cur_max,
     vector_ref<float, q_step> cur_sum,
     matrix_ref<float, ((head_size + 16 - 1) / 16 * 16) / REG_N * (REG_N / REG_M), REG_M * REG_N> rO,
-    // SLM byte-offset base of a work-group-local copy of the 256-entry half decode LUT
-    // (hf8_e4m3_ref.py's build_hf8_decode_lut_f16), only read when KVElemT=uchar -- see
-    // hf8_e4m3_decode_to_f16_lut_slm's doc comment. An EARLIER version of this function used
-    // hf8_e4m3_decode_to_f16_lut (per-call global/SVM gather, no SLM staging) instead: correct, but
-    // measured catastrophically slower here (~4.6x slower than the plain-half ring at FlashVSR's
-    // realistic kv_len_ring=57600 shape) -- unlike sdpa_kernel_lsc's decode-ONCE-per-work-group
-    // amortization, this per-work-item loop calls the decode function on every tile of every
-    // kv_base iteration, so a genuine global-memory gather (as opposed to a cheap SLM read) is
-    // paid that many times over, not once. The SLM copy is filled cooperatively, once, by the
-    // caller (cm_sdpa_opt_prefill_multisource.cm) before this is ever invoked. Only ever non-zero
-    // for the ring source (see sdpa_kernel_lsc_prefetch_2src's two call sites below); current
-    // always stays half.
-    //
-    // KNOWN REMAINING PERF GAP (not fixed by the SLM move above): even with lut_slm_base, the
-    // fp8 ring is still measured ~3.2x SLOWER than the plain-half ring at that same realistic
-    // shape (bench_sdpa_multisource.py's "steady" chunk, dense: fp16 ~571ms vs fp8ring ~1841ms on
-    // a 64-EU Arc Xe2 GPU) -- NOT a bug, a structural property of this function's per-work-item
-    // design. sdpa_kernel_lsc's SLM-LUT win is real because that kernel decodes each (kv_pos,
-    // column-range) byte range into SLM EXACTLY ONCE per work-group (half the WG's lanes decode
-    // K, the other half decode V; every lane then reads the shared result back out of SLM) --
-    // the decode cost is amortized over wg_local_size(16) lanes. This function has NO such
-    // work-group cooperation: every one of the 16 lanes in a work-group independently re-loads
-    // (cache-absorbed, cheap) AND re-decodes (real ALU + SLM-gather instructions, NOT free) the
-    // exact same underlying K/V bytes at the exact same kv_pos -- so the decode cost here is
-    // paid 16x over, not once, regardless of which decode primitive is used. This workload is
-    // compute-bound (DPAS-heavy, ~51% XMX utilization even in the plain-half case -- see
-    // bench_sdpa_multisource.py), so that 16x-undamortized extra per-lane instruction stream
-    // cannot be hidden behind memory latency the way it might be in a bandwidth-bound kernel.
-    // Closing this gap for real would mean porting this kernel to sdpa_kernel_lsc's heavier
-    // SLM-staged K/V double-buffer + cm_sbarrier/cm_fence pipeline -- which this file's own
-    // "Two-source variant" header comment deliberately scopes OUT of, to keep this kernel family
-    // small, independently-testable, and barrier-free. Treat fp8 ring here as "correct and the
-    // best available per-lane decode," not as "as fast as fp16" -- a caller that needs fp8-ring
-    // speed parity with fp16 would need that larger architectural change as separate follow-up
-    // work, not a tweak to this function.
-    uint lut_slm_base = 0) {
-    static_assert(sparse_block_size > 1, "dense dual-source is out of scope -- use sdpa_kernel_lsc_prefetch for single-source dense attention");
-    static_assert(std::is_same<KVElemT, half>::value || std::is_same<KVElemT, uchar>::value,
-                  "KVElemT must be half (fp16 K/V, default) or uchar (fp8e4m3-packed ring K/V)");
+    bool& first_write) {
     if (kv_stop <= 0)
         return;
 
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
-    constexpr int num_P_tiles = REG_N / REG_M;
-    constexpr bool fp8_kv = std::is_same<KVElemT, uchar>::value;
+    constexpr int wg_local_size = 16;
 
-    lsc::block_2d_desc<KVElemT, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<KVElemT, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, kv_step, REG_K> b2dK(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K, REG_N> b2dV(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
 
     static_assert(wg_local_size == 16);
-    lsc::block_2d_desc<KVElemT, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, k_pitch_bytes - 1, 0, 0);
-    lsc::block_2d_desc<KVElemT, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(KVElemT) - 1, v_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, kv_step / wg_local_size, REG_K> prefetch_K(k_base, kv_stop - 1, head_size * sizeof(half) - 1, k_pitch_bytes - 1, 0, 0);
+    lsc::block_2d_desc<half, 1, REG_K / wg_local_size, REG_N> prefetch_V(v_base, kv_stop - 1, head_size * sizeof(half) - 1, v_pitch_bytes - 1, 0, 0);
 
+    constexpr int num_P_tiles = REG_N / REG_M;
     constexpr int KV_BLK = CMFLA_KV_BLK;
     constexpr int num_K = kv_step / REG_M;
     constexpr int BLK_ROWS = KV_BLK * kv_step;
 
-    // Warm up first K and V tiles before the loop so kv_base=0 finds them in cache (identical
-    // mechanism to sdpa_kernel_lsc_prefetch above, just scoped to this source's own range).
+    // Warm up first K and V tiles before the loop so kv_pos=0 finds them in cache.
     prefetch_K.set_block_y(wg_local_id);
     prefetch_V.set_block_y(wg_local_id);
     cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
@@ -1074,9 +1052,9 @@ CM_INLINE void sdpa_accumulate_kv_source(
 
     for (int kv_base = 0; kv_base < kv_stop; kv_base += BLK_ROWS) {
         // ---- block-sparsity: skip this whole KV_BLK chunk (no load, no DPAS) when its
-        // sparse_block_size-sized bucket is masked out -- indexed relative to THIS source's own
-        // kv_base (sparse_mask_base already points at this source's row in the combined mask).
-        {
+        // sparse_block_size-sized bucket is masked out -- plain per-lane continue, no barrier
+        // needed (see this function's doc comment: nothing here is shared across lanes).
+        if constexpr (sparse_block_size > 1) {
             constexpr int sb_shift = (sparse_block_size == 128) ? 7 : (sparse_block_size == 256) ? 8 : -1;
             static_assert(sb_shift > 0, "sparse_block_size must be 128 or 256");
             static_assert(sparse_block_size % BLK_ROWS == 0,
@@ -1085,7 +1063,6 @@ CM_INLINE void sdpa_accumulate_kv_source(
                 continue;
             }
         }
-
         //# St = K @ Q^T for KV_BLK stacked sub-tiles -> [KV_BLK*kv_step, q_step]
         matrix<float, BLK_ROWS, q_step> St;
         auto St2 = St.format<float, KV_BLK * num_K, REG_M * REG_N>();
@@ -1093,22 +1070,15 @@ CM_INLINE void sdpa_accumulate_kv_source(
         for (int b = 0; b < KV_BLK; b++) {
             int kv_pos = kv_base + b * kv_step;
             matrix<half, num_K, REG_M * REG_K> Kmat;
+            // Prefetch K of the matching tile one block ahead and V of this tile, so V
+            // is warm by the PV phase and the next block's K is warm by its K phase.
             prefetch_K.set_block_y(wg_local_id + kv_pos + BLK_ROWS);
             prefetch_V.set_block_y(wg_local_id + kv_pos);
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(0));
             cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(0));
 
             b2dK.set_block_y(kv_pos);
-            if constexpr (fp8_kv) {
-                // K path (simple case): raw fp8e4m3 bytes load as a plain 2D block (same tile
-                // shape as the half path, 1 byte/elem instead of 2), decoded to half in-register
-                // right before cm_dpas -- no separate reorder kernel, no extra buffer.
-                matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
-                cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(0));
-                Kmat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>(), lut_slm_base);
-            } else {
-                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
-            }
+            cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(0));
 #    pragma unroll
             for (int k = 0; k < num_K; k++)
                 St2.row(b * num_K + k) =
@@ -1118,13 +1088,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
             for (int ri = 1; ri < padded_head_size / REG_K; ri++) {
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_K.set_block_x(ri * REG_K));
                 cm_prefetch<CacheHint::Cached, CacheHint::Cached>(prefetch_V.set_block_x(ri * REG_N));
-                if constexpr (fp8_kv) {
-                    matrix<uchar, num_K, REG_M * REG_K> Kmat_u8;
-                    cm_load<lsc::Normal>(Kmat_u8.format<uchar>(), b2dK.set_block_x(ri * REG_K));
-                    Kmat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<num_K * REG_M * REG_K>(Kmat_u8.format<uchar>(), lut_slm_base);
-                } else {
-                    cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
-                }
+                cm_load<lsc::Normal>(Kmat.format<half>(), b2dK.set_block_x(ri * REG_K));
 #    pragma unroll
                 for (int k = 0; k < num_K; k++) {
                     St2.row(b * num_K + k) = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount, float>(St2.row(b * num_K + k),
@@ -1134,9 +1098,10 @@ CM_INLINE void sdpa_accumulate_kv_source(
             }
         }
 
-        // ---- kv-tail mask (no causal mask in this kernel family -- see file header comment) ----
+        // ---- mask kv-tail (no causal mask in this kernel family, see doc comment above) ----
         {
             int kv_tokens = kv_stop - kv_base;
+            // LSC ensures no overflow-access, but mask off k-tail attn-score is still required
             for (int p = kv_tokens; p < BLK_ROWS; p++)
                 St[p] = -3.4e38f;
         }
@@ -1144,9 +1109,11 @@ CM_INLINE void sdpa_accumulate_kv_source(
         // ---- one online-softmax update over the whole block ----
         auto max_comp = cm_online_softmax_update(St, cur_max, cur_sum);
 
-        // ---- rescale rO ----
+        // ---- rescale rO (skip only on the very first executed block of the very first segment --
+        // see this function's doc comment for why `|| !first_write` is required here, unlike
+        // sdpa_kernel_lsc_prefetch's single-call-only `kv_base > 0` check) ----
         if constexpr (KV_BLK >= 2) {
-            if (kv_base > 0) {
+            if (kv_base > 0 || !first_write) {
 #    pragma unroll
                 for (int t = 0; t < padded_head_size / REG_N * num_P_tiles; t++) {
                     auto cO = rO[t].format<float, REG_M, REG_N>();
@@ -1164,6 +1131,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
                     cO.row(r) = cm_mul<float>(cO.row(r), max_comp[r + (t % num_P_tiles) * REG_M]);
             }
         }
+        first_write = false;
 
         // ---- transpose each sub-tile and accumulate P@V into rO ----
         constexpr int num_Vchunks = padded_head_size / REG_N;
@@ -1176,28 +1144,7 @@ CM_INLINE void sdpa_accumulate_kv_source(
 #    pragma unroll
             for (int ci = 0, ri = 0; ci < num_Vchunks; ci++, ri += num_P_tiles) {
                 matrix<half, REG_K / 2, REG_N * 2> Vmat;
-                if constexpr (fp8_kv) {
-                    // V path (harder case): hardware cm_load<lsc::VNNI> only knows how to
-                    // half-pair-interleave 2-byte (half) source elements -- there is no 1-byte
-                    // VNNI transform to ask the LSC unit for. So: load the raw fp8e4m3 bytes as a
-                    // PLAIN (non-VNNI) 2D block (REG_K rows x REG_N cols, same shape as the K
-                    // path), decode every byte to half, then MANUALLY reproduce in software the
-                    // exact VNNI2 interleave hardware would have produced from a half source --
-                    // out_row[i].lo16 = in_row[2*i], out_row[i].hi16 = in_row[2*i+1] (pairs of
-                    // adjacent source *rows* interleaved into each output dword). This is the
-                    // same select<>-based interleave sdpa_kernel_lsc's non-LSC-2D fallback path
-                    // already uses above (search "temp_vnni" earlier in this file) to build a
-                    // VNNI2 tile by hand from already-decoded half data -- reused here verbatim,
-                    // just renamed, so no SLM round-trip is needed for a first correct version.
-                    matrix<uchar, REG_K, REG_N> Vmat_u8;
-                    cm_load<lsc::Normal>(Vmat_u8.format<uchar>(), b2dV.set_block_x(ci * REG_N));
-                    matrix<half, REG_K, REG_N> Vmat_nat;
-                    Vmat_nat.format<half>() = hf8_e4m3_decode_to_f16_lut_slm<REG_K * REG_N>(Vmat_u8.format<uchar>(), lut_slm_base);
-                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 0) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(0, 0);
-                    Vmat.select<REG_K / 2, 1, REG_N, 2>(0, 1) = Vmat_nat.select<REG_K / 2, 2, REG_N, 1>(1, 0);
-                } else {
-                    cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
-                }
+                cm_load<lsc::VNNI>(Vmat.format<half>(), b2dV.set_block_x(ci * REG_N));
 #    pragma unroll
                 for (int p = 0; p < num_P_tiles; p++) {
                     rO[ri + p] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SystolicDepth, RepeatCount>(rO[ri + p].format<float>(),
@@ -1209,38 +1156,37 @@ CM_INLINE void sdpa_accumulate_kv_source(
     }
 }
 
-// fp8_ring_kv: compile-time switch (see KV_RING_FP8E4M3 in cm_sdpa_opt_prefill_multisource.cm)
-// selecting an fp8e4m3-packed ring K/V (decoded to half in-register, see
-// sdpa_accumulate_kv_source/hf8_e4m3_decode_to_f16 above) instead of today's plain half ring.
-// Only the ring call below is templated on it -- current (this step's own new K/V) always stays
-// half (see the scope note at this file's "Two-source variant" header comment).
-template <int num_heads, int num_kv_heads, int head_size, int wg_local_size, int sparse_block_size, bool fp8_ring_kv = false>
+// sdpa_kernel_lsc_prefetch_2src: barrier-free dual-source entry point for the pure-fp16
+// (KV_CACHE_COMPRESSION==0) case ONLY -- the int8-cache case keeps using
+// sdpa_kernel_lsc_2src_slm unchanged. Calls sdpa_accumulate_kv_source_prefetch twice
+// (cache, then current) sharing ONE set of online-softmax accumulators, numerically equivalent to
+// sdpa_kernel_lsc_2src_slm / one pass over concat(cache, current), but with no SLM, no
+// barriers, no scale/zp pointers (cache is never quantized here), no work-group-uniform mask rows
+// (this path has no barrier-pipelined skip-LOAD decision to protect -- see
+// sdpa_accumulate_kv_source_prefetch's doc comment). Safe to early-return for an inactive lane
+// (q_tokens<=0) at the .cm call site exactly like sdpa_kernel_lsc_prefetch's own callers do
+// (cm_sdpa_opt_prefill.cm's KV_CACHE_COMPRESSION==0 branch) -- there are no barriers here to strand
+// a sibling lane on, unlike sdpa_kernel_lsc_2src_slm which must NOT early-return.
+template <int head_size, int sparse_block_size>
 void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
-                                   int q_len,
-                                   uint q_pitch_bytes,
-                                   svmptr_t q_base [[type("svmptr_t")]],
-                                   svmptr_t o_base [[type("svmptr_t")]],
-                                   int kv_len_ring,
-                                   uint k_pitch_bytes_ring,
-                                   uint v_pitch_bytes_ring,
-                                   svmptr_t k_base_ring [[type("svmptr_t")]],
-                                   svmptr_t v_base_ring [[type("svmptr_t")]],
-                                   svmptr_t sparse_mask_ring [[type("svmptr_t")]],
-                                   int kv_len_cur,
-                                   uint k_pitch_bytes_cur,
-                                   uint v_pitch_bytes_cur,
-                                   svmptr_t k_base_cur [[type("svmptr_t")]],
-                                   svmptr_t v_base_cur [[type("svmptr_t")]],
-                                   svmptr_t sparse_mask_cur [[type("svmptr_t")]],
-                                   // SLM byte-offset base of the work-group-local 256-entry half
-                                   // decode LUT, only read when fp8_ring_kv -- see
-                                   // sdpa_accumulate_kv_source's lut_slm_base doc comment. Threaded
-                                   // down from cm_sdpa_opt_prefill_multisource.cm's KV_RING_FP8E4M3
-                                   // cooperative LUT SLM fill (done once by the caller, before this
-                                   // is ever invoked).
-                                   uint lut_slm_base = 0,
-                                   uint o_pitch_bytes = num_heads * head_size * sizeof(half),
-                                   float q_prescale_rt = q_prescale) {
+                                    int q_len,
+                                    uint q_pitch_bytes,
+                                    svmptr_t q_base [[type("svmptr_t")]],
+                                    svmptr_t o_base [[type("svmptr_t")]],
+                                    int kv_len_cache,
+                                    uint k_pitch_bytes_cache,
+                                    uint v_pitch_bytes_cache,
+                                    svmptr_t k_base_cache [[type("svmptr_t")]],
+                                    svmptr_t v_base_cache [[type("svmptr_t")]],
+                                    svmptr_t sparse_mask_cache [[type("svmptr_t")]],
+                                    int kv_len_cur,
+                                    uint k_pitch_bytes_cur,
+                                    uint v_pitch_bytes_cur,
+                                    svmptr_t k_base_cur [[type("svmptr_t")]],
+                                    svmptr_t v_base_cur [[type("svmptr_t")]],
+                                    svmptr_t sparse_mask_cur [[type("svmptr_t")]],
+                                    uint o_pitch_bytes,
+                                    float q_prescale_rt = q_prescale) {
     uint o_pitch = o_pitch_bytes;
     constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
 
@@ -1277,14 +1223,170 @@ void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
         }
     }
 
-    // ---- ring, then current: numerically equivalent to one pass over concat(ring, current) ----
-    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size,
-                               typename std::conditional<fp8_ring_kv, uchar, half>::type>(
-        wg_local_id, kv_len_ring, k_pitch_bytes_ring, v_pitch_bytes_ring,
-        k_base_ring, v_base_ring, sparse_mask_ring, rQ, cur_max, cur_sum, rO, lut_slm_base);
-    sdpa_accumulate_kv_source<head_size, wg_local_size, sparse_block_size>(
+    // ---- cache, then current: SAME online-softmax accumulators across both calls, numerically
+    // equivalent to one pass over concat(cache, current) -- see sdpa_accumulate_kv_source_prefetch's
+    // doc comment for the first_write-threading rescale-skip fix that makes this safe.
+    bool first_write = true;
+    sdpa_accumulate_kv_source_prefetch<head_size, sparse_block_size>(
+        wg_local_id, kv_len_cache, k_pitch_bytes_cache, v_pitch_bytes_cache,
+        k_base_cache, v_base_cache, sparse_mask_cache, rQ, cur_max, cur_sum, rO, first_write);
+    sdpa_accumulate_kv_source_prefetch<head_size, sparse_block_size>(
         wg_local_id, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
-        k_base_cur, v_base_cur, sparse_mask_cur, rQ, cur_max, cur_sum, rO);
+        k_base_cur, v_base_cur, sparse_mask_cur, rQ, cur_max, cur_sum, rO, first_write);
+
+    if (q_tokens_left == 0)
+        return;
+
+    //# save cur_O/cur_sum.transpose(0, 1)
+    matrix<half, num_P_tiles * REG_M, REG_N> cur_O_f16;
+    // Guard the all-masked-row case (every KV block skipped across both sources): see
+    // sdpa_kernel_lsc_prefetch's identical guard above for the NaN-avoidance rationale.
+    vector<unsigned short, q_step> cur_sum_is_zero = (cur_sum == 0.0f);
+    cur_sum = cm_inv(cur_sum);
+    cur_sum.merge(0.0f, cur_sum_is_zero);
+
+    lsc::block_2d_desc<half, 1, REG_M, REG_N> b2dO(o_base, q_tokens_left - 1, head_size * sizeof(half) - 1, o_pitch - 1, 0, 0);
+
+#    pragma unroll
+    for (int k = 0, ri = 0; k < padded_head_size; k += REG_N, ri += num_P_tiles) {
+#    pragma unroll
+        for (int p = 0; p < num_P_tiles; p++) {
+            auto cO = rO[ri + p].format<float, REG_M, REG_N>();
+#    pragma unroll
+            for (int r = 0; r < cO.n_rows(); r++) {
+                cur_O_f16[r + p * REG_M] = cm_mul<float>(cO.row(r), cur_sum[r + p * REG_M]);
+            }
+        }
+        b2dO.set_block_x(k);
+        cm_store(b2dO.set_block_y(0), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(0));
+        cm_store(b2dO.set_block_y(REG_M), cur_O_f16.format<half, num_P_tiles, REG_M * REG_N>().row(1));
+    }
+}
+
+// sdpa_kernel_lsc_2src_slm: the dual-source entry point, SLM/barrier-pipelined (replacing
+// a retired barrier-free sdpa_kernel_lsc_prefetch_2src/sdpa_accumulate_kv_source pair that paid its
+// int8-cache decode cost once per lane instead of once per work-group -- a "KNOWN REMAINING PERF GAP"
+// this function closes) by calling sdpa_accumulate_kv_source_slm once per source (cache, then
+// current), reusing ONE shared SLM ring-buffer allocation (slm_K/slm_V, allocated by the caller,
+// same convention as sdpa_kernel_lsc) and ONE set of online-softmax accumulators across both calls
+// -- giving int8-cache
+// the same decode-once-per-work-group amortization sdpa_kernel_lsc's KVElemT=uchar path already
+// has, instead of paying the decode cost once per lane (16x over) like the retired
+// sdpa_accumulate_kv_source did.
+//
+// cache_compression (0=NONE/half, 1=BY_TOKEN, 2=BY_CHANNEL, matching KV_CACHE_COMPRESSION in
+// cm_sdpa_opt_prefill_dualsource.cm) selects the cache source's KVElemT and K granularity; current
+// always stays half (see this file's "Two-source variant" header comment -- current is transient,
+// quantizing it buys no persistent-memory win).
+//
+// sparse_mask_wg_lo/hi_cache and _cur: REQUIRED once this pipeline is barrier-pipelined (unlike the
+// barrier-free sdpa_kernel_lsc_prefetch_2src, which never needed them) -- at SPARSE_BLOCK_SIZE==128
+// two different lanes in the same work-group can map to two different q_blocks and legitimately
+// disagree about which KV chunks to skip; the skip-LOAD decision inside
+// sdpa_accumulate_kv_source_slm must be work-group-uniform or the barrier-pipelined lanes can
+// diverge and deadlock -- same requirement, same fix (work-group-uniform OR-merged mask rows
+// computed by the caller from wg_id) as sdpa_kernel_lsc's own SPARSE_BLOCK_SIZE==128 path. Each
+// source needs its OWN pair since cache and current have independent block-mask ranges.
+//
+// Both sdpa_accumulate_kv_source_slm calls use use_causal_mask=false -- matches this kernel
+// family's existing, deliberate scope (see this file's "Two-source variant" header comment: never
+// generalized to causal masking since FlashVSR's own self-attention never needs it).
+template <int num_heads, int num_kv_heads, int head_size, int sparse_block_size, int cache_compression = 0>
+void sdpa_kernel_lsc_2src_slm(uint slm_K,
+                                       uint slm_V,
+                                       int wg_local_id,
+                                       int local_size,
+                                       int q_len,
+                                       uint q_pitch_bytes,
+                                       svmptr_t q_base [[type("svmptr_t")]],
+                                       svmptr_t o_base [[type("svmptr_t")]],
+                                       int kv_len_cache,
+                                       uint k_pitch_bytes_cache,
+                                       uint v_pitch_bytes_cache,
+                                       svmptr_t k_base_cache [[type("svmptr_t")]],
+                                       svmptr_t v_base_cache [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_cache [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_wg_lo_cache [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_wg_hi_cache [[type("svmptr_t")]],
+                                       // Int8 cache dequant scale/zero-point, only read when
+                                       // cache_compression!=0 -- see cm_int8_kv_decode.hpp. Layout
+                                       // matches sdpa_kernel_lsc's k_scale_base/k_zp_base/
+                                       // v_scale_base/v_zp_base exactly, scoped to the cache source.
+                                       svmptr_t k_scale_base_cache [[type("svmptr_t")]],
+                                       svmptr_t k_zp_base_cache [[type("svmptr_t")]],
+                                       svmptr_t v_scale_base_cache [[type("svmptr_t")]],
+                                       svmptr_t v_zp_base_cache [[type("svmptr_t")]],
+                                       int kv_len_cur,
+                                       uint k_pitch_bytes_cur,
+                                       uint v_pitch_bytes_cur,
+                                       svmptr_t k_base_cur [[type("svmptr_t")]],
+                                       svmptr_t v_base_cur [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_cur [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_wg_lo_cur [[type("svmptr_t")]],
+                                       svmptr_t sparse_mask_wg_hi_cur [[type("svmptr_t")]],
+                                       uint o_pitch_bytes = num_heads * head_size * sizeof(half),
+                                       float q_prescale_rt = q_prescale) {
+    uint o_pitch = o_pitch_bytes;
+    constexpr int padded_head_size = (head_size + 16 - 1) / 16 * 16;
+
+    vector<float, q_step> cur_max;
+    vector<float, q_step> cur_sum;
+
+    cur_max = -3e38f;
+    cur_sum = 0;
+    constexpr int num_P_tiles = REG_N / REG_M;
+    matrix<half, padded_head_size / REG_K, REG_K * REG_N> rQ;
+    matrix<float, padded_head_size / REG_N * num_P_tiles, REG_M * REG_N> rO;
+    rO = 0.0f;
+
+    auto q_tokens_left = q_len;
+    static_assert(q_step == REG_N);
+    static_assert(kv_step == REG_K);
+
+    if (q_tokens_left < 0)
+        q_tokens_left = 0;
+    if (q_tokens_left > q_step)
+        q_tokens_left = q_step;
+
+    if (q_tokens_left > 0) {
+        lsc::block_2d_desc<uint, 1, REG_N, REG_K / 2> b2dQ(reinterpret_cast<uint*>(q_base),
+                                                           q_tokens_left - 1,
+                                                           head_size * sizeof(half) - 1,
+                                                           q_pitch_bytes - 1,
+                                                           0,
+                                                           0);
+#    pragma unroll
+        for (int k = 0, ri = 0; k < padded_head_size / 2; k += REG_K / 2, ri++) {
+            cm_load<lsc::Transpose>(rQ[ri].format<uint>(), b2dQ.set_block_x(k));
+            rQ[ri].format<half>() = cm_mul<half>(rQ[ri].format<half>(), (half)q_prescale_rt);
+        }
+    }
+
+    constexpr bool cache_int8 = (cache_compression != 0);
+    constexpr bool cache_by_channel = (cache_compression == 2);
+    using CacheElemT = typename std::conditional<cache_int8, uchar, half>::type;
+
+    // Neither source uses causal masking, so these are write-only scratch -- the shared
+    // first_write flag is the only state that genuinely carries across the two calls (see this
+    // function's doc comment and sdpa_accumulate_kv_source_slm's own doc comment).
+    int unused_causal_left_cache = 0;
+    int unused_causal_left_cur = 0;
+    bool first_write = true;
+
+    // ---- cache, then current: SAME shared SLM ring buffer + online-softmax accumulators across
+    // both calls, numerically equivalent to one pass over concat(cache, current) -- see
+    // sdpa_accumulate_kv_source_slm's doc comment for the segment-boundary entry-barrier that
+    // makes this safe.
+    sdpa_accumulate_kv_source_slm<false, head_size, sparse_block_size, CacheElemT, cache_by_channel>(
+        slm_K, slm_V, wg_local_id, local_size, kv_len_cache, k_pitch_bytes_cache, v_pitch_bytes_cache,
+        k_base_cache, v_base_cache, k_scale_base_cache, k_zp_base_cache, v_scale_base_cache, v_zp_base_cache,
+        sparse_mask_cache, sparse_mask_wg_lo_cache, sparse_mask_wg_hi_cache,
+        rQ, cur_max, cur_sum, rO, unused_causal_left_cache, first_write);
+    sdpa_accumulate_kv_source_slm<false, head_size, sparse_block_size, half, false>(
+        slm_K, slm_V, wg_local_id, local_size, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
+        k_base_cur, v_base_cur, 0, 0, 0, 0,
+        sparse_mask_cur, sparse_mask_wg_lo_cur, sparse_mask_wg_hi_cur,
+        rQ, cur_max, cur_sum, rO, unused_causal_left_cur, first_write);
 
     if (q_tokens_left == 0)
         return;

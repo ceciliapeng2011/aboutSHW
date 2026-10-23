@@ -3,66 +3,75 @@
 //
 
 // Stage 1 of DraftBlockMask (FlashVSR's generate_draft_block_mask, wan_video_dit.py:116-153):
-// mean-pool a windowed [N, WINDOW_TOKENS, NUM_HEADS*HEAD_DIM] half (or, with K_FP8E4M3, fp8e4m3)
-// tensor over the WINDOW_TOKENS dim, per head -> pooled [N, NUM_HEADS, HEAD_DIM] half. Bandwidth-
-// bound: reads the full windowed Q/K, same order of bytes as the main attention op itself. The
-// same kernel entry point is used for both Q and K, bound to different input/output buffers and
-// dispatch sizes by the host (see DraftBlockMaskPoolGenerator in draft_block_mask.cpp).
+// mean-pool a windowed [N, WINDOW_TOKENS, NUM_HEADS*HEAD_DIM] half (or, with K_CACHE_COMPRESSION,
+// int8-packed) tensor over the WINDOW_TOKENS dim, per head -> pooled [N(+out_row_offset),
+// NUM_HEADS, HEAD_DIM] half. Bandwidth-bound: reads the full windowed Q/K, same order of bytes as
+// the main attention op itself. The same kernel entry point is used for both Q and K, bound to
+// different input/output buffers and dispatch sizes by the host (see DraftBlockMaskPoolGenerator
+// in draft_block_mask.cpp).
 //
-// JIT constants: NUM_HEADS, HEAD_DIM, WINDOW_TOKENS, K_FP8E4M3 (default 0)
+// JIT constants: NUM_HEADS, HEAD_DIM, WINDOW_TOKENS, K_CACHE_COMPRESSION (default 0),
+// HAS_OUT_ROW_OFFSET (default 0)
 // GWS: [N, NUM_HEADS, 1], LWS: [1,1,1].
 //
-// K_FP8E4M3: this project's ring K/V cache may be stored fp8e4m3-packed (1 byte/element) to save
-// device memory; Q is never quantized (only ring K/V ever is, see the BlockSparseAttention
-// fp8-ring work this mirrors), so this flag only ever applies to a K-pooling dispatch -- the host
-// picks which compiled kernel variant (K_FP8E4M3=0/1) to bind to which buffer, same mechanism that
-// already lets this one kernel source serve both Q- and K-pooling. When set, `windowed` is
-// fp8e4m3-packed uchar instead of half, an extra `hf8_lut` param carries the base pointer of a
-// host-built 256-entry half decode LUT (see hf8_e4m3_ref.py's build_hf8_decode_lut_f16), and each
-// row is read as HEAD_DIM raw bytes and decoded on the fly before accumulation. `pooled` (the
-// output) stays half unconditionally either way -- only the input side changes.
+// HAS_OUT_ROW_OFFSET: when set, an extra runtime `out_row_offset` arg shifts every write's row
+// index by a constant -- lets a dual-source caller (K-cache then K-cur) pool both sources straight
+// into two slices of ONE shared device `pooled` buffer (cache dispatch at offset 0, cur dispatch at
+// offset num_cache_windows) instead of pooling into two separate buffers and stitching them
+// together on the host. Purely an output-addressing change -- independent of K_CACHE_COMPRESSION
+// (which only affects how `windowed` is read).
+//
+// K_CACHE_COMPRESSION (0=NONE, 1=BY_TOKEN, 2=BY_CHANNEL, matching pageatten/test_pa.py's
+// KV_CACHE_COMPRESSION_{NONE,BY_TOKEN,BY_CHANNEL} enum/JIT-constant convention): this project's
+// cache K/V may be stored int8-packed (1 byte/element, affine uint8 quantization -- see
+// cm_int8_kv_decode.hpp) to save device memory; Q is never quantized (only cache K/V ever is, see
+// the BlockSparseAttention int8-cache work this mirrors), so this flag only ever applies to a
+// K-pooling dispatch -- the host picks which compiled kernel variant (K_CACHE_COMPRESSION=0/1/2) to
+// bind to which buffer, same mechanism that already lets this one kernel source serve both Q- and
+// K-pooling. When set, `windowed` is int8-packed uchar instead of half, plus `k_scale`/`k_zp`
+// tensors carry the dequant scale/zero-point (see int8_kv_ref.py, the host-side encode reference).
+// Quantization treats this kernel's whole D_full=NUM_HEADS*HEAD_DIM axis as one flat "channel" set
+// (the windowed buffer has no separate per-head leading dim in memory), so BY_CHANNEL's scale/zp
+// are [num_k_windows, WINDOW_TOKENS/16, D_full] and BY_TOKEN's are [num_k_windows, WINDOW_TOKENS]
+// (one scalar per token, shared across every channel) -- a given (window,head) dispatch reads its
+// own HEAD_DIM-wide slice of the D_full-wide BY_CHANNEL scale/zp, exactly mirroring how it already
+// reads its own HEAD_DIM-wide slice of the raw D_full-wide windowed data. `pooled` (the output)
+// stays half unconditionally either way -- only the input side changes. No SLM/barrier work is
+// needed here (GWS=[N,NUM_HEADS,1], LWS=[1,1,1] -- no sibling lanes to cooperate with), just a flat
+// per-row affine decode -- a strict improvement over the retired LUT-gather decode this replaces,
+// which was the single worst-performing decode pattern in this codebase (no lane-sharing
+// opportunity here at all, and it didn't even get the SLM-staged LUT amortization sdpa_kernel_lsc's
+// quantized-KV path had).
 //
 #include <cm/cm.h>
 #include <cm/cmtl.h>
+#include "cm_int8_kv_decode.hpp"
 
 #ifndef ATTR
 #define ATTR [[type("svmptr_t")]]
 #endif
 
-#ifndef K_FP8E4M3
-#define K_FP8E4M3 0
+#ifndef K_CACHE_COMPRESSION
+#define K_CACHE_COMPRESSION 0
 #endif
 
-#if K_FP8E4M3
-// Deliberate duplicate of cm_sdpa_common.hpp's hf8_e4m3_decode_to_f16_lut (the BlockSparseAttention
-// fp8-ring work's already-proven-correct, proven-faster-than-bit-manipulation LUT-gather decode --
-// see that function's own doc comment in flashattn/cm_sdpa_common.hpp for the full rationale/CM-
-// spec citation). NOT reused via #include here: that header unconditionally pulls in
-// cm_attention_common.hpp, which hard-requires SDPA-specific JIT state this plain elementwise
-// mean-pool kernel has no reason to define (CMFLA_SCALE_FACTOR has no #ifndef fallback, and several
-// static_asserts/templates are gated on DPAS/systolic-array tiling constants (REG_N/REG_K,
-// q_step/kv_step) that only make sense for the matmul-shaped SDPA kernels). Bit-exact parity with
-// the original is covered by this directory's own fp8 pool test, which drives both through the same
-// LUT (hf8_e4m3_ref.build_hf8_decode_lut_f16) and the same byte inputs.
-template <int N>
-CM_INLINE vector<half, N> hf8_e4m3_decode_to_f16_lut(vector_ref<uchar, N> raw, svmptr_t lut_base) {
-    // Widen to uint before the *sizeof(half) multiply: raw is 0..255, so plain uchar arithmetic
-    // would overflow (255*2==510) well before a later widening could save it.
-    vector<uint, N> idx = raw;
-    vector<uint, N> offsets = idx * (uint)sizeof(half);
-    return cm_ptr_load<half, VectorSize::N1, DataSize::U16, CacheHint::Cached, CacheHint::Cached>(
-        reinterpret_cast<half*>(lut_base), offsets);
-}
+#ifndef HAS_OUT_ROW_OFFSET
+#define HAS_OUT_ROW_OFFSET 0
 #endif
 
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
-#if K_FP8E4M3
+#if K_CACHE_COMPRESSION
     uchar* windowed ATTR,
-    half* hf8_lut ATTR,
+    half* k_scale ATTR,
+    half* k_zp ATTR,
 #else
     half* windowed ATTR,
 #endif
-    half* pooled ATTR) {
+    half* pooled ATTR
+#if HAS_OUT_ROW_OFFSET
+    , uint out_row_offset
+#endif
+    ) {
     constexpr uint D_full = NUM_HEADS * HEAD_DIM;
     uint w = cm_group_id(0);
     uint h = cm_group_id(1);
@@ -70,29 +79,57 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     uint row_base_elems = w * (uint)WINDOW_TOKENS * D_full + h * (uint)HEAD_DIM;
 
     vector<float, HEAD_DIM> acc = 0;
+#if K_CACHE_COMPRESSION == 2
+    // BY_CHANNEL: reselect this (window, head)'s HEAD_DIM-wide scale/zp slice once per 16-token
+    // sub-block boundary (not every token) -- same "reload every 16 tokens" cadence
+    // cm_sdpa_common.hpp's sdpa_accumulate_kv_source_slm uses for its own BY_CHANNEL K path.
+    constexpr int SUB_BLOCK = 16;
+    static_assert(WINDOW_TOKENS % SUB_BLOCK == 0, "WINDOW_TOKENS must be divisible by 16 for BY_CHANNEL pooling");
+    constexpr int num_sub_blocks = WINDOW_TOKENS / SUB_BLOCK;
+    uint meta_base = (w * (uint)num_sub_blocks) * D_full + h * (uint)HEAD_DIM;
+    for (int sb = 0; sb < num_sub_blocks; sb++) {
+        vector<half, HEAD_DIM> scale, zp;
+        uint meta_off = meta_base + (uint)sb * D_full;
+        scale.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)k_scale, meta_off * (uint)sizeof(half));
+        zp.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)k_zp, meta_off * (uint)sizeof(half));
+#    pragma unroll
+        for (int tt = 0; tt < SUB_BLOCK; tt++) {
+            uint t = (uint)(sb * SUB_BLOCK + tt);
+            vector<uchar, HEAD_DIM> raw_row;
+            raw_row.format<int>() =
+                cm_ptr_load<int, HEAD_DIM / 4>((int*)windowed, (row_base_elems + t * D_full) * (uint)sizeof(uchar));
+            vector<half, HEAD_DIM> row;
+            int8_decode_by_channel_row<HEAD_DIM>(raw_row, scale, zp, row);
+            acc += row;
+        }
+    }
+#elif K_CACHE_COMPRESSION == 1
+    // BY_TOKEN: one scalar (scale,zp) pair per token, shared across every channel -- read fresh
+    // every token (cheap, a single half each, no vector).
     for (uint t = 0; t < WINDOW_TOKENS; t++) {
-        vector<float, HEAD_DIM> row_f;
-#if K_FP8E4M3
-        // Plain int-granularity block read of the HEAD_DIM raw bytes (same recipe the half path
-        // below already uses for its own row, just at 1/4 the stride instead of 1/2): a scalar-
-        // offset cm_ptr_load<uchar,N> hits this toolchain's "transposed load only supports U32/U64"
-        // restriction (/cm/builtin/cm/cm_lsc.h), so HEAD_DIM is read as HEAD_DIM/4 ints and
-        // reinterpreted via .format<uchar>() instead -- requires HEAD_DIM % 4 == 0 (true for every
-        // config this project uses, e.g. production HEAD_DIM=128).
+        half scale = k_scale[w * (uint)WINDOW_TOKENS + t];
+        half zp = k_zp[w * (uint)WINDOW_TOKENS + t];
         vector<uchar, HEAD_DIM> raw_row;
         raw_row.format<int>() =
             cm_ptr_load<int, HEAD_DIM / 4>((int*)windowed, (row_base_elems + t * D_full) * (uint)sizeof(uchar));
-        vector<half, HEAD_DIM> row = hf8_e4m3_decode_to_f16_lut<HEAD_DIM>(raw_row.select_all(), reinterpret_cast<svmptr_t>(hf8_lut));
-        row_f = row;
+        vector<half, HEAD_DIM> row = raw_row - zp;
+        row = cm_mul<half>(row, scale);
+        acc += row;
+    }
 #else
+    for (uint t = 0; t < WINDOW_TOKENS; t++) {
         vector<half, HEAD_DIM> row;
         row.format<int>() = cm_ptr_load<int, HEAD_DIM / 2>((int*)windowed, (row_base_elems + t * D_full) * (uint)sizeof(half));
-        row_f = row;
-#endif
-        acc += row_f;
+        acc += row;
     }
+#endif
     vector<half, HEAD_DIM> out = acc * (1.0f / (float)WINDOW_TOKENS);
 
-    uint out_off_elems = (w * (uint)NUM_HEADS + h) * (uint)HEAD_DIM;
+#if HAS_OUT_ROW_OFFSET
+    uint out_row = w + out_row_offset;
+#else
+    uint out_row = w;
+#endif
+    uint out_off_elems = (out_row * (uint)NUM_HEADS + h) * (uint)HEAD_DIM;
     cm_ptr_store<int, HEAD_DIM / 2>((int*)pooled, out_off_elems * (uint)sizeof(half), out.format<int>());
 }

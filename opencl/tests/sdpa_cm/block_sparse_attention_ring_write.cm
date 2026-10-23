@@ -1,0 +1,199 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+// BlockSparseAttention ring-cache write-back (the CM-kernel mirror of
+// impls/cm/block_sparse_attention/block_sparse_attention_ring_write.cm's PagedAttention-style
+// write-indices scatter): copies `updates` (this chunk's own new key_cur/value_cur, one whole
+// `tokens_per_group`-token temporal group at a time) into `cache` (key_ring/value_ring) at the
+// physical slot given by `write_indices[g]`, in place. One compiled/dispatched instance for K, one
+// for V (same source, different buffers/dims), same as the real primitive's `ring_write_k`/
+// `ring_write_v` stages, which run strictly AFTER the prefill stage has read the ring for this
+// chunk (never before -- so a chunk's own new tokens never leak into its own attention read; see
+// test_sdpa_ring_write.py's ordering test).
+//
+// JIT constants: NUM_KV_HEADS, HEAD_SIZE (RING_WRITE_DIM = NUM_KV_HEADS*HEAD_SIZE is derived, not
+// itself a JIT constant -- matches how cm_sdpa_opt_prefill_dualsource.cm derives its own per-head
+// pitches from NUM_KV_HEADS/HEAD_SIZE rather than taking a flat width directly), RING_CACHE_COMPRESSION
+// (default 0=NONE/plain half, matching every other KV_*_CACHE_COMPRESSION JIT-constant convention
+// in this project; 1=BY_TOKEN, 2=BY_CHANNEL), SUB_BLOCK_SIZE (default 16, BY_CHANNEL granularity --
+// must match cm_sdpa_opt_prefill_dualsource.cm's/cm_int8_kv_decode.hpp's own hardcoded 16),
+// NUM_SLOTS (only required when RING_CACHE_COMPRESSION != 0 -- the ring's total physical slot
+// count, needed to size the cache_scale/cache_zp meta-buffer stride; the fp16 path never needs it,
+// `cache` is addressed purely via write_indices there).
+// GWS/LWS: see the two RING_CACHE_COMPRESSION branches below (each documents its own dispatch).
+//
+// RING_CACHE_COMPRESSION: this repo's own local extension -- there is no upstream counterpart
+// (openvino's ring_write_k/_v only ever write fp16; openvino dropped int8/fp8 KV-cache entirely in
+// this same redesign). `updates` (key_cur/value_cur) is NEVER quantized here regardless of this
+// flag -- only `cache` (the ring) ever is, matching KV_CACHE_COMPRESSION's identical
+// cache-only-quantization convention in cm_sdpa_opt_prefill_dualsource.cm and K_CACHE_COMPRESSION's
+// in draft_block_mask_pool.cm. Quantization statistics are computed PER (kv_head, token-or-
+// sub-block, group) -- never spanning multiple kv heads -- so the written scale/zp buffers land in
+// exactly the layout cm_sdpa_opt_prefill_dualsource.cm's key_ring_scale/key_ring_zp (BY_CHANNEL:
+// [NUM_KV_HEADS, kv_len_ring/16, HEAD_SIZE]; BY_TOKEN: [NUM_KV_HEADS, kv_len_ring], where
+// kv_len_ring = num_slots*tokens_per_group) already expect to read, with no batch dim (this
+// project's BlockSparseAttention ring-write workload, like upstream's, is always batch=1 --
+// matches block_sparse_attention_ring_write.cm's own documented shape).
+//
+// Because a write is always a WHOLE group of `tokens_per_group` tokens landing in a WHOLE
+// destination slot, and every config this project uses has tokens_per_group as a multiple of
+// SUB_BLOCK_SIZE (16) (e.g. the production window_tokens=128), each written group's quantization
+// is entirely self-contained within that one group -- unlike PagedAttention's per-token
+// incremental cache update (pageatten/pa_kv_cache_update_ref.cm's process_quantization_per_channel/
+// process_quantization_per_token), there is no "stale tail / requantize" merge against
+// previously-written neighboring tokens to do. The max/min -> scale/zp affine-quant math below
+// (including the BY_CHANNEL small-qrange NaN guard) is the same proven formula
+// pa_kv_cache_update_ref.cm uses, adapted to this simpler whole-group case (no block-table/
+// dequant_size bookkeeping).
+#include <cm/cm.h>
+#include <cm/cmtl.h>
+
+#ifndef ATTR
+#define ATTR [[type("svmptr_t")]]
+#endif
+
+#ifndef RING_CACHE_COMPRESSION
+#define RING_CACHE_COMPRESSION 0
+#endif
+
+#ifndef SUB_BLOCK_SIZE
+#define SUB_BLOCK_SIZE 16
+#endif
+
+constexpr uint RING_WRITE_DIM = (uint)NUM_KV_HEADS * (uint)HEAD_SIZE;
+
+#if RING_CACHE_COMPRESSION == 0
+
+// Plain fp16 scatter-copy -- exact signature/GWS match to upstream's
+// block_sparse_attention_ring_write.cm. GWS: [RING_WRITE_DIM/16, tokens_per_group, n_new],
+// LWS: [1,1,1] -- each work item copies one 16-element channel chunk of one token of one group.
+extern "C" _GENX_MAIN_ void KERNEL_NAME(
+    const half* updates [[type("svmptr_t")]],        // [n_new, tokens_per_group, RING_WRITE_DIM]
+    const int32_t* write_indices [[type("svmptr_t")]], // [n_new]
+    half* cache [[type("svmptr_t")]],                 // [num_slots, tokens_per_group, RING_WRITE_DIM], in-place
+    uint32_t tokens_per_group,
+    uint32_t n_new) {
+    uint c = cm_group_id(0) * 16;
+    uint t = cm_group_id(1);
+    uint g = cm_group_id(2);
+
+    int slot = write_indices[g];
+
+    uint src_off = ((uint)g * tokens_per_group + t) * RING_WRITE_DIM + c;
+    uint dst_off = ((uint)slot * tokens_per_group + t) * RING_WRITE_DIM + c;
+
+    vector<half, 16> v;
+    v.format<int>() = cm_ptr_load<int, 8>((int*)updates, src_off * (uint)sizeof(half));
+    cm_ptr_store<int, 8>((int*)cache, dst_off * (uint)sizeof(half), v.format<int>());
+}
+
+#else
+
+// Int8-ring scatter-quantize (this repo's own extension, no upstream counterpart -- see file
+// header). `updates` stays half; `cache` is int8-packed, with separate `cache_scale`/`cache_zp`
+// dequant tensors.
+//
+// GWS/LWS, RING_CACHE_COMPRESSION==1 (BY_TOKEN): [NUM_KV_HEADS, tokens_per_group, n_new],
+// LWS=[1,1,1] -- one work item quantizes one HEAD_SIZE-wide (kv_head, token) row.
+// GWS/LWS, RING_CACHE_COMPRESSION==2 (BY_CHANNEL): [NUM_KV_HEADS, tokens_per_group/SUB_BLOCK_SIZE,
+// n_new], LWS=[1,1,1] -- one work item quantizes one (kv_head, 16-token sub-block) tile, one scale/
+// zp pair per HEAD_SIZE channel shared across those 16 tokens.
+extern "C" _GENX_MAIN_ void KERNEL_NAME(
+    const half* updates [[type("svmptr_t")]],          // [n_new, tokens_per_group, RING_WRITE_DIM]
+    const int32_t* write_indices [[type("svmptr_t")]],  // [n_new]
+    uchar* cache [[type("svmptr_t")]],                  // [num_slots, tokens_per_group, RING_WRITE_DIM], in-place
+    half* cache_scale [[type("svmptr_t")]],             // see file header for layout
+    half* cache_zp [[type("svmptr_t")]],
+    uint32_t tokens_per_group,
+    uint32_t n_new) {
+    uint hkv = cm_group_id(0);
+    uint g = cm_group_id(2);
+    int slot = write_indices[g];
+
+    constexpr int HEAD_SIZE_C = HEAD_SIZE;
+
+#if RING_CACHE_COMPRESSION == 1
+    uint t = cm_group_id(1);
+
+    vector<half, HEAD_SIZE_C> row;
+    uint src_off = ((uint)g * tokens_per_group + t) * RING_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
+    row.format<int>() = cm_ptr_load<int, HEAD_SIZE_C / 2>((int*)updates, src_off * (uint)sizeof(half));
+
+    half max_val = cm_reduced_max<half>(row);
+    half min_val = cm_reduced_min<half>(row);
+    half qrange = max_val - min_val;
+    float scale_val = qrange == (half)0.0f ? 1.0f : 255.0f / (float)qrange;
+    half zp_val = (half)((0.0f - (float)min_val) * scale_val);
+    vector<half, HEAD_SIZE_C> q = cm_mul<half>(row, (half)scale_val) + zp_val;
+    q = cm_min<half>(cm_max<half>(q, (half)0.0f), (half)255.0f);
+    vector<uchar, HEAD_SIZE_C> q_u8 = cm_rnde<uchar, HEAD_SIZE_C>(q);
+
+    uint dst_tok = (uint)slot * tokens_per_group + t;
+    uint dst_off = dst_tok * RING_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
+    cm_ptr_store<int, HEAD_SIZE_C / 4>((int*)cache, dst_off * (uint)sizeof(uchar), q_u8.format<int>());
+
+    // cache_scale/cache_zp: [NUM_KV_HEADS, kv_len_ring] (kv_len_ring = NUM_SLOTS*tokens_per_group)
+    // -- dst_tok is already the flat ring-token index (slot*tokens_per_group+t), matching
+    // cm_sdpa_opt_prefill_dualsource.cm's key_ring_scale/zp BY_TOKEN layout exactly.
+    uint kv_len_ring = (uint)NUM_SLOTS * tokens_per_group;
+    uint meta_off = hkv * kv_len_ring + dst_tok;
+    cache_scale[meta_off] = (half)(1.0f / scale_val);
+    cache_zp[meta_off] = zp_val;
+
+#else  // RING_CACHE_COMPRESSION == 2, BY_CHANNEL
+    uint sb = cm_group_id(1);
+    uint t0 = sb * (uint)SUB_BLOCK_SIZE;
+
+    matrix<half, SUB_BLOCK_SIZE, HEAD_SIZE_C> in_data;
+#pragma unroll
+    for (int i = 0; i < SUB_BLOCK_SIZE; i++) {
+        uint src_off = ((uint)g * tokens_per_group + (t0 + (uint)i)) * RING_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
+        in_data.row(i).format<int>() = cm_ptr_load<int, HEAD_SIZE_C / 2>((int*)updates, src_off * (uint)sizeof(half));
+    }
+
+    vector<half, HEAD_SIZE_C> max_vals = in_data.row(0);
+    vector<half, HEAD_SIZE_C> min_vals = in_data.row(0);
+#pragma unroll
+    for (int i = 1; i < SUB_BLOCK_SIZE; i++) {
+        max_vals = cm_max<half>(max_vals, in_data.row(i));
+        min_vals = cm_min<half>(min_vals, in_data.row(i));
+    }
+
+    vector<float, HEAD_SIZE_C> qrange = max_vals - min_vals;
+    vector<ushort, HEAD_SIZE_C> zero_range = (qrange == (half)0.0f);
+    // Small-qrange guard (matches pa_kv_cache_update_ref.cm's process_quantization_per_channel):
+    // avoids INF/NaN scale/zp when a channel's 16-token window is near-constant.
+    vector<float, HEAD_SIZE_C> min_range = cm_abs<float>(max_vals) * 0.1f;
+    vector<float, HEAD_SIZE_C> adjust_val = cm_max<float>(min_range, 1.0f);
+    qrange.merge(qrange + adjust_val, qrange <= min_range);
+
+    vector<float, HEAD_SIZE_C> scale_vals = 255.0f / qrange;
+    scale_vals.merge(1.0f, zero_range);
+    vector<half, HEAD_SIZE_C> zp_vals = cm_mul<half>((0.0f - min_vals), scale_vals);
+
+    uint dst_slot_base = (uint)slot * tokens_per_group;
+#pragma unroll
+    for (int i = 0; i < SUB_BLOCK_SIZE; i++) {
+        vector<half, HEAD_SIZE_C> quant_data = cm_mul<half>(in_data.row(i), scale_vals) + zp_vals;
+        quant_data = cm_min<half>(cm_max<half>(quant_data, (half)0.0f), (half)255.0f);
+        vector<uchar, HEAD_SIZE_C> q_u8 = cm_rnde<uchar, HEAD_SIZE_C>(quant_data);
+        uint dst_off = (dst_slot_base + t0 + (uint)i) * RING_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
+        cm_ptr_store<int, HEAD_SIZE_C / 4>((int*)cache, dst_off * (uint)sizeof(uchar), q_u8.format<int>());
+    }
+
+    vector<half, HEAD_SIZE_C> scale_out = 1.0f / scale_vals;
+    // cache_scale/cache_zp: [NUM_KV_HEADS, kv_len_ring/SUB_BLOCK_SIZE, HEAD_SIZE]
+    // (kv_len_ring = NUM_SLOTS*tokens_per_group) -- (slot*tokens_per_group+t0)/SUB_BLOCK_SIZE is
+    // the flat ring sub-block index, matching cm_sdpa_opt_prefill_dualsource.cm's
+    // key_ring_scale/zp BY_CHANNEL layout exactly.
+    uint kv_len_ring = (uint)NUM_SLOTS * tokens_per_group;
+    uint num_sub_blocks_per_head = kv_len_ring / (uint)SUB_BLOCK_SIZE;
+    uint dst_sub_block = (dst_slot_base + t0) / (uint)SUB_BLOCK_SIZE;
+    uint meta_base = hkv * num_sub_blocks_per_head + dst_sub_block;
+    cm_ptr_store<int, HEAD_SIZE_C / 2>((int*)cache_scale, meta_base * (uint)HEAD_SIZE_C * (uint)sizeof(half), scale_out.format<int>());
+    cm_ptr_store<int, HEAD_SIZE_C / 2>((int*)cache_zp, meta_base * (uint)HEAD_SIZE_C * (uint)sizeof(half), zp_vals.format<int>());
+#endif
+}
+
+#endif  // RING_CACHE_COMPRESSION

@@ -12,24 +12,39 @@
 // draft_block_mask_topk_mask.cm can treat each value's raw bit pattern as a monotonic sort key
 // directly).
 //
-// JIT constants: NUM_HEADS, HEAD_DIM
+// JIT constants: NUM_HEADS, HEAD_DIM, HAS_CACHE_VALID_MASK (default 0), NUM_K_WINDOWS_CACHE (only
+// meaningful when HAS_CACHE_VALID_MASK)
 // GWS: [num_q_windows, NUM_HEADS, 1], LWS: [1,1,1].
 //
 // Runtime args: pooled_q [num_q_windows,NUM_HEADS,HEAD_DIM] half, pooled_k
-// [num_k_windows,NUM_HEADS,HEAD_DIM] half, local_mask [spatial_windows,spatial_windows_k] uint8
-// (1=keep/0=masked, tiled here across every (Q-temporal-group,K-temporal-group) pair via
-// modulo-spatial-window addressing -- spatial_windows_k may differ from spatial_windows, e.g. a
-// streaming decoder's accumulated KV cache growing past the current query window), raw_scores
+// [num_k_windows,NUM_HEADS,HEAD_DIM] half (cache windows first, current windows second for a
+// dual-source caller), local_mask [spatial_windows,spatial_windows_k] uint8 (1=keep/0=masked,
+// tiled here across every (Q-temporal-group,K-temporal-group) pair via modulo-spatial-window
+// addressing -- spatial_windows_k may differ from spatial_windows, e.g. a streaming decoder's
+// accumulated KV cache growing past the current query window), raw_scores
 // [NUM_HEADS,num_q_windows,num_k_windows] float scratch (this kernel's own inter-pass working
 // buffer, not read by any caller), probs [NUM_HEADS,num_q_windows,num_k_windows] float softmax
 // output (float, not half: see draft_block_mask_topk_mask.cm's file header comment on why the
 // top-k stage needs full float precision here).
+//
+// HAS_CACHE_VALID_MASK: for a dual-source caller whose cache buffer is a FIXED-CAPACITY physical
+// allocation that doesn't shrink (so it can't just pass a shorter num_k_windows at chunk0/
+// warmup -- a genuinely zero-length device tensor can't be bound as a kernel argument), the
+// trailing runtime arg `valid_k_windows_cache` says how many of the first NUM_K_WINDOWS_CACHE
+// columns are actually populated; any cache column index in [valid_k_windows_cache,
+// NUM_K_WINDOWS_CACHE) is forced to masked_score, same treatment as a local_mask-excluded column --
+// it's still read (cache's physical shape never changes), just never selectable by top-k. Current
+// columns (index >= NUM_K_WINDOWS_CACHE) are never affected.
 //
 #include <cm/cm.h>
 #include <cm/cmtl.h>
 
 #ifndef ATTR
 #define ATTR [[type("svmptr_t")]]
+#endif
+
+#ifndef HAS_CACHE_VALID_MASK
+#define HAS_CACHE_VALID_MASK 0
 #endif
 
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
@@ -42,7 +57,11 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     int num_k_windows,
     int spatial_windows,
     int spatial_windows_k,
-    float scale) {
+    float scale
+#if HAS_CACHE_VALID_MASK
+    , int valid_k_windows_cache
+#endif
+    ) {
     constexpr float log2e = 1.4426950408889634f;
     // row_max's untouched-init sentinel: real dot-product scores (bounded, half-precision inputs
     // scaled by 1/sqrt(head_dim)) never approach this magnitude, so it safely means "no unmasked
@@ -99,6 +118,13 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         if (!local_mask[mask_row_off + m2_spatial]) score2 = masked_score;
         if (!local_mask[mask_row_off + m3_spatial]) score3 = masked_score;
 
+#if HAS_CACHE_VALID_MASK
+        if ((m + 0) < NUM_K_WINDOWS_CACHE && (m + 0) >= valid_k_windows_cache) score0 = masked_score;
+        if ((m + 1) < NUM_K_WINDOWS_CACHE && (m + 1) >= valid_k_windows_cache) score1 = masked_score;
+        if ((m + 2) < NUM_K_WINDOWS_CACHE && (m + 2) >= valid_k_windows_cache) score2 = masked_score;
+        if ((m + 3) < NUM_K_WINDOWS_CACHE && (m + 3) >= valid_k_windows_cache) score3 = masked_score;
+#endif
+
         raw_scores[out_row_off + (uint)(m + 0)] = score0;
         raw_scores[out_row_off + (uint)(m + 1)] = score1;
         raw_scores[out_row_off + (uint)(m + 2)] = score2;
@@ -120,6 +146,10 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
         uint m_spatial = (uint)m % (uint)spatial_windows_k;
         uchar keep = local_mask[mask_row_off + m_spatial];
         if (!keep) score = masked_score;
+
+#if HAS_CACHE_VALID_MASK
+        if (m < NUM_K_WINDOWS_CACHE && m >= valid_k_windows_cache) score = masked_score;
+#endif
 
         raw_scores[out_row_off + (uint)m] = score;
         row_max = cm_max<float>(row_max, score);
