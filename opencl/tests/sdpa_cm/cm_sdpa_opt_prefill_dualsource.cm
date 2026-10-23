@@ -194,41 +194,32 @@ _GENX_MAIN_ void KERNEL_NAME(
     }
 
 #if KV_CACHE_COMPRESSION
-    // Work-group-uniform mask rows for the barrier-pipelined skip-LOAD decision -- only needed by
-    // sdpa_kernel_lsc_2src_slm (the barrier-free sdpa_kernel_lsc_prefetch_2src used when
-    // KV_CACHE_COMPRESSION==0 has no barrier-pipelined skip-LOAD decision to keep
-    // work-group-uniform in the first place -- see cm_sdpa_common.hpp's
-    // sdpa_accumulate_kv_source_prefetch doc comment).
+    // Work-group-uniform mask rows for the cache segment's barrier-pipelined skip-LOAD decision --
+    // only needed by sdpa_accumulate_kv_source_slm (current's segment is barrier-free via
+    // sdpa_accumulate_kv_source_prefetch and uses its own per-lane sparse_mask_cur row directly --
+    // see cm_sdpa_common.hpp's sdpa_kernel_lsc_2src_slm doc comment).
 #if SPARSE_BLOCK_SIZE == 128
     // REQUIRED because sdpa_accumulate_kv_source_slm is barrier-pipelined (unlike the retired
     // barrier-free sdpa_accumulate_kv_source, which never needed this): at SPARSE_BLOCK_SIZE==128,
     // two different lanes in the same work-group can map to two different q_blocks and legitimately
     // disagree about which KV chunks to skip -- see sdpa_kernel_lsc's own identical
     // SPARSE_BLOCK_SIZE==128 doc comment for the full rationale this mirrors. Computed from wg_id
-    // (NOT q_start), so every lane in the work-group derives the exact same two row pointers; cache
-    // and current share the same two ROWS (just offset by num_k_blocks_cache columns, same
-    // relationship as sparse_mask_cache/sparse_mask_cur above), since both sources are indexed by the
-    // same q_block.
-    svmptr_t sparse_mask_wg_lo_row = 0, sparse_mask_wg_hi_row = 0;
+    // (NOT q_start), so every lane in the work-group derives the exact same two row pointers.
+    svmptr_t sparse_mask_wg_lo_cache = 0, sparse_mask_wg_hi_cache = 0;
     if (sparse_block_mask) {
         int wg_q_block_lo = wg_id * (wg_seq_len / SPARSE_BLOCK_SIZE);
         int wg_q_block_hi = wg_q_block_lo + 1;
         if (wg_q_block_lo < num_q_blocks) {
             uint off_lo = (uint)((b * num_heads + h) * num_q_blocks + wg_q_block_lo) * (uint)num_k_blocks_total;
-            sparse_mask_wg_lo_row = reinterpret_cast<svmptr_t>((bool*)sparse_block_mask + off_lo);
+            sparse_mask_wg_lo_cache = reinterpret_cast<svmptr_t>((bool*)sparse_block_mask + off_lo);
         }
         if (wg_q_block_hi < num_q_blocks) {
             uint off_hi = (uint)((b * num_heads + h) * num_q_blocks + wg_q_block_hi) * (uint)num_k_blocks_total;
-            sparse_mask_wg_hi_row = reinterpret_cast<svmptr_t>((bool*)sparse_block_mask + off_hi);
+            sparse_mask_wg_hi_cache = reinterpret_cast<svmptr_t>((bool*)sparse_block_mask + off_hi);
         }
     }
-    svmptr_t sparse_mask_wg_lo_cache = sparse_mask_wg_lo_row;
-    svmptr_t sparse_mask_wg_hi_cache = sparse_mask_wg_hi_row;
-    svmptr_t sparse_mask_wg_lo_cur = sparse_mask_wg_lo_row ? reinterpret_cast<svmptr_t>((bool*)sparse_mask_wg_lo_row + (uint)num_k_blocks_cache) : 0;
-    svmptr_t sparse_mask_wg_hi_cur = sparse_mask_wg_hi_row ? reinterpret_cast<svmptr_t>((bool*)sparse_mask_wg_hi_row + (uint)num_k_blocks_cache) : 0;
 #else
     svmptr_t sparse_mask_wg_lo_cache = 0, sparse_mask_wg_hi_cache = 0;
-    svmptr_t sparse_mask_wg_lo_cur = 0, sparse_mask_wg_hi_cur = 0;
 #endif
 #endif
 
@@ -282,8 +273,6 @@ _GENX_MAIN_ void KERNEL_NAME(
         reinterpret_cast<svmptr_t>((uint8_t*)key_cur + k_off_cur),
         reinterpret_cast<svmptr_t>((uint8_t*)value_cur + v_off_cur),
         sparse_mask_cur,
-        sparse_mask_wg_lo_cur,
-        sparse_mask_wg_hi_cur,
         o_seq_pitch,
         q_prescale_rt);
 #else

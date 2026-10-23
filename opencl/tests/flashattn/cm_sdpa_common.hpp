@@ -1263,34 +1263,53 @@ void sdpa_kernel_lsc_prefetch_2src(int wg_local_id,
     }
 }
 
-// sdpa_kernel_lsc_2src_slm: the dual-source entry point, SLM/barrier-pipelined (replacing
+// sdpa_kernel_lsc_2src_slm: the dual-source entry point, HYBRID -- cache runs through
+// sdpa_accumulate_kv_source_slm (SLM/barrier-pipelined, decode-once-per-work-group, replacing
 // a retired barrier-free sdpa_kernel_lsc_prefetch_2src/sdpa_accumulate_kv_source pair that paid its
 // int8-cache decode cost once per lane instead of once per work-group -- a "KNOWN REMAINING PERF GAP"
-// this function closes) by calling sdpa_accumulate_kv_source_slm once per source (cache, then
-// current), reusing ONE shared SLM ring-buffer allocation (slm_K/slm_V, allocated by the caller,
-// same convention as sdpa_kernel_lsc) and ONE set of online-softmax accumulators across both calls
-// -- giving int8-cache
-// the same decode-once-per-work-group amortization sdpa_kernel_lsc's KVElemT=uchar path already
-// has, instead of paying the decode cost once per lane (16x over) like the retired
-// sdpa_accumulate_kv_source did.
+// this function closes), while current runs through sdpa_accumulate_kv_source_prefetch (barrier-free,
+// per-lane, no SLM) -- both share ONE set of online-softmax accumulators (rQ/cur_max/cur_sum/rO/
+// first_write), numerically equivalent to one pass over concat(cache, current).
+//
+// Why current gets the barrier-free path even though this whole function is reached from
+// KV_CACHE_COMPRESSION!=0: current is NEVER quantized (see this file's "Two-source variant" header
+// comment -- it's transient, quantizing it buys no persistent-memory win), so it has nothing to
+// decode-amortize and therefore no reason to pay for SLM/barrier sharing. Forcing it through
+// sdpa_accumulate_kv_source_slm anyway (the pre-hybrid design) cost two things for free: (1) a fixed
+// per-work-group entry-barrier + SLM-ring-repriming tax at the cache/current boundary, measured as a
+// near-constant ~75ms overhead over the single-source int8 kernel regardless of density, and (2) at
+// SPARSE_BLOCK_SIZE==128, current's own skip-LOAD decision was coarsened to the same
+// work-group-uniform 256-token OR-across-2-rows granularity cache's decode sharing requires, instead
+// of the native per-lane, per-128-token skip sdpa_accumulate_kv_source_prefetch gives for free --
+// losing most of current's sparse speedup for a dtype that was never quantized in the first place.
+// Switching current to the barrier-free helper recovers both: no second entry barrier/ring-priming
+// (it never touches SLM), and skip-LOAD/skip-COMPUTE collapse into one exact per-lane decision at
+// current's own mask granularity, same as the all-fp16 sdpa_kernel_lsc_prefetch_2src path gets.
+//
+// Transitioning from cache's barrier-pipelined segment into current's barrier-free one needs no
+// extra barrier: sdpa_accumulate_kv_source_slm's own entry cm_barrier() (see that function's doc
+// comment) exists solely to protect AGAINST SLM RING REUSE across repeated calls against the same
+// slm_K/slm_V allocation -- current's call never touches slm_K/slm_V at all (it loads K/V straight
+// into private registers), so there is no reuse hazard to protect against. Each lane's own rQ/rO/
+// cur_max/cur_sum/first_write state is already carried correctly across the two calls by reference,
+// independent of any other lane's progress.
 //
 // cache_compression (0=NONE/half, 1=BY_TOKEN, 2=BY_CHANNEL, matching KV_CACHE_COMPRESSION in
-// cm_sdpa_opt_prefill_dualsource.cm) selects the cache source's KVElemT and K granularity; current
-// always stays half (see this file's "Two-source variant" header comment -- current is transient,
-// quantizing it buys no persistent-memory win).
+// cm_sdpa_opt_prefill_dualsource.cm) selects the cache source's KVElemT and K granularity.
 //
-// sparse_mask_wg_lo/hi_cache and _cur: REQUIRED once this pipeline is barrier-pipelined (unlike the
-// barrier-free sdpa_kernel_lsc_prefetch_2src, which never needed them) -- at SPARSE_BLOCK_SIZE==128
-// two different lanes in the same work-group can map to two different q_blocks and legitimately
-// disagree about which KV chunks to skip; the skip-LOAD decision inside
+// sparse_mask_wg_lo/hi_cache: REQUIRED because cache's segment is still barrier-pipelined (unlike
+// the barrier-free sdpa_kernel_lsc_prefetch_2src, which never needed them) -- at
+// SPARSE_BLOCK_SIZE==128 two different lanes in the same work-group can map to two different
+// q_blocks and legitimately disagree about which KV chunks to skip; the skip-LOAD decision inside
 // sdpa_accumulate_kv_source_slm must be work-group-uniform or the barrier-pipelined lanes can
 // diverge and deadlock -- same requirement, same fix (work-group-uniform OR-merged mask rows
-// computed by the caller from wg_id) as sdpa_kernel_lsc's own SPARSE_BLOCK_SIZE==128 path. Each
-// source needs its OWN pair since cache and current have independent block-mask ranges.
+// computed by the caller from wg_id) as sdpa_kernel_lsc's own SPARSE_BLOCK_SIZE==128 path. Current's
+// barrier-free segment needs no such row -- sparse_mask_cur (this lane's own row) is sufficient, same
+// as sdpa_accumulate_kv_source_prefetch's other callers.
 //
-// Both sdpa_accumulate_kv_source_slm calls use use_causal_mask=false -- matches this kernel
-// family's existing, deliberate scope (see this file's "Two-source variant" header comment: never
-// generalized to causal masking since FlashVSR's own self-attention never needs it).
+// Both accumulate calls use use_causal_mask=false -- matches this kernel family's existing,
+// deliberate scope (see this file's "Two-source variant" header comment: never generalized to causal
+// masking since FlashVSR's own self-attention never needs it).
 template <int num_heads, int num_kv_heads, int head_size, int sparse_block_size, int cache_compression = 0>
 void sdpa_kernel_lsc_2src_slm(uint slm_K,
                                        uint slm_V,
@@ -1321,9 +1340,10 @@ void sdpa_kernel_lsc_2src_slm(uint slm_K,
                                        uint v_pitch_bytes_cur,
                                        svmptr_t k_base_cur [[type("svmptr_t")]],
                                        svmptr_t v_base_cur [[type("svmptr_t")]],
+                                       // This lane's own per-(q_block) row -- sdpa_accumulate_kv_source_prefetch
+                                       // is barrier-free, so no work-group-uniform wg_lo/hi row is needed here
+                                       // (contrast sparse_mask_wg_lo/hi_cache above).
                                        svmptr_t sparse_mask_cur [[type("svmptr_t")]],
-                                       svmptr_t sparse_mask_wg_lo_cur [[type("svmptr_t")]],
-                                       svmptr_t sparse_mask_wg_hi_cur [[type("svmptr_t")]],
                                        uint o_pitch_bytes = num_heads * head_size * sizeof(half),
                                        float q_prescale_rt = q_prescale) {
     uint o_pitch = o_pitch_bytes;
@@ -1366,27 +1386,27 @@ void sdpa_kernel_lsc_2src_slm(uint slm_K,
     constexpr bool cache_by_channel = (cache_compression == 2);
     using CacheElemT = typename std::conditional<cache_int8, uchar, half>::type;
 
-    // Neither source uses causal masking, so these are write-only scratch -- the shared
-    // first_write flag is the only state that genuinely carries across the two calls (see this
-    // function's doc comment and sdpa_accumulate_kv_source_slm's own doc comment).
+    // Cache uses no causal masking, so this is write-only scratch -- the shared first_write flag is
+    // the only state that genuinely carries across the two calls (see this function's doc comment
+    // and sdpa_accumulate_kv_source_slm's own doc comment). current's accumulate helper
+    // (sdpa_accumulate_kv_source_prefetch) has no causal_left parameter at all -- it's narrower than
+    // sdpa_accumulate_kv_source_slm by construction (see that function's own doc comment).
     int unused_causal_left_cache = 0;
-    int unused_causal_left_cur = 0;
     bool first_write = true;
 
-    // ---- cache, then current: SAME shared SLM ring buffer + online-softmax accumulators across
-    // both calls, numerically equivalent to one pass over concat(cache, current) -- see
-    // sdpa_accumulate_kv_source_slm's doc comment for the segment-boundary entry-barrier that
-    // makes this safe.
+    // ---- cache (SLM/barrier-pipelined, decode-amortized), then current (barrier-free, per-lane) --
+    // SAME online-softmax accumulators across both calls, numerically equivalent to one pass over
+    // concat(cache, current) -- see this function's doc comment for why current doesn't need (and
+    // no longer pays for) cache's SLM ring / work-group-uniform skip-LOAD machinery.
     sdpa_accumulate_kv_source_slm<false, head_size, sparse_block_size, CacheElemT, cache_by_channel>(
         slm_K, slm_V, wg_local_id, local_size, kv_len_cache, k_pitch_bytes_cache, v_pitch_bytes_cache,
         k_base_cache, v_base_cache, k_scale_base_cache, k_zp_base_cache, v_scale_base_cache, v_zp_base_cache,
         sparse_mask_cache, sparse_mask_wg_lo_cache, sparse_mask_wg_hi_cache,
         rQ, cur_max, cur_sum, rO, unused_causal_left_cache, first_write);
-    sdpa_accumulate_kv_source_slm<false, head_size, sparse_block_size, half, false>(
-        slm_K, slm_V, wg_local_id, local_size, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
-        k_base_cur, v_base_cur, 0, 0, 0, 0,
-        sparse_mask_cur, sparse_mask_wg_lo_cur, sparse_mask_wg_hi_cur,
-        rQ, cur_max, cur_sum, rO, unused_causal_left_cur, first_write);
+    sdpa_accumulate_kv_source_prefetch<head_size, sparse_block_size>(
+        wg_local_id, kv_len_cur, k_pitch_bytes_cur, v_pitch_bytes_cur,
+        k_base_cur, v_base_cur, sparse_mask_cur,
+        rQ, cur_max, cur_sum, rO, first_write);
 
     if (q_tokens_left == 0)
         return;
