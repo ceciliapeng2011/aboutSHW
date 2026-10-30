@@ -15,16 +15,16 @@
 #define TRANSPOSE_ORDER_SWAPPED  1  // [B,S,H,D]
 
 #ifndef Q_TRANSPOSE_ORDER
-#define Q_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
+#    define Q_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
 #endif
 #ifndef K_TRANSPOSE_ORDER
-#define K_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
+#    define K_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
 #endif
 #ifndef V_TRANSPOSE_ORDER
-#define V_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
+#    define V_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
 #endif
 #ifndef OUTPUT_TRANSPOSE_ORDER
-#define OUTPUT_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
+#    define OUTPUT_TRANSPOSE_ORDER TRANSPOSE_ORDER_IDENTITY
 #endif
 
 // Byte pitch between consecutive tokens for a [.., num_heads, .., head_size] tensor, given a
@@ -36,7 +36,7 @@
 // cache buffer (see KV_CACHE_COMPRESSION in cm_sdpa_opt_prefill_dualsource.cm) packs 1
 // byte/element instead of 2, so its own pitch/offset must be computed with elem_size=sizeof(uchar)
 // -- callers opt in explicitly by passing the second template argument.
-template<int order, int elem_size = sizeof(half)>
+template <int order, int elem_size = sizeof(half)>
 inline uint get_seq_pitch_bytes(int seq_len, int num_heads, int head_size) {
     if constexpr (order == TRANSPOSE_ORDER_SWAPPED)
         return num_heads * head_size * elem_size;
@@ -45,7 +45,7 @@ inline uint get_seq_pitch_bytes(int seq_len, int num_heads, int head_size) {
 }
 
 // Byte offset of head `h`'s sub-tensor within one batch's chunk.
-template<int order, int elem_size = sizeof(half)>
+template <int order, int elem_size = sizeof(half)>
 inline uint get_head_byte_offset(int h, int seq_len, int head_size) {
     if constexpr (order == TRANSPOSE_ORDER_SWAPPED)
         return h * head_size * elem_size;

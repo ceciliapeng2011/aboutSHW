@@ -98,6 +98,15 @@
 // accumulation), but for a second segment called after a non-empty first one, first_write is
 // already false, forcing ugemm_PV1 (required for correctness once rO holds real accumulated state,
 // even if this segment's own local kv_pos starts back at 0).
+// k_scale_base/k_zp_base/v_scale_base/v_zp_base point into the region-split cache layout shared by
+// both of this function's call sites (sdpa_kernel_lsc and sdpa_kernel_lsc_2src_slm): the real
+// OpenVINO BlockSparseAttention primitive's design (see kv_cache_write.cm's /
+// cm_sdpa_opt_prefill_dualsource.cm's doc comments) -- scale/zp live in a dedicated region B,
+// packed as interleaved (scale, zp) half-pairs, CONTIGUOUS across tokens (BY_TOKEN) or channels
+// within a group (BY_CHANNEL), so k_zp_base is always k_scale_base+2 (passed anyway for signature
+// symmetry, but unused) and many consecutive entries can be fetched with ONE vectorized block read
+// instead of one scalar read at a time -- this is the fix for an 8.36x slowdown (204ms->1708ms) the
+// real primitive hit when an earlier per-token-interleaved design forced scalar reads instead.
 template <bool use_causal_mask, int head_size, int sparse_block_size, typename KVElemT, bool k_by_channel>
 CM_INLINE void sdpa_accumulate_kv_source_slm(
     uint slm_K,
@@ -176,18 +185,39 @@ CM_INLINE void sdpa_accumulate_kv_source_slm(
                     // register-aliasing trick, to keep this new path simple to verify).
                     vector<half, kv_step> k_scale, k_zp;
                     if constexpr (!k_by_channel) {
-                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + (uint)kv_pos * sizeof(half)), k_scale);
-                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_zp_base + (uint)kv_pos * sizeof(half)), k_zp);
+                        // Region-split layout (see this function's doc comment above):
+                        // k_scale_base points at this (batch, kv_head)'s region-B sub-range --
+                        // head-major, TOKEN-CONTIGUOUS within a head, packed as interleaved
+                        // (scale, zp) half-pairs, 4 bytes/token. kv_step consecutive tokens'
+                        // pairs are therefore a single contiguous 4*kv_step-byte range starting
+                        // at kv_pos*4 -- fetch them with ONE vectorized block read and
+                        // deinterleave, instead of kv_step individual scalar reads.
+                        vector<half, kv_step * 2> k_meta_packed;
+                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + (uint)kv_pos * 4), k_meta_packed);
+                        k_scale = k_meta_packed.select<kv_step, 2>(0);
+                        k_zp = k_meta_packed.select<kv_step, 2>(1);
                     }
                     matrix<uint8_t, kv_step, REG_K> quanKmat;
                     matrix<half, kv_step, REG_K> kmat;
                     b2dK.set_block_y(kv_pos);
                     for (int k = REG_K * wg_local_id; k < padded_head_size; k += REG_K * (local_size / 2)) {
                         if constexpr (k_by_channel) {
+                            // Region-split layout: head-major, then GROUP-major, then
+                            // CHANNEL-CONTIGUOUS within a group, packed as interleaved
+                            // (scale, zp) half-pairs, 4 bytes/channel. kv_step==16 exactly
+                            // matches the group size, so this load_slm_KV(kv_pos) call's whole
+                            // 16-row tile shares ONE group (kv_pos/16); REG_K consecutive
+                            // channels' pairs are a single contiguous 4*REG_K-byte range
+                            // starting at ((kv_pos/16)*head_size + k)*4.
                             uint k_ch_off = (uint)(kv_pos / 16) * head_size + k;
-                            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + k_ch_off * sizeof(half)), k_scale);
-                            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_zp_base + k_ch_off * sizeof(half)), k_zp);
+                            vector<half, REG_K * 2> k_meta_packed;
+                            cm_svm_block_read(reinterpret_cast<svmptr_t>(k_scale_base + k_ch_off * 4), k_meta_packed);
+                            k_scale = k_meta_packed.select<REG_K, 2>(0);
+                            k_zp = k_meta_packed.select<REG_K, 2>(1);
                         }
+                        // Region A's data pitch is always plain head_size*sizeof(KVElemT)
+                        // (scale/zp live in the separate region B above), already 16-byte-aligned --
+                        // b2dK's hardware 2D block read is safe here unconditionally.
                         cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
                         if constexpr (k_by_channel)
                             int8_decode_by_channel<kv_step, REG_K>(quanKmat, k_scale, k_zp, kmat);
@@ -212,11 +242,18 @@ CM_INLINE void sdpa_accumulate_kv_source_slm(
                     // hardware would have produced from a half source is reproduced manually via
                     // select<>() -- the same manual-VNNI approach this path has always used.
                     vector<half, kv_step> v_scale, v_zp;
-                    cm_svm_block_read(reinterpret_cast<svmptr_t>(v_scale_base + (uint)kv_pos * sizeof(half)), v_scale);
-                    cm_svm_block_read(reinterpret_cast<svmptr_t>(v_zp_base + (uint)kv_pos * sizeof(half)), v_zp);
+                    // Same region-split convention and vectorized-read opportunity as K's BY_TOKEN
+                    // branch above (V is always BY_TOKEN) -- see this function's doc comment.
+                    vector<half, kv_step * 2> v_meta_packed;
+                    cm_svm_block_read(reinterpret_cast<svmptr_t>(v_scale_base + (uint)kv_pos * 4), v_meta_packed);
+                    v_scale = v_meta_packed.select<kv_step, 2>(0);
+                    v_zp = v_meta_packed.select<kv_step, 2>(1);
                     matrix<uchar, REG_K, REG_N> Vmat_u8;
                     matrix<half, REG_K, REG_N> Vmat_nat;
                     matrix<half, REG_K / 2, REG_N * 2> temp2;
+                    // Region A's data pitch is always plain head_size*sizeof(KVElemT) (scale/zp
+                    // live in the separate region B above), already 16-byte-aligned -- b2dV's
+                    // hardware 2D block read is safe here unconditionally.
                     b2dV.set_block_y(kv_pos);
 #    pragma unroll
                     for (int k = REG_N * (wg_local_id - (local_size / 2)); k < padded_head_size; k += REG_N * (local_size / 2)) {
@@ -557,9 +594,13 @@ void sdpa_kernel_lsc(uint slm_K,
                      // mirrors sdpa_kernel_lsc_prefetch's own o_pitch_bytes param.
                      uint o_pitch_bytes = num_heads * head_size * sizeof(half),
                      // Int8 dequant scale/zero-point SVM pointers, only read when KVElemT=uchar --
-                     // see cm_int8_kv_decode.hpp. k_scale_base/k_zp_base are laid out
-                     // [kv_len/16, head_size] when k_by_channel, else [kv_len]; v_scale_base/
-                     // v_zp_base are always [kv_len] (V is always BY_TOKEN).
+                     // see cm_int8_kv_decode.hpp. Region-split cache layout (see
+                     // sdpa_accumulate_kv_source_slm's doc comment): k_scale_base/v_scale_base point
+                     // at the (batch, kv_head)'s own region-B sub-range, packed as interleaved
+                     // (scale, zp) half-pairs -- channel-contiguous within a 16-token group when
+                     // k_by_channel, else token-contiguous; v is always token-contiguous (V is
+                     // always BY_TOKEN). k_zp_base/v_zp_base are always k_scale_base+2/
+                     // v_scale_base+2 (passed for signature symmetry, unused).
                      svmptr_t k_scale_base [[type("svmptr_t")]] = 0,
                      svmptr_t k_zp_base [[type("svmptr_t")]] = 0,
                      svmptr_t v_scale_base [[type("svmptr_t")]] = 0,
@@ -1398,6 +1439,10 @@ void sdpa_kernel_lsc_2src_slm(uint slm_K,
     // SAME online-softmax accumulators across both calls, numerically equivalent to one pass over
     // concat(cache, current) -- see this function's doc comment for why current doesn't need (and
     // no longer pays for) cache's SLM ring / work-group-uniform skip-LOAD machinery.
+    //
+    // The cache source always uses the region-split layout (see
+    // sdpa_accumulate_kv_source_slm's doc comment) -- matches kv_cache_write.cm's /
+    // cm_sdpa_opt_prefill_dualsource.cm's embedded scale/zp convention.
     sdpa_accumulate_kv_source_slm<false, head_size, sparse_block_size, CacheElemT, cache_by_channel>(
         slm_K, slm_V, wg_local_id, local_size, kv_len_cache, k_pitch_bytes_cache, v_pitch_bytes_cache,
         k_base_cache, v_base_cache, k_scale_base_cache, k_zp_base_cache, v_scale_base_cache, v_zp_base_cache,

@@ -24,10 +24,16 @@ from kv_cache_quant_utils import DEFAULT_SUB_BLOCK_SIZE, quant_per_channel_parts
 
 __all__ = [
     "DEFAULT_SUB_BLOCK_SIZE",
+    "TRANSPOSE_ORDER_IDENTITY",
+    "TRANSPOSE_ORDER_SWAPPED",
     "encode_k_by_channel",
     "dequant_k_by_channel",
     "encode_by_token",
     "dequant_by_token",
+    "encode_cache_by_token",
+    "dequant_cache_by_token",
+    "encode_cache_k_by_channel",
+    "dequant_cache_k_by_channel",
 ]
 
 
@@ -84,6 +90,110 @@ def dequant_by_token(v_u8: torch.Tensor, v_scale: torch.Tensor, v_zp: torch.Tens
     return ((v_f - zp_r) * scale_r).to(torch.half)
 
 
+TRANSPOSE_ORDER_IDENTITY = 0  # [B, H, S, D]  -- OCL SDPA default order
+TRANSPOSE_ORDER_SWAPPED = 1   # [B, S, H, D]  -- {0,2,1,3} heads<->seq swap fused in
+
+
+def _to_physical_region_a(u8: torch.Tensor, order: int) -> torch.Tensor:
+    """u8: [B, Hkv, S, D] uint8. SWAPPED -> token-major/heads-interleaved [B, S, Hkv, D] (the real
+    primitive's own convention, see cm_sdpa_opt_prefill_dualsource.cm's module docstring);
+    IDENTITY -> left as [B, Hkv, S, D] (heads-major, matching the plain fp16 path's own
+    K_TRANSPOSE_ORDER/V_TRANSPOSE_ORDER==IDENTITY layout). Mirrors test_sdpa_prefill.py's
+    to_physical, inlined here to keep this module test-infra-independent."""
+    if order == TRANSPOSE_ORDER_SWAPPED:
+        return u8.transpose(1, 2).contiguous()
+    return u8.contiguous()
+
+
+def _from_physical_region_a(region_a_flat: torch.Tensor, order: int, B: int, Hkv: int, S: int, D: int) -> torch.Tensor:
+    """Inverse of _to_physical_region_a. region_a_flat: [B, S*Hkv*D] uint8. Returns [B, Hkv, S, D]."""
+    if order == TRANSPOSE_ORDER_SWAPPED:
+        return region_a_flat.reshape(B, S, Hkv, D).transpose(1, 2).contiguous()
+    return region_a_flat.reshape(B, Hkv, S, D).contiguous()
+
+
+def encode_cache_by_token(v: torch.Tensor, order: int = TRANSPOSE_ORDER_SWAPPED) -> torch.Tensor:
+    """BY_TOKEN quantization for the region-split cache layout `cm_sdpa_opt_prefill.cm`,
+    `cm_sdpa_opt_prefill_dualsource.cm`, and `kv_cache_write.cm` all share -- the real OpenVINO
+    BlockSparseAttention primitive's design (see those files' module docstrings). The buffer is
+    split into two contiguous regions instead of interleaving a widened per-token entry: region A
+    (`[kv_len, num_kv_heads, D]` when order==SWAPPED, byte-identical to the plain fp16 path's own
+    K_TRANSPOSE_ORDER/V_TRANSPOSE_ORDER convention) holds every token's quantized data; region B
+    (`[num_kv_heads, kv_len]` packed (scale, zp) half-pairs, head-major, TOKEN-CONTIGUOUS within a
+    head -- always this ONE layout regardless of `order`, matching kv_cache_write.cm's own
+    order-agnostic region B) is appended immediately after region A.
+
+    v: [B, Hkv, kv_len, D] half. Returns packed [B, kv_len*Hkv*D + Hkv*kv_len*4] uint8 (flat,
+    per-batch region A then region B).
+    """
+    B, Hkv, S, D = v.shape
+    v_u8, v_scale, v_zp = encode_by_token(v)
+    region_a = _to_physical_region_a(v_u8, order).reshape(B, S * Hkv * D)
+    # Region B: head-major, token-contiguous, interleaved (scale, zp) half-pairs.
+    scale_bytes = v_scale.contiguous().view(torch.uint8).reshape(B, Hkv, S, 2)
+    zp_bytes = v_zp.contiguous().view(torch.uint8).reshape(B, Hkv, S, 2)
+    region_b = torch.empty(B, Hkv, S, 4, dtype=torch.uint8)
+    region_b[..., 0:2] = scale_bytes
+    region_b[..., 2:4] = zp_bytes
+    region_b = region_b.reshape(B, Hkv * S * 4)
+    return torch.cat([region_a, region_b], dim=-1)
+
+
+def dequant_cache_by_token(packed: torch.Tensor, kv_len: int, head_size: int, num_kv_heads: int,
+                            order: int = TRANSPOSE_ORDER_SWAPPED) -> torch.Tensor:
+    """Inverse of encode_cache_by_token. packed: [B, kv_len*Hkv*D + Hkv*kv_len*4] uint8. Returns
+    [B, Hkv, kv_len, D] half."""
+    B = packed.shape[0]
+    D, Hkv, S = head_size, num_kv_heads, kv_len
+    region_a_size = S * Hkv * D
+    v_u8 = _from_physical_region_a(packed[:, :region_a_size], order, B, Hkv, S, D)
+    region_b = packed[:, region_a_size:].reshape(B, Hkv, S, 4)
+    v_scale = region_b[..., 0:2].contiguous().view(torch.half).reshape(B, Hkv, S)
+    v_zp = region_b[..., 2:4].contiguous().view(torch.half).reshape(B, Hkv, S)
+    return dequant_by_token(v_u8, v_scale, v_zp)
+
+
+def encode_cache_k_by_channel(k: torch.Tensor, group_size: int = DEFAULT_SUB_BLOCK_SIZE,
+                               order: int = TRANSPOSE_ORDER_SWAPPED) -> torch.Tensor:
+    """BY_CHANNEL quantization for the region-split cache layout (K only -- V is always
+    `encode_cache_by_token`), matching the real OpenVINO BlockSparseAttention primitive's design.
+    Region A is the same `[kv_len, num_kv_heads, D]`-when-SWAPPED layout `encode_cache_by_token`
+    uses; region B is `[num_kv_heads, kv_len/group_size, D]` packed (scale, zp) half-pairs,
+    head-major then GROUP-major then CHANNEL-contiguous within a group (always this ONE layout
+    regardless of `order`, same as `encode_cache_by_token`'s region B).
+
+    k: [B, Hkv, kv_len, D] half. Returns packed [B, kv_len*Hkv*D + Hkv*(kv_len/group_size)*D*4]
+    uint8.
+    """
+    B, Hkv, S, D = k.shape
+    k_u8, k_scale, k_zp = encode_k_by_channel(k, sub_block_size=group_size)
+    num_groups = S // group_size
+    region_a = _to_physical_region_a(k_u8, order).reshape(B, S * Hkv * D)
+    scale_bytes = k_scale.contiguous().view(torch.uint8).reshape(B, Hkv, num_groups, D, 2)
+    zp_bytes = k_zp.contiguous().view(torch.uint8).reshape(B, Hkv, num_groups, D, 2)
+    region_b = torch.empty(B, Hkv, num_groups, D, 4, dtype=torch.uint8)
+    region_b[..., 0:2] = scale_bytes
+    region_b[..., 2:4] = zp_bytes
+    region_b = region_b.reshape(B, Hkv * num_groups * D * 4)
+    return torch.cat([region_a, region_b], dim=-1)
+
+
+def dequant_cache_k_by_channel(packed: torch.Tensor, kv_len: int, head_size: int, num_kv_heads: int,
+                                group_size: int = DEFAULT_SUB_BLOCK_SIZE,
+                                order: int = TRANSPOSE_ORDER_SWAPPED) -> torch.Tensor:
+    """Inverse of encode_cache_k_by_channel. packed:
+    [B, kv_len*Hkv*D + Hkv*(kv_len/group_size)*D*4] uint8. Returns [B, Hkv, kv_len, D] half."""
+    B = packed.shape[0]
+    D, Hkv, S = head_size, num_kv_heads, kv_len
+    num_groups = S // group_size
+    region_a_size = S * Hkv * D
+    k_u8 = _from_physical_region_a(packed[:, :region_a_size], order, B, Hkv, S, D)
+    region_b = packed[:, region_a_size:].reshape(B, Hkv, num_groups, D, 4)
+    k_scale = region_b[..., 0:2].contiguous().view(torch.half).reshape(B, Hkv, num_groups, D)
+    k_zp = region_b[..., 2:4].contiguous().view(torch.half).reshape(B, Hkv, num_groups, D)
+    return dequant_k_by_channel(k_u8, k_scale, k_zp, sub_block_size=group_size)
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     k = (torch.randn(1, 2, 32, 8) * 3).to(torch.half)
@@ -95,3 +205,13 @@ if __name__ == "__main__":
     v_u8, v_scale, v_zp = encode_by_token(v)
     v_rt = dequant_by_token(v_u8, v_scale, v_zp)
     print("by-token max abs err:", (v.to(torch.float32) - v_rt.to(torch.float32)).abs().max().item())
+
+    v_packed = encode_cache_by_token(v)
+    v_cache_rt = dequant_cache_by_token(v_packed, kv_len=32, head_size=8, num_kv_heads=2)
+    print("cache by-token (region-split) max abs err:",
+          (v.to(torch.float32) - v_cache_rt.to(torch.float32)).abs().max().item())
+
+    k_packed = encode_cache_k_by_channel(k, group_size=16)
+    k_cache_rt = dequant_cache_k_by_channel(k_packed, kv_len=32, head_size=8, num_kv_heads=2, group_size=16)
+    print("cache by-channel (region-split) max abs err:",
+          (k.to(torch.float32) - k_cache_rt.to(torch.float32)).abs().max().item())

@@ -35,25 +35,50 @@
 // and current buffers (both are addressed via the same get_seq_pitch_bytes/get_head_byte_offset
 // helpers, just with each source's own kv_len).
 //
-// KV_CACHE_COMPRESSION (default 0=NONE, matches pageatten/test_pa.py's own
-// KV_CACHE_COMPRESSION_{NONE,BY_TOKEN,BY_CHANNEL} enum/JIT-constant convention): when 1 or 2,
-// key_cache/value_cache are read as int8-packed bytes (1 byte/element, affine uint8 quantization --
-// see cm_int8_kv_decode.hpp) instead of plain half, decoded to half once per work-group and staged
-// through SLM -- same scheme and same SLM/barrier pipeline cm_sdpa_opt_prefill.cm's
-// KV_CACHE_COMPRESSION now uses (sdpa_kernel_lsc_2src_slm calls the SAME
-// sdpa_accumulate_kv_source_slm that backs sdpa_kernel_lsc). K is quantized BY_CHANNEL when ==2 or
-// BY_TOKEN when ==1; V is always BY_TOKEN regardless of mode. Only the cache source is ever
-// affected; key_cur/value_cur always stay plain half (current is transient, quantizing it buys no
-// persistent-memory win -- see
-// flashvsr_dit_kvcache_int8_3slot_fused_dualsource_design_zh.md Sec 3.1's identical rationale for
-// the analogous int8 design). The physical cache buffer is then 1 byte/element, so its own
-// pitch/offset must be computed at elem_size=sizeof(uchar) (see kv_cache_elem_size below) --
-// current's pitch/offset are untouched (still implicitly sizeof(half) via the 1-arg template call).
+// KV_CACHE_COMPRESSION's `key_cache`/`value_cache` buffer is split into two contiguous regions
+// (see this file's KV_CACHE_COMPRESSION doc comment below): region A (quantized data, same
+// addressing as the plain fp16 path) and region B (scale/zp, head-major/token-or-group-contiguous).
+// Only the PER-BATCH stride (`k_batch_off_cache`/`v_batch_off_cache`, via get_batch_byte_stride)
+// still uses the full `head_size+4` width -- that is the true total per-batch buffer size (region A
+// + region B together). The intra-batch region-A seq-pitch/head-offset calls
+// (`k_seq_pitch_cache`/`k_off_cache` etc.) use the LOGICAL `head_size` alone, byte-identical to the
+// uncompressed path -- see `cache_head_size`/`cache_head_size_for_batch_stride` below. This matches
+// kv_cache_write.cm's identical region A/B split, which produces this exact buffer.
+//
+// KV_CACHE_COMPRESSION (default 0=NONE, 1=BY_TOKEN, 2=BY_CHANNEL, K only -- V stays BY_TOKEN
+// regardless): key_cache/value_cache are read as int8-packed bytes (1 byte/element, affine uint8
+// quantization -- see cm_int8_kv_decode.hpp) instead of plain half, decoded to half once per
+// work-group and staged through SLM via sdpa_kernel_lsc_2src_slm (the same
+// sdpa_accumulate_kv_source_slm pipeline cm_sdpa_opt_prefill.cm's own KV_CACHE_COMPRESSION branch
+// uses). Only the cache source is ever affected; key_cur/value_cur always stay plain half (current
+// is transient, quantizing it buys no persistent-memory win). K is quantized BY_CHANNEL when ==2
+// (one affine scale/zp pair per 16-token group per head_size channel, PagedAttention's
+// `is_key_by_channel` convention) or BY_TOKEN when ==1 (one pair per token). `key_cache`/
+// `value_cache`'s buffer is split into two contiguous regions instead of interleaving a widened
+// per-token entry: region A (token-major/heads-interleaved, logical `head_size` pitch --
+// byte-identical addressing to the plain fp16 path, same for both K modes) holds every token's
+// quantized data; region B holds every token's packed (scale, zero-point) half-pair, immediately
+// after region A -- BY_TOKEN's region B is head-major, TOKEN-CONTIGUOUS within a head (so
+// sdpa_accumulate_kv_source_slm's walk can fetch many consecutive tokens' metadata with one
+// vectorized block read); BY_CHANNEL's region B is `[Hkv, Lk_cache/16, head_size]`, head-major then
+// GROUP-major then CHANNEL-contiguous within a group (so the same walk can fetch many consecutive
+// CHANNELS' metadata, shared across a whole 16-token group, with one vectorized block read -- see
+// cm_sdpa_common.hpp's load_slm_KV, kv_step==16 exactly matches the group size so each
+// load_slm_KV(kv_pos) call handles exactly one group). There is no separate key_cache_scale/
+// key_cache_zp kernel parameter; `key_cache`/`value_cache` carry everything -- only the byte layout
+// within them changed. Total buffer size is unchanged (kv_len_cache*num_kv_heads*(head_size+4)
+// bytes either way, independent of K's mode -- region A is always head_size*kv_len_cache elements,
+// region B is always 4 bytes/token amortized: BY_CHANNEL's region B is 4*head_size bytes per
+// 16-token group = 4 bytes/token average, same total as BY_TOKEN's 4 bytes/token exactly). This
+// differs from PagedAttention's own packing (which appends scale/zp after a whole head's per-BLOCK
+// data, since PA's cache is head-major within a block) because this op's cache DATA region stays
+// token-major with heads interleaved -- only the METADATA region adopts a head-major arrangement --
+// see flashvsr_dit_kvcache_int8_3slot_fused_dualsource_design_zh.md Sec 3.1's identical rationale.
 // When ==0 (no quantization on either source), the kernel instead dispatches to the barrier-free,
 // non-SLM sdpa_kernel_lsc_prefetch_2src (cm_sdpa_common.hpp) -- there is nothing to decode-amortize
 // in that case, so paying for sdpa_kernel_lsc_2src_slm's SLM/barrier pipeline would be pure
-// overhead. This mirrors cm_sdpa_opt_prefill.cm's own KV_CACHE_COMPRESSION fork (sdpa_kernel_lsc for
-// int8, sdpa_kernel_lsc_prefetch for fp16) -- see the call site below.
+// overhead. This mirrors cm_sdpa_opt_prefill.cm's own KV_CACHE_COMPRESSION fork (sdpa_kernel_lsc
+// for int8, sdpa_kernel_lsc_prefetch for fp16) -- see the call site below.
 #include "cm_sdpa_common.hpp"
 #include "cm_sdpa_opt_common.hpp"
 
@@ -70,6 +95,9 @@ static_assert(SPARSE_BLOCK_SIZE > 1, "cm_sdpa_opt_prefill_dualsource.cm requires
 #ifndef KV_CACHE_COMPRESSION
 #define KV_CACHE_COMPRESSION 0
 #endif
+static_assert(KV_CACHE_COMPRESSION == 0 || KV_CACHE_COMPRESSION == 1 || KV_CACHE_COMPRESSION == 2,
+              "cm_sdpa_opt_prefill_dualsource.cm implements KV_CACHE_COMPRESSION 0 (NONE), 1 "
+              "(BY_TOKEN), or 2 (BY_CHANNEL, K only -- V stays BY_TOKEN regardless).");
 
 _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
@@ -88,18 +116,7 @@ _GENX_MAIN_ void KERNEL_NAME(
     bool* sparse_block_mask [[type("svmptr_t")]],
     int num_q_blocks,
     int num_k_blocks_cache,
-    int num_k_blocks_cur
-#if KV_CACHE_COMPRESSION
-    // Int8 cache dequant scale/zero-point tensors -- see cm_int8_kv_decode.hpp and int8_kv_ref.py
-    // (the host-side encode reference). key_cache_scale/key_cache_zp are [kv_len_cache/16, head_size]
-    // when KV_CACHE_COMPRESSION==2 (BY_CHANNEL) or [kv_len_cache] when ==1 (BY_TOKEN);
-    // value_cache_scale/value_cache_zp are always [kv_len_cache] (V is always BY_TOKEN).
-    , half* key_cache_scale [[type("svmptr_t")]]
-    , half* key_cache_zp [[type("svmptr_t")]]
-    , half* value_cache_scale [[type("svmptr_t")]]
-    , half* value_cache_zp [[type("svmptr_t")]]
-#endif
-    ) {
+    int num_k_blocks_cur) {
     constexpr int num_heads = CMFLA_NUM_HEADS;
     constexpr int num_kv_heads = CMFLA_NUM_KV_HEADS;
     constexpr int head_size = CMFLA_HEAD_SIZE;
@@ -124,28 +141,36 @@ _GENX_MAIN_ void KERNEL_NAME(
     // macro.
 #if KV_CACHE_COMPRESSION
     constexpr int kv_cache_elem_size = sizeof(uchar);
+    // Region A (quantized data) keeps the LOGICAL `head_size` pitch -- byte-identical addressing to
+    // the plain fp16 path, see this file's KV_CACHE_COMPRESSION doc comment. Only the PER-BATCH
+    // stride needs the ADJUSTED `head_size+4` width: that is the true total size of one batch's
+    // region-A+region-B chunk (see cache_head_size_for_batch_stride below).
+    constexpr int cache_head_size = head_size;
+    constexpr int cache_head_size_for_batch_stride = head_size + 4;
 #else
     constexpr int kv_cache_elem_size = sizeof(half);
+    constexpr int cache_head_size = head_size;
+    constexpr int cache_head_size_for_batch_stride = head_size;
 #endif
 
     uint q_seq_pitch = get_seq_pitch_bytes<Q_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
-    uint k_seq_pitch_cache = get_seq_pitch_bytes<K_TRANSPOSE_ORDER, kv_cache_elem_size>(kv_len_cache, num_kv_heads, head_size);
-    uint v_seq_pitch_cache = get_seq_pitch_bytes<V_TRANSPOSE_ORDER, kv_cache_elem_size>(kv_len_cache, num_kv_heads, head_size);
+    uint k_seq_pitch_cache = get_seq_pitch_bytes<K_TRANSPOSE_ORDER, kv_cache_elem_size>(kv_len_cache, num_kv_heads, cache_head_size);
+    uint v_seq_pitch_cache = get_seq_pitch_bytes<V_TRANSPOSE_ORDER, kv_cache_elem_size>(kv_len_cache, num_kv_heads, cache_head_size);
     uint k_seq_pitch_cur = get_seq_pitch_bytes<K_TRANSPOSE_ORDER>(kv_len_cur, num_kv_heads, head_size);
     uint v_seq_pitch_cur = get_seq_pitch_bytes<V_TRANSPOSE_ORDER>(kv_len_cur, num_kv_heads, head_size);
     uint o_seq_pitch = get_seq_pitch_bytes<OUTPUT_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
 
     uint q_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
-    uint k_batch_off_cache = (uint)b * get_batch_byte_stride(kv_len_cache, num_kv_heads, head_size, kv_cache_elem_size);
-    uint v_batch_off_cache = (uint)b * get_batch_byte_stride(kv_len_cache, num_kv_heads, head_size, kv_cache_elem_size);
+    uint k_batch_off_cache = (uint)b * get_batch_byte_stride(kv_len_cache, num_kv_heads, cache_head_size_for_batch_stride, kv_cache_elem_size);
+    uint v_batch_off_cache = (uint)b * get_batch_byte_stride(kv_len_cache, num_kv_heads, cache_head_size_for_batch_stride, kv_cache_elem_size);
     uint k_batch_off_cur = (uint)b * get_batch_byte_stride(kv_len_cur, num_kv_heads, head_size);
     uint v_batch_off_cur = (uint)b * get_batch_byte_stride(kv_len_cur, num_kv_heads, head_size);
     uint o_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
 
     uint q_off = q_batch_off + get_head_byte_offset<Q_TRANSPOSE_ORDER>(h, q_len, head_size)
                  + (uint)q_start * q_seq_pitch;
-    uint k_off_cache = k_batch_off_cache + get_head_byte_offset<K_TRANSPOSE_ORDER, kv_cache_elem_size>(hkv, kv_len_cache, head_size);
-    uint v_off_cache = v_batch_off_cache + get_head_byte_offset<V_TRANSPOSE_ORDER, kv_cache_elem_size>(hkv, kv_len_cache, head_size);
+    uint k_off_cache = k_batch_off_cache + get_head_byte_offset<K_TRANSPOSE_ORDER, kv_cache_elem_size>(hkv, kv_len_cache, cache_head_size);
+    uint v_off_cache = v_batch_off_cache + get_head_byte_offset<V_TRANSPOSE_ORDER, kv_cache_elem_size>(hkv, kv_len_cache, cache_head_size);
     uint k_off_cur = k_batch_off_cur + get_head_byte_offset<K_TRANSPOSE_ORDER>(hkv, kv_len_cur, head_size);
     uint v_off_cur = v_batch_off_cur + get_head_byte_offset<V_TRANSPOSE_ORDER>(hkv, kv_len_cur, head_size);
     uint o_off = o_batch_off + get_head_byte_offset<OUTPUT_TRANSPOSE_ORDER>(h, q_len, head_size)
@@ -179,8 +204,9 @@ _GENX_MAIN_ void KERNEL_NAME(
 
     // sparse_block_mask row for this work-item's (batch,q_head,q_block), split at
     // num_k_blocks_cache into the two sources' own sub-ranges (see cm_sdpa_common.hpp's
-    // sdpa_accumulate_kv_source_slm: each source indexes `kv_base >> sb_shift` relative to its own
-    // pointer, so the current source's pointer is pre-offset here by num_k_blocks_cache blocks).
+    // sdpa_kernel_lsc_2src_slm/sdpa_kernel_lsc_prefetch_2src: each source indexes
+    // `kv_base >> sb_shift` relative to its own pointer, so the current source's pointer is
+    // pre-offset here by num_k_blocks_cache blocks).
     int num_k_blocks_total = num_k_blocks_cache + num_k_blocks_cur;
     svmptr_t sparse_mask_cache = 0;
     svmptr_t sparse_mask_cur = 0;
@@ -223,24 +249,36 @@ _GENX_MAIN_ void KERNEL_NAME(
 #endif
 #endif
 
-    // Int8 cache scale/zp pointers, offset to this (batch,kv_head) same as key_cache/value_cache
-    // themselves -- see cm_sdpa_opt_prefill.cm's identical k_meta_off/v_meta_off computation for
-    // why this is plain [B,Hkv,...] element arithmetic, not get_seq_pitch_bytes/
-    // get_head_byte_offset (no meaningful "swapped" layout for quantization metadata).
-#if KV_CACHE_COMPRESSION == 2
-    int num_k_sub_blocks_cache = (kv_len_cache + 15) / 16;
-    uint k_meta_off_cache = ((uint)b * num_kv_heads + (uint)hkv) * (uint)num_k_sub_blocks_cache * (uint)head_size;
-#elif KV_CACHE_COMPRESSION == 1
-    uint k_meta_off_cache = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len_cache;
-#else
-    uint k_meta_off_cache = 0;
-#endif
+    // Int8 cache scale/zp pointers: region B, immediately after region A within the SAME
+    // key_cache/value_cache buffer -- see this file's header comment. V's region B (and K's when
+    // BY_TOKEN) is head-major, TOKEN-CONTIGUOUS within a head: for this (batch, kv_head), region B's
+    // own per-head sub-range starts at `*_batch_off_cache + region_a_size_cache +
+    // hkv*region_b_head_stride_cache` and holds kv_len_cache consecutive packed (scale, zp)
+    // half-pairs, one per token. K's region B when BY_CHANNEL is instead head-major then GROUP-major
+    // then CHANNEL-contiguous within a group: `region_b_head_stride_cache` becomes
+    // `(kv_len_cache/16)*head_size*4` bytes (one packed pair per channel per 16-token group), and
+    // `load_slm_KV` (cm_sdpa_common.hpp) adds `(kv_pos/16)*head_size*4 + k*4` bytes on top of this
+    // same per-head base pointer to reach a given group+channel-chunk -- so either way
+    // sdpa_accumulate_kv_source_slm can fetch many consecutive metadata entries (tokens for
+    // BY_TOKEN, channels for BY_CHANNEL) with ONE vectorized block read -- see that function's doc
+    // comment in cm_sdpa_common.hpp.
 #if KV_CACHE_COMPRESSION
-    uint v_meta_off_cache = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len_cache;
-    svmptr_t k_scale_ptr_cache = reinterpret_cast<svmptr_t>(key_cache_scale + k_meta_off_cache);
-    svmptr_t k_zp_ptr_cache = reinterpret_cast<svmptr_t>(key_cache_zp + k_meta_off_cache);
-    svmptr_t v_scale_ptr_cache = reinterpret_cast<svmptr_t>(value_cache_scale + v_meta_off_cache);
-    svmptr_t v_zp_ptr_cache = reinterpret_cast<svmptr_t>(value_cache_zp + v_meta_off_cache);
+    // kv_len_cache is this ring cache's fixed physical token-row capacity, so it doubles as region
+    // A's token count here -- no separate LK_CACHE JIT constant is needed on this (read) side,
+    // unlike the write kernel (kv_cache_write.cm), which has no equivalent runtime parameter.
+    uint region_a_size_cache = (uint)kv_len_cache * (uint)num_kv_heads * (uint)head_size;
+#if KV_CACHE_COMPRESSION == 2
+    uint region_b_head_stride_k_cache = (uint)(kv_len_cache / 16) * (uint)head_size * 4;
+#else
+    uint region_b_head_stride_k_cache = (uint)kv_len_cache * 4;
+#endif
+    uint region_b_head_stride_v_cache = (uint)kv_len_cache * 4;
+    svmptr_t k_region_b_base = reinterpret_cast<svmptr_t>((uint8_t*)key_cache + k_batch_off_cache + region_a_size_cache + hkv * region_b_head_stride_k_cache);
+    svmptr_t v_region_b_base = reinterpret_cast<svmptr_t>((uint8_t*)value_cache + v_batch_off_cache + region_a_size_cache + hkv * region_b_head_stride_v_cache);
+    svmptr_t k_scale_ptr_cache = k_region_b_base;
+    svmptr_t k_zp_ptr_cache = k_region_b_base + 2;
+    svmptr_t v_scale_ptr_cache = v_region_b_base;
+    svmptr_t v_zp_ptr_cache = v_region_b_base + 2;
 #else
     svmptr_t k_scale_ptr_cache = 0, k_zp_ptr_cache = 0, v_scale_ptr_cache = 0, v_zp_ptr_cache = 0;
 #endif

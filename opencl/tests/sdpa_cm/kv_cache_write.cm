@@ -6,44 +6,64 @@
 // value_cur, one whole `tokens_per_group`-token temporal group at a time) into `cache` (the ring-
 // buffer-backed key_cache/value_cache) at the physical slot given by `write_indices[g]`, in place.
 // One compiled/dispatched instance for K, one for V (same source, different buffers/dims), same as
-// the real BlockSparseAttention primitive's `ring_write_k`/`ring_write_v` stages, which run
+// the real BlockSparseAttention primitive's `cache_write_k`/`cache_write_v` stages, which run
 // strictly AFTER the prefill stage has read the cache for this chunk (never before -- so a chunk's
 // own new tokens never leak into its own attention read; see test_kv_cache_write.py's ordering
 // test).
 //
-// JIT constants: NUM_KV_HEADS, HEAD_SIZE (CACHE_WRITE_DIM = NUM_KV_HEADS*HEAD_SIZE is derived, not
-// itself a JIT constant -- matches how cm_sdpa_opt_prefill_dualsource.cm derives its own per-head
-// pitches from NUM_KV_HEADS/HEAD_SIZE rather than taking a flat width directly), CACHE_COMPRESSION
-// (default 0=NONE/plain half, matching every other KV_*_CACHE_COMPRESSION JIT-constant convention
-// in this project; 1=BY_TOKEN, 2=BY_CHANNEL), SUB_BLOCK_SIZE (default 16, BY_CHANNEL granularity --
-// must match cm_sdpa_opt_prefill_dualsource.cm's/cm_int8_kv_decode.hpp's own hardcoded 16),
-// NUM_SLOTS (only required when CACHE_COMPRESSION != 0 -- the cache's total physical slot count,
-// needed to size the cache_scale/cache_zp meta-buffer stride; the fp16 path never needs it, `cache`
-// is addressed purely via write_indices there).
-// GWS/LWS: see the two CACHE_COMPRESSION branches below (each documents its own dispatch).
+// JIT constants: NUM_KV_HEADS, HEAD_SIZE (the LOGICAL per-head data width; CACHE_WRITE_DIM =
+// NUM_KV_HEADS*HEAD_SIZE is derived, not itself a JIT constant -- matches how
+// cm_sdpa_opt_prefill_dualsource.cm derives its own per-head pitches from NUM_KV_HEADS/HEAD_SIZE
+// rather than taking a flat width directly), CACHE_COMPRESSION (default 0=NONE/plain half,
+// 1=BY_TOKEN, 2=BY_CHANNEL -- K only, never emitted for the V instance; GROUP_SIZE, default 16, the
+// BY_CHANNEL quantization group size, matching PagedAttention's `is_key_by_channel` convention).
+// Every CACHE_COMPRESSION variant (including plain fp16) additionally takes an `lk_cache` RUNTIME
+// scalar (not a JIT constant -- `cache`'s own Lk_cache dimension can be declared dynamic on the
+// graph, so this is read fresh every dispatch, same as cm_sdpa_opt_prefill_dualsource.cm's
+// kv_len_cache) carrying the cache's total physical token-row count (num_slots*tokens_per_group):
+// the compressed variants need it to locate region B's base offset/per-head stride (see
+// region_b_base/region_b_head_stride below), and ALL variants use it to bounds-check
+// `write_indices[g]` before scatter-writing -- an out-of-range slot (corrupted index tensor, stale
+// host-side ring-buffer computation) must not write past `cache`'s allocated buffer. GWS/LWS: see
+// the three CACHE_COMPRESSION branches below (each documents its own dispatch).
 //
-// CACHE_COMPRESSION: this repo's own local extension -- there is no upstream counterpart (openvino's
-// ring_write_k/_v only ever write fp16; openvino dropped int8/fp8 KV-cache entirely in this same
-// redesign). `updates` (key_cur/value_cur) is NEVER quantized here regardless of this flag -- only
+// `updates` (key_cur/value_cur) is NEVER quantized here regardless of CACHE_COMPRESSION -- only
 // `cache` ever is, matching KV_CACHE_COMPRESSION's identical cache-only-quantization convention in
-// cm_sdpa_opt_prefill_dualsource.cm and K_CACHE_COMPRESSION's in draft_block_mask_pool.cm.
-// Quantization statistics are computed PER (kv_head, token-or-sub-block, group) -- never spanning
-// multiple kv heads -- so the written scale/zp buffers land in exactly the layout
-// cm_sdpa_opt_prefill_dualsource.cm's key_cache_scale/key_cache_zp (BY_CHANNEL:
-// [NUM_KV_HEADS, kv_len_cache/16, HEAD_SIZE]; BY_TOKEN: [NUM_KV_HEADS, kv_len_cache], where
-// kv_len_cache = num_slots*tokens_per_group) already expect to read, with no batch dim (this
-// project's BlockSparseAttention cache-write workload, like upstream's, is always batch=1).
+// cm_sdpa_opt_prefill_dualsource.cm and K_CACHE_COMPRESSION's in draft_block_mask_pool.cm. When
+// CACHE_COMPRESSION!=0, `cache` is `uchar`-typed and split into two contiguous regions instead of
+// interleaving a widened per-token entry: region A (`[LK_CACHE, NUM_KV_HEADS, HEAD_SIZE]`,
+// token-major/heads-interleaved, byte-identical addressing to the plain fp16 path, the SAME for
+// both modes) holds every token's quantized data; region B holds every token's packed (scale,
+// zero-point) half-pair, immediately after region A -- BY_TOKEN's region B is
+// `[NUM_KV_HEADS, LK_CACHE]`, head-major, TOKEN-CONTIGUOUS within a head; BY_CHANNEL's region B is
+// `[NUM_KV_HEADS, LK_CACHE/GROUP_SIZE, HEAD_SIZE]`, head-major then GROUP-major then
+// CHANNEL-CONTIGUOUS within a group -- either way a reader can fetch many consecutive metadata
+// entries (tokens for BY_TOKEN, channels for BY_CHANNEL) with one vectorized block read instead of
+// one scalar read at a time (see cm_sdpa_common.hpp's sdpa_accumulate_kv_source_slm, the reader this
+// feeds). There is no separate cache_scale/cache_zp parameter; `cache` still carries everything --
+// only the byte layout within it changed. Total buffer size is unchanged (LK_CACHE*NUM_KV_HEADS*
+// (HEAD_SIZE+4) bytes either way, independent of mode -- region B is always 4 bytes/token amortized:
+// BY_CHANNEL's region B is 4*HEAD_SIZE bytes per GROUP_SIZE-token group = 4 bytes/token average,
+// same total as BY_TOKEN's 4 bytes/token exactly), so this is purely an addressing change, not a
+// shape/ABI change. This differs from PagedAttention's own packing (scale/zp appended after a whole
+// head's per-BLOCK data) because this op's cache data region stays token-major with heads
+// interleaved, not head-major within a block -- only the metadata region adopts a head-major
+// arrangement.
 //
-// Because a write is always a WHOLE group of `tokens_per_group` tokens landing in a WHOLE
-// destination slot, and every config this project uses has tokens_per_group as a multiple of
-// SUB_BLOCK_SIZE (16) (e.g. the production window_tokens=128), each written group's quantization
-// is entirely self-contained within that one group -- unlike PagedAttention's per-token
-// incremental cache update (pageatten/pa_kv_cache_update_ref.cm's process_quantization_per_channel/
-// process_quantization_per_token), there is no "stale tail / requantize" merge against
-// previously-written neighboring tokens to do. The max/min -> scale/zp affine-quant math below
-// (including the BY_CHANNEL small-qrange NaN guard) is the same proven formula
-// pa_kv_cache_update_ref.cm uses, adapted to this simpler whole-group case (no block-table/
-// dequant_size bookkeeping).
+// CACHE_COMPRESSION==1 (BY_TOKEN) quantization statistics are computed PER (kv_head, token) --
+// reducing across the HEAD_SIZE channel dimension; CACHE_COMPRESSION==2 (BY_CHANNEL) instead
+// computes them PER (kv_head, channel, GROUP_SIZE-token group) -- reducing across the GROUP_SIZE
+// token dimension, the opposite axis. Either way each written group's quantization is entirely
+// self-contained within that one group -- never spanning multiple kv heads, tokens (BY_TOKEN), or
+// quantization groups (BY_CHANNEL) -- unlike PagedAttention's per-token incremental cache update
+// (pageatten/pa_kv_cache_update_ref.cm's process_quantization_per_token), there is no "stale tail /
+// requantize" merge against previously-written neighboring tokens to do. BY_CHANNEL's write
+// granularity (tokens_per_group, asserted host-side to be a multiple of GROUP_SIZE) always aligns
+// with a whole number of GROUP_SIZE-token groups -- FlashVSR's own block_s==128 chunking guarantees
+// this (128 is a multiple of 16) -- so no group is ever split across two separate write calls either.
+// The max/min -> scale/zp affine-quant math below is the same proven formula
+// pageatten/pa_kv_cache_update_ref.cm's process_quantization_per_token uses, applied along whichever
+// axis the mode calls for.
 #include <cm/cm.h>
 #include <cm/cmtl.h>
 
@@ -54,29 +74,54 @@
 #ifndef CACHE_COMPRESSION
 #define CACHE_COMPRESSION 0
 #endif
-
-#ifndef SUB_BLOCK_SIZE
-#define SUB_BLOCK_SIZE 16
+static_assert(CACHE_COMPRESSION == 0 || CACHE_COMPRESSION == 1 || CACHE_COMPRESSION == 2,
+              "kv_cache_write.cm implements CACHE_COMPRESSION 0 (NONE), 1 (BY_TOKEN), or 2 "
+              "(BY_CHANNEL, K only -- the host test harness never requests CACHE_COMPRESSION==2 for "
+              "the V instance).");
+#ifndef GROUP_SIZE
+#define GROUP_SIZE 16
 #endif
 
+// This kernel source is compiled twice per chunk (K, V -- see test_kv_cache_write*.py's
+// build_cache_write_kernel* helpers) with a different KERNEL_NAME each time, and the two entry
+// points are routinely batched into ONE clBuildProgram call by this project's kernel-build
+// infrastructure (same mechanism documented in pageatten/draft_block_mask_pool.cm). CACHE_WRITE_DIM
+// must therefore live inside a namespace scoped to this kernel's own KERNEL_NAME -- otherwise it
+// would be defined at global scope twice across the batched K/V instances and fail to build with a
+// redefinition error.
+namespace KERNEL_NAME {
+
+// `updates`' (key_cur/value_cur, never compressed) per-token pitch -- always the LOGICAL,
+// unadjusted width. `cache`'s own region-A (quantized data) per-token pitch is IDENTICAL to this
+// when CACHE_COMPRESSION!=0 -- see this file's header comment -- so no separate "adjusted" pitch is
+// needed for the data region any more (only region B's addressing differs from region A's).
 constexpr uint CACHE_WRITE_DIM = (uint)NUM_KV_HEADS * (uint)HEAD_SIZE;
 
 #if CACHE_COMPRESSION == 0
 
-// Plain fp16 scatter-copy -- exact signature/GWS match to upstream's cache write-back primitive.
-// GWS: [CACHE_WRITE_DIM/16, tokens_per_group, n_new], LWS: [1,1,1] -- each work item copies one
-// 16-element channel chunk of one token of one group.
+// Plain fp16 scatter-copy. GWS: [CACHE_WRITE_DIM/16, tokens_per_group, n_new], LWS: [1,1,1] -- each
+// work item copies one 16-element channel chunk of one token of one group.
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     const half* updates [[type("svmptr_t")]],        // [n_new, tokens_per_group, CACHE_WRITE_DIM]
     const int32_t* write_indices [[type("svmptr_t")]], // [n_new]
     half* cache [[type("svmptr_t")]],                 // [num_slots, tokens_per_group, CACHE_WRITE_DIM], in-place
     uint32_t tokens_per_group,
-    uint32_t n_new) {
+    uint32_t n_new,
+    // The cache's total physical slot count (num_slots), needed to bounds-check `slot` below -- a
+    // RUNTIME scalar for the same reason the compressed variants' lk_cache is (see this file's
+    // header comment): `cache`'s own Lk_cache dimension can be declared dynamic on the graph.
+    uint32_t lk_cache) {
     uint c = cm_group_id(0) * 16;
     uint t = cm_group_id(1);
     uint g = cm_group_id(2);
 
     int slot = write_indices[g];
+    // Out-of-range `slot` (corrupted write_indices tensor, stale host-side ring-buffer computation)
+    // must not scatter-write past `cache`'s allocated buffer -- drop the work item instead of
+    // wrapping/overflowing the destination offset below.
+    if (slot < 0 || (uint)slot * tokens_per_group >= lk_cache) {
+        return;
+    }
 
     uint src_off = ((uint)g * tokens_per_group + t) * CACHE_WRITE_DIM + c;
     uint dst_off = ((uint)slot * tokens_per_group + t) * CACHE_WRITE_DIM + c;
@@ -86,33 +131,46 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     cm_ptr_store<int, 8>((int*)cache, dst_off * (uint)sizeof(half), v.format<int>());
 }
 
-#else
+#elif CACHE_COMPRESSION == 1  // BY_TOKEN
 
-// Int8 scatter-quantize (this repo's own extension, no upstream counterpart -- see file header).
-// `updates` stays half; `cache` is int8-packed, with separate `cache_scale`/`cache_zp` dequant
-// tensors.
+// Int8 scatter-quantize. `updates` stays half, read at the LOGICAL (unadjusted) CACHE_WRITE_DIM
+// pitch; `cache` is int8-packed and split into region A (quantized data) + region B (scale/zp) --
+// see this file's header comment. No separate cache_scale/cache_zp parameter.
 //
-// GWS/LWS, CACHE_COMPRESSION==1 (BY_TOKEN): [NUM_KV_HEADS, tokens_per_group, n_new],
-// LWS=[1,1,1] -- one work item quantizes one HEAD_SIZE-wide (kv_head, token) row.
-// GWS/LWS, CACHE_COMPRESSION==2 (BY_CHANNEL): [NUM_KV_HEADS, tokens_per_group/SUB_BLOCK_SIZE,
-// n_new], LWS=[1,1,1] -- one work item quantizes one (kv_head, 16-token sub-block) tile, one scale/
-// zp pair per HEAD_SIZE channel shared across those 16 tokens.
+// GWS/LWS: [NUM_KV_HEADS, tokens_per_group, n_new], LWS=[1,1,1] -- one work item quantizes one
+// HEAD_SIZE-wide (kv_head, token) row.
 extern "C" _GENX_MAIN_ void KERNEL_NAME(
     const half* updates [[type("svmptr_t")]],          // [n_new, tokens_per_group, CACHE_WRITE_DIM]
     const int32_t* write_indices [[type("svmptr_t")]],  // [n_new]
-    uchar* cache [[type("svmptr_t")]],                  // [num_slots, tokens_per_group, CACHE_WRITE_DIM], in-place
-    half* cache_scale [[type("svmptr_t")]],             // see file header for layout
-    half* cache_zp [[type("svmptr_t")]],
+    // Region A: [lk_cache, NUM_KV_HEADS, HEAD_SIZE] uchar, token-major/heads-interleaved, in-place.
+    // Region B: [NUM_KV_HEADS, lk_cache] packed half-pairs (scale, zp), immediately after region A.
+    uchar* cache [[type("svmptr_t")]],
     uint32_t tokens_per_group,
-    uint32_t n_new) {
+    uint32_t n_new,
+    // The cache's total physical token-row count (num_slots*tokens_per_group), needed to locate
+    // region B's base offset/per-head stride -- see this file's header comment. A RUNTIME scalar
+    // (not a JIT constant): `cache`'s own dimension can be declared dynamic on the graph
+    // (shape-specialized kernel builds would otherwise risk baking in a stale value if this were
+    // read once at kernel-build time instead of fresh on every dispatch -- same rationale as
+    // cm_sdpa_opt_prefill_dualsource.cm's kv_len_cache on the read side).
+    uint32_t lk_cache) {
     uint hkv = cm_group_id(0);
+    uint t = cm_group_id(1);
     uint g = cm_group_id(2);
     int slot = write_indices[g];
+    // Out-of-range `slot` (corrupted write_indices tensor, stale host-side ring-buffer computation)
+    // must not scatter-write past `cache`'s allocated buffer -- drop the work item instead of
+    // wrapping/overflowing the destination offsets below.
+    if (slot < 0 || (uint)slot * tokens_per_group >= lk_cache) {
+        return;
+    }
 
     constexpr int HEAD_SIZE_C = HEAD_SIZE;
-
-#if CACHE_COMPRESSION == 1
-    uint t = cm_group_id(1);
+    // Region A size (all lk_cache tokens x NUM_KV_HEADS heads x HEAD_SIZE quantized bytes) doubles
+    // as region B's base offset -- see this file's header comment. Region B's per-head stride is
+    // lk_cache*4 (one packed half-pair per token, token-contiguous within a head).
+    uint region_b_base = lk_cache * (uint)NUM_KV_HEADS * (uint)HEAD_SIZE_C;
+    uint region_b_head_stride = lk_cache * 4;
 
     vector<half, HEAD_SIZE_C> row;
     uint src_off = ((uint)g * tokens_per_group + t) * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
@@ -121,77 +179,135 @@ extern "C" _GENX_MAIN_ void KERNEL_NAME(
     half max_val = cm_reduced_max<half>(row);
     half min_val = cm_reduced_min<half>(row);
     half qrange = max_val - min_val;
-    float scale_val = qrange == (half)0.0f ? 1.0f : 255.0f / (float)qrange;
+    // Small-range guard, ported scalar-wise from pageatten/pa_kv_cache_update_ref.cm's
+    // process_quantization_per_channel (itself from the OCL impl's
+    // quantize_and_save_by_channel_block_with_requantize): avoid +-INF scale/zp when qrange is
+    // tiny-but-nonzero and the row's values sit far from zero (e.g. a near-flat/low-variance row)
+    // -- that would otherwise poison every subsequent dequant of this entry and, via online-softmax
+    // accumulation, the whole attention row that reads it. The exact-qrange==0 case is still routed
+    // to scale=1.0 directly, matching PA's `mask`-based override of the bumped-qrange result.
+    const bool qrange_is_zero = (qrange == (half)0.0f);
+    float min_range = ((float)max_val < 0.0f ? -(float)max_val : (float)max_val) * 0.1f;
+    float adjust_val = min_range > 1.0f ? min_range : 1.0f;
+    float qrange_f = (float)qrange;
+    if (qrange_f <= min_range) {
+        qrange_f += adjust_val;
+    }
+    float scale_val = qrange_is_zero ? 1.0f : 255.0f / qrange_f;
     half zp_val = (half)((0.0f - (float)min_val) * scale_val);
     vector<half, HEAD_SIZE_C> q = cm_mul<half>(row, (half)scale_val) + zp_val;
     q = cm_min<half>(cm_max<half>(q, (half)0.0f), (half)255.0f);
     vector<uchar, HEAD_SIZE_C> q_u8 = cm_rnde<uchar, HEAD_SIZE_C>(q);
 
+    // Region A: same addressing as the plain fp16 path (token-major, heads-interleaved, logical
+    // HEAD_SIZE pitch) -- see CACHE_WRITE_DIM's doc comment above its declaration.
     uint dst_tok = (uint)slot * tokens_per_group + t;
-    uint dst_off = dst_tok * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
-    cm_ptr_store<int, HEAD_SIZE_C / 4>((int*)cache, dst_off * (uint)sizeof(uchar), q_u8.format<int>());
+    uint dataA_off = dst_tok * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
+    cm_ptr_store<int, HEAD_SIZE_C / 4>((int*)cache, dataA_off * (uint)sizeof(uchar), q_u8.format<int>());
 
-    // cache_scale/cache_zp: [NUM_KV_HEADS, kv_len_cache] (kv_len_cache = NUM_SLOTS*tokens_per_group)
-    // -- dst_tok is already the flat cache-token index (slot*tokens_per_group+t), matching
-    // cm_sdpa_opt_prefill_dualsource.cm's key_cache_scale/zp BY_TOKEN layout exactly.
-    uint kv_len_cache = (uint)NUM_SLOTS * tokens_per_group;
-    uint meta_off = hkv * kv_len_cache + dst_tok;
-    cache_scale[meta_off] = (half)(1.0f / scale_val);
-    cache_zp[meta_off] = zp_val;
+    // Region B: head-major, token-contiguous -- read back by cm_sdpa_common.hpp's
+    // sdpa_accumulate_kv_source_slm at the identical offset via a vectorized block read.
+    uint metaB_off = region_b_base + hkv * region_b_head_stride + dst_tok * 4;
+    half* scale_ptr = (half*)(cache + metaB_off);
+    scale_ptr[0] = (half)(1.0f / scale_val);
+    scale_ptr[1] = zp_val;
+}
 
-#else  // CACHE_COMPRESSION == 2, BY_CHANNEL
-    uint sb = cm_group_id(1);
-    uint t0 = sb * (uint)SUB_BLOCK_SIZE;
+#elif CACHE_COMPRESSION == 2  // BY_CHANNEL, K only -- see this file's header comment
 
-    matrix<half, SUB_BLOCK_SIZE, HEAD_SIZE_C> in_data;
-#pragma unroll
-    for (int i = 0; i < SUB_BLOCK_SIZE; i++) {
-        uint src_off = ((uint)g * tokens_per_group + (t0 + (uint)i)) * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
-        in_data.row(i).format<int>() = cm_ptr_load<int, HEAD_SIZE_C / 2>((int*)updates, src_off * (uint)sizeof(half));
+// Int8 scatter-quantize, BY_CHANNEL: one scale/zp pair per channel, shared across a whole
+// GROUP_SIZE-token group (the opposite reduction axis from CACHE_COMPRESSION==1's per-token
+// reduction across HEAD_SIZE_C channels). `updates` stays half, read at the LOGICAL (unadjusted)
+// CACHE_WRITE_DIM pitch; `cache` is int8-packed and split into region A (quantized data) + region B
+// (scale/zp, head-major/GROUP-major/CHANNEL-contiguous) -- see this file's header comment.
+//
+// GWS/LWS: [NUM_KV_HEADS, tokens_per_group/GROUP_SIZE, n_new], LWS=[1,1,1] -- one work item
+// quantizes one whole GROUP_SIZE-token group of one (kv_head, slot). Relies on tokens_per_group
+// always being a multiple of GROUP_SIZE (the host test harness only ever drives this kernel with
+// FlashVSR-realistic block_s==128 chunking, a multiple of 16), so the destination's own
+// GROUP_SIZE-token range never straddles a write_indices-selected slot boundary either (any
+// multiple of a multiple of GROUP_SIZE is itself a multiple of GROUP_SIZE).
+extern "C" _GENX_MAIN_ void KERNEL_NAME(
+    const half* updates [[type("svmptr_t")]],          // [n_new, tokens_per_group, CACHE_WRITE_DIM]
+    const int32_t* write_indices [[type("svmptr_t")]],  // [n_new]
+    // Region A: [lk_cache, NUM_KV_HEADS, HEAD_SIZE] uchar, token-major/heads-interleaved, in-place.
+    // Region B: [NUM_KV_HEADS, lk_cache/GROUP_SIZE, HEAD_SIZE] packed half-pairs (scale, zp),
+    // immediately after region A.
+    uchar* cache [[type("svmptr_t")]],
+    uint32_t tokens_per_group,
+    uint32_t n_new,
+    uint32_t lk_cache) {
+    uint hkv = cm_group_id(0);
+    uint group_in_call = cm_group_id(1);
+    uint g = cm_group_id(2);
+    int slot = write_indices[g];
+    // Out-of-range `slot` (corrupted write_indices tensor, stale host-side ring-buffer computation)
+    // must not scatter-write past `cache`'s allocated buffer -- drop the work item instead of
+    // wrapping/overflowing the destination offsets below.
+    if (slot < 0 || (uint)slot * tokens_per_group >= lk_cache) {
+        return;
     }
 
-    vector<half, HEAD_SIZE_C> max_vals = in_data.row(0);
-    vector<half, HEAD_SIZE_C> min_vals = in_data.row(0);
+    constexpr int HEAD_SIZE_C = HEAD_SIZE;
+    // Region A size doubles as region B's base offset, same as CACHE_COMPRESSION==1 -- see this
+    // file's header comment. Region B's per-head stride is (lk_cache/GROUP_SIZE)*HEAD_SIZE_C*4 (one
+    // packed half-pair per channel per GROUP_SIZE-token group).
+    uint region_b_base = lk_cache * (uint)NUM_KV_HEADS * (uint)HEAD_SIZE_C;
+    uint region_b_head_stride = (lk_cache / (uint)GROUP_SIZE) * (uint)HEAD_SIZE_C * 4;
+
+    uint src_tok_base = (uint)g * tokens_per_group + group_in_call * (uint)GROUP_SIZE;
+    uint dst_tok_base = (uint)slot * tokens_per_group + group_in_call * (uint)GROUP_SIZE;
+    uint dst_group = dst_tok_base / (uint)GROUP_SIZE;
+    uint metaB_group_off = region_b_base + hkv * region_b_head_stride + dst_group * (uint)HEAD_SIZE_C * 4;
+
+    for (int c = 0; c < HEAD_SIZE_C; c++) {
+        vector<half, GROUP_SIZE> col;
 #pragma unroll
-    for (int i = 1; i < SUB_BLOCK_SIZE; i++) {
-        max_vals = cm_max<half>(max_vals, in_data.row(i));
-        min_vals = cm_min<half>(min_vals, in_data.row(i));
-    }
+        for (int t = 0; t < GROUP_SIZE; t++) {
+            uint src_off = (src_tok_base + (uint)t) * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C + (uint)c;
+            col[t] = updates[src_off];
+        }
 
-    vector<float, HEAD_SIZE_C> qrange = max_vals - min_vals;
-    vector<ushort, HEAD_SIZE_C> zero_range = (qrange == (half)0.0f);
-    // Small-qrange guard (matches pa_kv_cache_update_ref.cm's process_quantization_per_channel):
-    // avoids INF/NaN scale/zp when a channel's 16-token window is near-constant.
-    vector<float, HEAD_SIZE_C> min_range = cm_abs<float>(max_vals) * 0.1f;
-    vector<float, HEAD_SIZE_C> adjust_val = cm_max<float>(min_range, 1.0f);
-    qrange.merge(qrange + adjust_val, qrange <= min_range);
+        half max_val = cm_reduced_max<half>(col);
+        half min_val = cm_reduced_min<half>(col);
+        half qrange = max_val - min_val;
+        // Small-range guard, ported scalar-wise from pageatten/pa_kv_cache_update_ref.cm's
+        // process_quantization_per_channel (itself from the OCL impl's
+        // quantize_and_save_by_channel_block_with_requantize): avoid +-INF scale/zp when qrange is
+        // tiny-but-nonzero and the column's values sit far from zero (e.g. a near-flat,
+        // low-temporal-variance channel over this GROUP_SIZE-token window -- far more likely here
+        // than in CACHE_COMPRESSION==1's 128-channel reduction, since reducing across only 16
+        // samples of a SINGLE channel is much more exposed to near-zero local variance) -- that
+        // would otherwise poison every subsequent dequant of this (channel, group) and, via
+        // online-softmax accumulation, the whole attention row that reads it. The exact-qrange==0
+        // case is still routed to scale=1.0 directly, matching PA's `mask`-based override of the
+        // bumped-qrange result.
+        const bool qrange_is_zero = (qrange == (half)0.0f);
+        float min_range = ((float)max_val < 0.0f ? -(float)max_val : (float)max_val) * 0.1f;
+        float adjust_val = min_range > 1.0f ? min_range : 1.0f;
+        float qrange_f = (float)qrange;
+        if (qrange_f <= min_range) {
+            qrange_f += adjust_val;
+        }
+        float scale_val = qrange_is_zero ? 1.0f : 255.0f / qrange_f;
+        half zp_val = (half)((0.0f - (float)min_val) * scale_val);
+        vector<half, GROUP_SIZE> q = cm_mul<half>(col, (half)scale_val) + zp_val;
+        q = cm_min<half>(cm_max<half>(q, (half)0.0f), (half)255.0f);
+        vector<uchar, GROUP_SIZE> q_u8 = cm_rnde<uchar, GROUP_SIZE>(q);
 
-    vector<float, HEAD_SIZE_C> scale_vals = 255.0f / qrange;
-    scale_vals.merge(1.0f, zero_range);
-    vector<half, HEAD_SIZE_C> zp_vals = cm_mul<half>((0.0f - min_vals), scale_vals);
-
-    uint dst_slot_base = (uint)slot * tokens_per_group;
 #pragma unroll
-    for (int i = 0; i < SUB_BLOCK_SIZE; i++) {
-        vector<half, HEAD_SIZE_C> quant_data = cm_mul<half>(in_data.row(i), scale_vals) + zp_vals;
-        quant_data = cm_min<half>(cm_max<half>(quant_data, (half)0.0f), (half)255.0f);
-        vector<uchar, HEAD_SIZE_C> q_u8 = cm_rnde<uchar, HEAD_SIZE_C>(quant_data);
-        uint dst_off = (dst_slot_base + t0 + (uint)i) * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C;
-        cm_ptr_store<int, HEAD_SIZE_C / 4>((int*)cache, dst_off * (uint)sizeof(uchar), q_u8.format<int>());
-    }
+        for (int t = 0; t < GROUP_SIZE; t++) {
+            uint dataA_off = (dst_tok_base + (uint)t) * CACHE_WRITE_DIM + hkv * (uint)HEAD_SIZE_C + (uint)c;
+            cache[dataA_off] = q_u8[t];
+        }
 
-    vector<half, HEAD_SIZE_C> scale_out = 1.0f / scale_vals;
-    // cache_scale/cache_zp: [NUM_KV_HEADS, kv_len_cache/SUB_BLOCK_SIZE, HEAD_SIZE]
-    // (kv_len_cache = NUM_SLOTS*tokens_per_group) -- (slot*tokens_per_group+t0)/SUB_BLOCK_SIZE is
-    // the flat cache sub-block index, matching cm_sdpa_opt_prefill_dualsource.cm's
-    // key_cache_scale/zp BY_CHANNEL layout exactly.
-    uint kv_len_cache = (uint)NUM_SLOTS * tokens_per_group;
-    uint num_sub_blocks_per_head = kv_len_cache / (uint)SUB_BLOCK_SIZE;
-    uint dst_sub_block = (dst_slot_base + t0) / (uint)SUB_BLOCK_SIZE;
-    uint meta_base = hkv * num_sub_blocks_per_head + dst_sub_block;
-    cm_ptr_store<int, HEAD_SIZE_C / 2>((int*)cache_scale, meta_base * (uint)HEAD_SIZE_C * (uint)sizeof(half), scale_out.format<int>());
-    cm_ptr_store<int, HEAD_SIZE_C / 2>((int*)cache_zp, meta_base * (uint)HEAD_SIZE_C * (uint)sizeof(half), zp_vals.format<int>());
-#endif
+        uint metaB_off = metaB_group_off + (uint)c * 4;
+        half* scale_ptr = (half*)(cache + metaB_off);
+        scale_ptr[0] = (half)(1.0f / scale_val);
+        scale_ptr[1] = zp_val;
+    }
 }
 
 #endif  // CACHE_COMPRESSION
+
+}  // namespace KERNEL_NAME

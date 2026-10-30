@@ -1265,7 +1265,7 @@ if __name__ == "__main__":
         for compressed_kvcache in perf_modes:
             smoke_perf_test(
                 seq_len=perf_seq_len,
-                block_sz=256,
+                block_sz=128,
                 blocks_per_trunk=16,
                 compressed_kvcache=compressed_kvcache,
                 sub_block_sz=DEFAULT_SUB_BLOCK_SIZE,

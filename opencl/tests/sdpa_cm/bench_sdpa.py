@@ -30,7 +30,10 @@ import test_sdpa_prefill_block_mask_dualsource as ms_block_mask
 import test_sdpa_prefill_int8 as prefill_int8
 # test_sdpa_prefill_block_mask's import above already put pageatten/ on sys.path.
 from generate_block_mask import generate_block_mask_with_ratio
-from int8_kv_ref import encode_k_by_channel, encode_by_token
+from int8_kv_ref import encode_cache_by_token, encode_cache_k_by_channel
+
+KV_CACHE_COMPRESSION_BY_TOKEN = 1
+KV_CACHE_COMPRESSION_BY_CHANNEL = 2
 
 torch.manual_seed(0)
 
@@ -169,14 +172,16 @@ def bench_prefill(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causa
 
 def bench_prefill_int8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_causal=True,
                         batch=1, n_warmup=10, n_iters=50, order=None, sparse_block_size=1,
-                        density=1.0):
-    """KV_CACHE_COMPRESSION=2 counterpart of bench_prefill, same shape/dispatch/timing convention --
-    K/V are uploaded as raw int8 bytes (1 byte/elem) instead of half (2 bytes/elem), decoded to half
-    once per work-group and staged through SLM, via a flat affine (raw-zp)*scale dequant (see
-    cm_sdpa_common.hpp's sdpa_kernel_lsc / cm_int8_kv_decode.hpp). Values/correctness don't matter
-    here (this is a pure perf probe, see test_sdpa_prefill_int8.py for correctness) -- only the byte
-    pattern's on-the-wire size (half the K/V bytes moved vs. fp16) and the V-path's extra
-    decode/VNNI-repack software overhead are what's being measured against the fp16 baseline.
+                        density=1.0, compression_mode=KV_CACHE_COMPRESSION_BY_CHANNEL):
+    """KV_CACHE_COMPRESSION counterpart of bench_prefill, same shape/dispatch/timing convention --
+    K/V are uploaded as raw int8 bytes (1 byte/elem) instead of half (2 bytes/elem), with scale/zp
+    appended in a separate region B of the SAME key/value buffer (no separate kernel argument --
+    see cm_sdpa_opt_prefill.cm's module docstring), decoded to half once per work-group and staged
+    through SLM, via a flat affine (raw-zp)*scale dequant (see cm_sdpa_common.hpp's sdpa_kernel_lsc
+    / cm_int8_kv_decode.hpp). Values/correctness don't matter here (this is a pure perf probe, see
+    test_sdpa_prefill_int8.py for correctness) -- only the byte pattern's on-the-wire size (half
+    the K/V bytes moved vs. fp16) and the V-path's extra decode/VNNI-repack software overhead are
+    what's being measured against the fp16 baseline.
 
     sparse_block_size>1 (with a matching density in (0,1]) additionally benchmarks a block-sparse
     mask on top of the int8 decode -- the mask is faked at the requested density exactly like
@@ -185,6 +190,7 @@ def bench_prefill_int8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_
     restriction cm_sdpa_opt_prefill.cm's static_assert enforces (see sdpa_kernel_lsc's doc
     comment).
 
+    compression_mode: BY_CHANNEL (default, K only) or BY_TOKEN -- both support either order.
     order: see bench_prefill's docstring."""
     assert sparse_block_size in (1, 128, 256), (
         "sparse_block_size must be 1 (dense), 128, or 256 -- matches "
@@ -193,19 +199,16 @@ def bench_prefill_int8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_
         order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_size)
     kernel = prefill_int8.build_prefill_kernel_int8(num_heads, num_kv_heads, head_size, is_causal,
-                                                     order, order, order, order, sparse_block_size)
+                                                     order, order, order, order, sparse_block_size,
+                                                     compression_mode=compression_mode)
 
-    # Quantize from the LOGICAL [B,H,S,D] k/v (scale/zp are always flat [B,Hkv,...], independent of
-    # K/V_TRANSPOSE_ORDER -- only the raw int8 DATA bytes need the physical transpose, same as the
-    # fp16 baseline's K/V bytes do).
-    k_u8_logical, k_scale, k_zp = encode_k_by_channel(k)
-    v_u8_logical, v_scale, v_zp = encode_by_token(v)
+    k_packed = (encode_cache_k_by_channel(k, order=order) if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL
+                else encode_cache_by_token(k, order=order))
+    v_packed = encode_cache_by_token(v, order=order)
     q_phys = prefill.to_physical(q, order)
-    k_u8_phys = prefill.to_physical(k_u8_logical, order)
-    v_u8_phys = prefill.to_physical(v_u8_logical, order)
     t_q = cl.tensor(q_phys.to(torch.float16).numpy())
-    t_k = cl.tensor(k_u8_phys.contiguous().numpy())
-    t_v = cl.tensor(v_u8_phys.contiguous().numpy())
+    t_k = cl.tensor(k_packed.contiguous().numpy())
+    t_v = cl.tensor(v_packed.contiguous().numpy())
     out_shape = ([batch, seq_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
                  else [batch, num_heads, seq_len, head_size])
     t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
@@ -225,11 +228,6 @@ def bench_prefill_int8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    t_k_scale = cl.tensor(k_scale.contiguous().numpy())
-    t_k_zp = cl.tensor(k_zp.contiguous().numpy())
-    t_v_scale = cl.tensor(v_scale.contiguous().numpy())
-    t_v_zp = cl.tensor(v_zp.contiguous().numpy())
-    args += [t_k_scale, t_k_zp, t_v_scale, t_v_zp]
 
     kernel_name = "cm_sdpa_opt_prefill_int8"
     cl.finish()
@@ -243,13 +241,14 @@ def bench_prefill_int8(seq_len, num_heads=32, num_kv_heads=8, head_size=128, is_
     total_flops = flops_for(num_heads, seq_len, seq_len, head_size, causal_savings=is_causal,
                              density=effective_density) * batch
     order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
-    decode_tag = "KV_CACHE_COMPRESSION=2"
+    mode_tag = "by_channel" if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL else "by_token"
+    decode_tag = f"KV_CACHE_COMPRESSION={compression_mode}[{mode_tag}]"
     sparse_tag = (f" block={sparse_block_size} density(req/eff)={density:.2f}/{effective_density:.3f}"
                   if sparse_block_size > 1 else "")
     label = (f"prefill* seq_len={seq_len:<6} heads={num_heads}/{num_kv_heads} hd={head_size} "
              f"causal={is_causal} order={order_tag} {decode_tag}{sparse_tag}")
     result = report(label, total_flops, lat_ms)
-    del t_q, t_k, t_v, t_out, t_mask, t_k_scale, t_k_zp, t_v_scale, t_v_zp
+    del t_q, t_k, t_v, t_out, t_mask
     gc.collect()
     return result
 
@@ -555,12 +554,15 @@ def bench_prefill_block_mask_synthetic_qkv(q_len, kv_len, num_heads=32, num_kv_h
 
 def bench_prefill_int8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_size=128,
                             batch=1, n_warmup=10, n_iters=50, order=None, sparse_block_size=1,
-                            density=1.0):
+                            density=1.0, compression_mode=KV_CACHE_COMPRESSION_BY_CHANNEL):
     """q_len != kv_len variant of bench_prefill_int8 -- needed for FlashVSR's REAL streaming
     KV-cache self-attention shape (steady-state q_len=19,200/kv_len=76,800, see
     fake_block_mask_qkv's docstring). Non-causal only, same restriction as
     bench_prefill_block_mask_synthetic_qkv (FlashVSR's self-attention call is always
-    is_causal=False -- see bench_sdpa.py's FlashVSR-config __main__ section comment)."""
+    is_causal=False -- see bench_sdpa.py's FlashVSR-config __main__ section comment).
+
+    compression_mode: BY_CHANNEL (default, K only) or BY_TOKEN -- both support either order, see
+    bench_prefill_int8's identical note."""
     assert sparse_block_size in (1, 128, 256), (
         "sparse_block_size must be 1 (dense), 128, or 256 -- matches "
         "cm_sdpa_opt_prefill.cm's KV_CACHE_COMPRESSION static_assert")
@@ -568,16 +570,16 @@ def bench_prefill_int8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_siz
         order = prefill.TRANSPOSE_ORDER_IDENTITY
     q, k, v = prefill.make_qkv(batch, num_heads, num_kv_heads, q_len, kv_len, head_size)
     kernel = prefill_int8.build_prefill_kernel_int8(num_heads, num_kv_heads, head_size, False,
-                                                     order, order, order, order, sparse_block_size)
+                                                     order, order, order, order, sparse_block_size,
+                                                     compression_mode=compression_mode)
 
-    k_u8_logical, k_scale, k_zp = encode_k_by_channel(k)
-    v_u8_logical, v_scale, v_zp = encode_by_token(v)
+    k_packed = (encode_cache_k_by_channel(k, order=order) if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL
+                else encode_cache_by_token(k, order=order))
+    v_packed = encode_cache_by_token(v, order=order)
     q_phys = prefill.to_physical(q, order)
-    k_u8_phys = prefill.to_physical(k_u8_logical, order)
-    v_u8_phys = prefill.to_physical(v_u8_logical, order)
     t_q = cl.tensor(q_phys.to(torch.float16).numpy())
-    t_k = cl.tensor(k_u8_phys.contiguous().numpy())
-    t_v = cl.tensor(v_u8_phys.contiguous().numpy())
+    t_k = cl.tensor(k_packed.contiguous().numpy())
+    t_v = cl.tensor(v_packed.contiguous().numpy())
     out_shape = ([batch, q_len, num_heads, head_size] if order == prefill.TRANSPOSE_ORDER_SWAPPED
                  else [batch, num_heads, q_len, head_size])
     t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
@@ -597,11 +599,6 @@ def bench_prefill_int8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_siz
         num_q_blocks, num_k_blocks = mask.shape[2], mask.shape[3]
         t_mask = cl.tensor(mask.numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    t_k_scale = cl.tensor(k_scale.contiguous().numpy())
-    t_k_zp = cl.tensor(k_zp.contiguous().numpy())
-    t_v_scale = cl.tensor(v_scale.contiguous().numpy())
-    t_v_zp = cl.tensor(v_zp.contiguous().numpy())
-    args += [t_k_scale, t_k_zp, t_v_scale, t_v_zp]
 
     kernel_name = "cm_sdpa_opt_prefill_int8"
     cl.finish()
@@ -615,13 +612,14 @@ def bench_prefill_int8_qkv(q_len, kv_len, num_heads=32, num_kv_heads=8, head_siz
     total_flops = flops_for(num_heads, q_len, kv_len, head_size, causal_savings=False,
                              density=effective_density) * batch
     order_tag = "swapped" if order == prefill.TRANSPOSE_ORDER_SWAPPED else "identity"
-    decode_tag = "KV_CACHE_COMPRESSION=2"
+    mode_tag = "by_channel" if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL else "by_token"
+    decode_tag = f"KV_CACHE_COMPRESSION={compression_mode}[{mode_tag}]"
     sparse_tag = (f" block={sparse_block_size} density(req/eff)={density:.2f}/{effective_density:.3f}"
                   if sparse_block_size > 1 else "")
     label = (f"prefill* q_len={q_len:<6} kv_len={kv_len:<6} heads={num_heads}/{num_kv_heads} "
              f"hd={head_size} causal=False order={order_tag} {decode_tag}{sparse_tag}")
     result = report(label, total_flops, lat_ms)
-    del t_q, t_k, t_v, t_out, t_mask, t_k_scale, t_k_zp, t_v_scale, t_v_zp
+    del t_q, t_k, t_v, t_out, t_mask
     gc.collect()
     return result
 
@@ -712,11 +710,14 @@ def bench_prefill_dual_fp16(kv_len_cache, kv_len_cur, num_heads=32, num_kv_heads
 
 def bench_prefill_dual_int8cache(kv_len_cache, kv_len_cur, num_heads=32, num_kv_heads=8, head_size=128,
                                  sparse_block_size=128, density=1.0, batch=1, n_warmup=10, n_iters=50,
-                                 seed=1000):
-    """KV_CACHE_COMPRESSION=2 counterpart of bench_prefill_dual_fp16 -- only the cache source is
-    quantized (uint8 affine, by-channel K / by-token V, via int8_kv_ref.py), current stays half,
-    matching bench_sdpa_dualsource.py's bench_dualsource_int8cache convention generalized to
-    arbitrary heads/head_size/lengths."""
+                                 seed=1000, compression_mode=KV_CACHE_COMPRESSION_BY_CHANNEL):
+    """KV_CACHE_COMPRESSION counterpart of bench_prefill_dual_fp16 -- key_cache/value_cache are a
+    single region-split packed uint8 buffer (no separate scale/zp kernel argument -- see
+    cm_sdpa_opt_prefill_dualsource.cm's / kv_cache_write.cm's module docstrings), current stays
+    half, matching bench_sdpa_dualsource.py's bench_dualsource_int8cache convention generalized to
+    arbitrary heads/head_size/lengths. This buffer is ALWAYS token-major/heads-interleaved, so (like
+    bench_sdpa_dualsource.py / test_sdpa_prefill_int8_cache.py) Q/K/V/OUTPUT_TRANSPOSE_ORDER must be
+    SWAPPED to match -- the real BlockSparseAttention primitive's own ABI for this op."""
     assert sparse_block_size > 1, (
         "cm_sdpa_opt_prefill_dualsource.cm requires SPARSE_BLOCK_SIZE > 1 (no dense/no-mask mode)")
     q_len = kv_len_cur
@@ -728,7 +729,9 @@ def bench_prefill_dual_int8cache(kv_len_cache, kv_len_cur, num_heads=32, num_kv_
         f"-DKERNEL_NAME=cm_sdpa_opt_prefill_dualsource_int8cache "
         f"-DCMFLA_NUM_HEADS={num_heads} -DCMFLA_NUM_KV_HEADS={num_kv_heads} "
         f"-DCMFLA_HEAD_SIZE={head_size} -DCMFLA_SCALE_FACTOR={scale_factor} "
-        f"-DSPARSE_BLOCK_SIZE={sparse_block_size} -DKV_CACHE_COMPRESSION=2"
+        f"-DQ_TRANSPOSE_ORDER={prefill.TRANSPOSE_ORDER_SWAPPED} -DK_TRANSPOSE_ORDER={prefill.TRANSPOSE_ORDER_SWAPPED} "
+        f"-DV_TRANSPOSE_ORDER={prefill.TRANSPOSE_ORDER_SWAPPED} -DOUTPUT_TRANSPOSE_ORDER={prefill.TRANSPOSE_ORDER_SWAPPED} "
+        f"-DSPARSE_BLOCK_SIZE={sparse_block_size} -DKV_CACHE_COMPRESSION={compression_mode}"
     )
     kernel = cl.kernels(src, opts)
 
@@ -738,19 +741,16 @@ def bench_prefill_dual_int8cache(kv_len_cache, kv_len_cur, num_heads=32, num_kv_
     v_cache = (torch.randn(batch, num_kv_heads, max(kv_len_cache, 16), head_size, generator=g) * 0.5).to(torch.float16)
     k_cur = (torch.randn(batch, num_kv_heads, kv_len_cur, head_size, generator=g) * 1.0).to(torch.float16)
     v_cur = (torch.randn(batch, num_kv_heads, kv_len_cur, head_size, generator=g) * 0.5).to(torch.float16)
-    k_cache_u8, k_cache_scale, k_cache_zp = encode_k_by_channel(k_cache)
-    v_cache_u8, v_cache_scale, v_cache_zp = encode_by_token(v_cache)
+    k_cache_packed = (encode_cache_k_by_channel(k_cache) if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL
+                      else encode_cache_by_token(k_cache))
+    v_cache_packed = encode_cache_by_token(v_cache)
 
-    t_q = cl.tensor(q.contiguous().numpy())
-    t_k_cache = cl.tensor(k_cache_u8.contiguous().numpy())
-    t_v_cache = cl.tensor(v_cache_u8.contiguous().numpy())
-    t_k_cur = cl.tensor(k_cur.contiguous().numpy())
-    t_v_cur = cl.tensor(v_cur.contiguous().numpy())
-    t_out = cl.tensor(np.zeros([batch, num_heads, q_len, head_size], dtype=np.float16))
-    t_k_scale = cl.tensor(k_cache_scale.contiguous().numpy())
-    t_k_zp = cl.tensor(k_cache_zp.contiguous().numpy())
-    t_v_scale = cl.tensor(v_cache_scale.contiguous().numpy())
-    t_v_zp = cl.tensor(v_cache_zp.contiguous().numpy())
+    t_q = cl.tensor(prefill.to_physical(q, prefill.TRANSPOSE_ORDER_SWAPPED).numpy())
+    t_k_cache = cl.tensor(k_cache_packed.contiguous().numpy())
+    t_v_cache = cl.tensor(v_cache_packed.contiguous().numpy())
+    t_k_cur = cl.tensor(prefill.to_physical(k_cur, prefill.TRANSPOSE_ORDER_SWAPPED).numpy())
+    t_v_cur = cl.tensor(prefill.to_physical(v_cur, prefill.TRANSPOSE_ORDER_SWAPPED).numpy())
+    t_out = cl.tensor(np.zeros([batch, q_len, num_heads, head_size], dtype=np.float16))
 
     mask, num_q_blocks, num_k_blocks_cache, num_k_blocks_cur, effective_density = _dual_source_mask(
         num_heads, q_len, kv_len_cache, kv_len_cur, sparse_block_size, density, batch=batch, seed=seed + 1)
@@ -763,8 +763,7 @@ def bench_prefill_dual_int8cache(kv_len_cache, kv_len_cur, num_heads=32, num_kv_
     GWS = [1, batch * num_heads, wg_count * wg_size]
     LWS = [1, 1, wg_size]
     args = [t_q, t_k_cache, t_v_cache, t_k_cur, t_v_cur, t_out, q_len, kv_len_cache, kv_len_cur,
-            t_mask, num_q_blocks, num_k_blocks_cache, num_k_blocks_cur,
-            t_k_scale, t_k_zp, t_v_scale, t_v_zp]
+            t_mask, num_q_blocks, num_k_blocks_cache, num_k_blocks_cur]
 
     cl.finish()
     for _ in range(n_warmup):
@@ -776,11 +775,12 @@ def bench_prefill_dual_int8cache(kv_len_cache, kv_len_cur, num_heads=32, num_kv_
 
     total_flops = flops_for(num_heads, q_len, kv_len_cache + kv_len_cur, head_size,
                              causal_savings=False, density=effective_density) * batch
-    label = (f"dual-int8cache kv_cache={kv_len_cache:<6} kv_cur={kv_len_cur:<6} q={q_len:<6} "
+    mode_tag = "by_channel" if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL else "by_token"
+    label = (f"dual-int8cache[{mode_tag}] kv_cache={kv_len_cache:<6} kv_cur={kv_len_cur:<6} q={q_len:<6} "
              f"heads={num_heads}/{num_kv_heads} hd={head_size} block={sparse_block_size} "
              f"density(req/eff)={density:.2f}/{effective_density:.3f}")
     result = report(label, total_flops, lat_ms)
-    del t_q, t_k_cache, t_v_cache, t_k_cur, t_v_cur, t_out, t_mask, t_k_scale, t_k_zp, t_v_scale, t_v_zp
+    del t_q, t_k_cache, t_v_cache, t_k_cur, t_v_cur, t_out, t_mask
     gc.collect()
     return result
 

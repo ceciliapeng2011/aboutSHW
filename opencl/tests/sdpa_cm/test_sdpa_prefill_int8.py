@@ -13,10 +13,21 @@ head_size channel) or BY_TOKEN (=1, one pair per token); V is always BY_TOKEN re
 matches opencl/tests/pageatten/kv_cache_quant_utils.py's own K/V asymmetry exactly (int8_kv_ref.py
 is the thin host-side wrapper around that module's quant_per_channel_parts/quant_per_token_parts).
 
+There is no separate key_scale/key_zp/value_scale/value_zp kernel argument -- key/value carry
+everything, using the SAME region-split cache layout as the real OpenVINO BlockSparseAttention
+primitive (see cm_sdpa_opt_prefill.cm's / cm_sdpa_opt_prefill_dualsource.cm's / kv_cache_write.cm's
+module docstrings): region A holds every token's quantized data (byte-identical addressing to the
+plain fp16 path), region B (appended immediately after) holds packed (scale, zp) half-pairs --
+token-contiguous per head for BY_TOKEN (K and V), channel-contiguous within a 16-token group for
+BY_CHANNEL (K only; V is always BY_TOKEN). Because region A's addressing no longer depends on K's
+compression granularity, both K_TRANSPOSE_ORDER values work for both modes (see
+int8_kv_ref.py's encode_cache_by_token/encode_cache_k_by_channel `order` parameter).
+
 This is the single-source counterpart of test_sdpa_prefill_int8_cache.py's KV_CACHE_COMPRESSION
-test for the narrower dual-source (cache+current) kernel -- same methodology, applied to the more
-general kernel, plus two axes the cache test doesn't cover: causal masking and K/V TRANSPOSE_ORDER
-(IDENTITY vs SWAPPED), since this kernel (unlike the dual-source one) already supports both.
+test for the narrower dual-source (cache+current) kernel -- same methodology and the same
+region-split host-side encoders, applied to the more general kernel, plus two axes the cache test
+doesn't cover: causal masking and K/V TRANSPOSE_ORDER (IDENTITY vs SWAPPED), since this kernel
+(unlike the dual-source one) already supports both.
 
 Correctness oracle (NOT "is int8 quantization accurate enough" -- that's not what this isolates):
 1. Build a random half K/V.
@@ -39,7 +50,10 @@ from clops import cl
 
 import test_sdpa_prefill as base
 import test_sdpa_prefill_block_mask as bm
-from int8_kv_ref import encode_k_by_channel, dequant_k_by_channel, encode_by_token, dequant_by_token
+from int8_kv_ref import (
+    encode_cache_k_by_channel, dequant_cache_k_by_channel,
+    encode_cache_by_token, dequant_cache_by_token,
+)
 # test_sdpa_prefill_block_mask's import above already put pageatten/ on sys.path (see
 # bench_sdpa.py's identical comment) -- generate_block_mask_with_ratio builds a realistic,
 # non-trivial (not all-True/all-False) causal block-sparse pattern per head, used below by the
@@ -88,43 +102,46 @@ def build_prefill_kernel_int8(num_heads, num_kv_heads, head_size, is_causal,
     return cl.kernels(src, opts)
 
 
-def _encode_kv_to_int8(k_logical, v_logical, compression_mode):
-    """k_logical/v_logical: logical [B,Hkv,S,D] half tensors. Returns a dict of device-ready
-    uint8/half numpy-backing tensors plus the roundtripped-through-int8 half K/V (the oracle's
-    "already-decoded" reference input)."""
+def _encode_kv_to_int8(k_logical, v_logical, compression_mode,
+                        k_order=TRANSPOSE_ORDER_IDENTITY, v_order=TRANSPOSE_ORDER_IDENTITY):
+    """k_logical/v_logical: logical [B,Hkv,S,D] half tensors. Returns (k_packed, v_packed, k_rt,
+    v_rt): k_packed/v_packed are already-physical flat uint8 region-split buffers (region A in the
+    requested order, region B's scale/zp immediately after -- see this module's header comment)
+    ready for run_prefill_int8; k_rt/v_rt are the roundtripped-through-int8 half K/V (the oracle's
+    "already-decoded" reference input). order must be baked in here (not applied afterward via
+    to_physical) since the packed buffer is flat, not a [B,Hkv,S,D]-shaped tensor."""
+    num_kv_heads, kv_len, head_size = k_logical.shape[1], k_logical.shape[2], k_logical.shape[3]
     if compression_mode == KV_CACHE_COMPRESSION_BY_CHANNEL:
-        k_u8, k_scale, k_zp = encode_k_by_channel(k_logical)
-        k_rt = dequant_k_by_channel(k_u8, k_scale, k_zp)
+        k_packed = encode_cache_k_by_channel(k_logical, order=k_order)
+        k_rt = dequant_cache_k_by_channel(k_packed, kv_len, head_size, num_kv_heads, order=k_order)
     else:
-        k_u8, k_scale, k_zp = encode_by_token(k_logical)
-        k_rt = dequant_by_token(k_u8, k_scale, k_zp)
-    v_u8, v_scale, v_zp = encode_by_token(v_logical)
-    v_rt = dequant_by_token(v_u8, v_scale, v_zp)
-    return (k_u8, k_scale, k_zp, k_rt), (v_u8, v_scale, v_zp, v_rt)
+        k_packed = encode_cache_by_token(k_logical, order=k_order)
+        k_rt = dequant_cache_by_token(k_packed, kv_len, head_size, num_kv_heads, order=k_order)
+    v_packed = encode_cache_by_token(v_logical, order=v_order)
+    v_rt = dequant_cache_by_token(v_packed, kv_len, head_size, num_kv_heads, order=v_order)
+    return k_packed, v_packed, k_rt, v_rt
 
 
-def run_prefill_int8(q, k_u8, k_scale, k_zp, v_u8, v_scale, v_zp, is_causal,
+def run_prefill_int8(q, k_packed, v_packed, kv_len, head_size, num_kv_heads, is_causal,
                       q_order=TRANSPOSE_ORDER_IDENTITY, k_order=TRANSPOSE_ORDER_IDENTITY,
                       v_order=TRANSPOSE_ORDER_IDENTITY, o_order=TRANSPOSE_ORDER_IDENTITY,
                       sparse_block_size=1, block_mask=None,
                       compression_mode=KV_CACHE_COMPRESSION_BY_CHANNEL):
-    # k_u8/v_u8: uint8 tensors, logical [B,Hkv,kv_len,D] (same logical shape convention as k/v
-    # half tensors elsewhere in this module). TRANSPOSE_ORDER only ever applies to the raw data --
-    # scale/zp travel as their own flat, order-independent tensors (see int8_kv_ref.py's layout).
-    batch, num_heads, q_len, head_size = q.shape
-    _, num_kv_heads, kv_len, _ = k_u8.shape
+    # k_packed/v_packed: already-physical flat region-split uint8 buffers from _encode_kv_to_int8
+    # above (order already baked in at encode time) -- no separate scale/zp kernel argument (see
+    # this module's header comment). kv_len/head_size/num_kv_heads can't be read back from
+    # k_packed/v_packed's shape anymore (they're flat, not [B,Hkv,kv_len,D]), so the caller passes
+    # them explicitly.
+    batch, num_heads, q_len, _ = q.shape
 
     kernel = build_prefill_kernel_int8(num_heads, num_kv_heads, head_size, is_causal,
                                         q_order, k_order, v_order, o_order, sparse_block_size,
                                         compression_mode=compression_mode)
 
     q_phys = base.to_physical(q, q_order)
-    k_phys = base.to_physical(k_u8, k_order)
-    v_phys = base.to_physical(v_u8, v_order)
-
     t_q = cl.tensor(q_phys.to(torch.float16).numpy())
-    t_k = cl.tensor(k_phys.contiguous().numpy())
-    t_v = cl.tensor(v_phys.contiguous().numpy())
+    t_k = cl.tensor(k_packed.contiguous().numpy())
+    t_v = cl.tensor(v_packed.contiguous().numpy())
     out_shape = ([batch, q_len, num_heads, head_size] if o_order == TRANSPOSE_ORDER_SWAPPED
                  else [batch, num_heads, q_len, head_size])
     t_out = cl.tensor(np.zeros(out_shape, dtype=np.float16))
@@ -142,13 +159,6 @@ def run_prefill_int8(q, k_u8, k_scale, k_zp, v_u8, v_scale, v_zp, is_causal,
         num_q_blocks, num_k_blocks = block_mask.shape[2], block_mask.shape[3]
         t_mask = cl.tensor(block_mask.to(torch.bool).numpy())
         args += [t_mask, num_q_blocks, num_k_blocks]
-    # KV_CACHE_COMPRESSION always needs scale/zp -- matching cm_sdpa_opt_prefill.cm's
-    # `#if KV_CACHE_COMPRESSION` key_scale/key_zp/value_scale/value_zp params, always last.
-    t_k_scale = cl.tensor(k_scale.contiguous().numpy())
-    t_k_zp = cl.tensor(k_zp.contiguous().numpy())
-    t_v_scale = cl.tensor(v_scale.contiguous().numpy())
-    t_v_zp = cl.tensor(v_zp.contiguous().numpy())
-    args += [t_k_scale, t_k_zp, t_v_scale, t_v_zp]
 
     kernel.enqueue("cm_sdpa_opt_prefill_int8", GWS, LWS, *args)
 
@@ -171,9 +181,10 @@ def _check_against_roundtripped_oracle(q, k, v, is_causal,
                                         v_order=TRANSPOSE_ORDER_IDENTITY, o_order=TRANSPOSE_ORDER_IDENTITY,
                                         sparse_block_size=1, mask=None,
                                         compression_mode=KV_CACHE_COMPRESSION_BY_CHANNEL):
-    (k_u8, k_scale, k_zp, k_rt), (v_u8, v_scale, v_zp, v_rt) = _encode_kv_to_int8(k, v, compression_mode)
+    num_kv_heads, kv_len, head_size = k.shape[1], k.shape[2], k.shape[3]
+    k_packed, v_packed, k_rt, v_rt = _encode_kv_to_int8(k, v, compression_mode, k_order, v_order)
 
-    out_int8 = run_prefill_int8(q, k_u8, k_scale, k_zp, v_u8, v_scale, v_zp, is_causal,
+    out_int8 = run_prefill_int8(q, k_packed, v_packed, kv_len, head_size, num_kv_heads, is_causal,
                                  q_order, k_order, v_order, o_order,
                                  sparse_block_size=sparse_block_size, block_mask=mask,
                                  compression_mode=compression_mode)
@@ -202,11 +213,15 @@ def test_int8_matches_fp16_causal_dense_identity():
 
 
 def test_int8_matches_fp16_causal_dense_swapped():
+    # Region A's addressing is order-generic for both K compression modes (see this file's header
+    # comment), so BY_TOKEN works fine under SWAPPED order here -- kept as BY_TOKEN mode for
+    # coverage, not because BY_CHANNEL couldn't also do SWAPPED now.
     q, k, v = _make_qkv(batch=1, num_heads=4, num_kv_heads=4, q_len=256, kv_len=256,
                          head_size=64, seed=218)
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
                                         q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
-                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED)
+                                        v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
+                                        compression_mode=KV_CACHE_COMPRESSION_BY_TOKEN)
     print("test_int8_matches_fp16_causal_dense_swapped PASSED")
 
 
@@ -282,9 +297,8 @@ def test_int8_sparse_all_masked_row_outputs_zero_not_nan():
     mask = torch.ones([1, num_heads, num_q_blocks, num_k_blocks], dtype=torch.bool)
     mask[:, :, 1, :] = False  # q_block 1 (tokens [256,512)): every k_block masked out
 
-    (k_u8, k_scale, k_zp, _), (v_u8, v_scale, v_zp, _) = _encode_kv_to_int8(
-        k, v, KV_CACHE_COMPRESSION_BY_CHANNEL)
-    out = run_prefill_int8(q, k_u8, k_scale, k_zp, v_u8, v_scale, v_zp, is_causal=True,
+    k_packed, v_packed, _, _ = _encode_kv_to_int8(k, v, KV_CACHE_COMPRESSION_BY_CHANNEL)
+    out = run_prefill_int8(q, k_packed, v_packed, k.shape[2], k.shape[3], k.shape[1], is_causal=True,
                             sparse_block_size=sparse_block_size, block_mask=mask)
     masked_rows = out[:, :, 256:512, :]
     assert torch.isfinite(masked_rows).all(), "all-masked q_block produced NaN/Inf, not 0"
@@ -324,6 +338,8 @@ def test_int8_matches_fp16_causal_sparse128_ragged_q_len():
 
 
 def test_int8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped():
+    # Same BY_TOKEN-under-SWAPPED coverage choice as test_int8_matches_fp16_causal_dense_swapped
+    # above (no longer a hard requirement -- BY_CHANNEL supports SWAPPED too).
     sparse_block_size = 128
     q_len = kv_len = 1024
     num_heads, num_kv_heads = 8, 2
@@ -335,7 +351,8 @@ def test_int8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped():
     _check_against_roundtripped_oracle(q, k, v, is_causal=True,
                                         q_order=TRANSPOSE_ORDER_SWAPPED, k_order=TRANSPOSE_ORDER_SWAPPED,
                                         v_order=TRANSPOSE_ORDER_SWAPPED, o_order=TRANSPOSE_ORDER_SWAPPED,
-                                        sparse_block_size=sparse_block_size, mask=mask)
+                                        sparse_block_size=sparse_block_size, mask=mask,
+                                        compression_mode=KV_CACHE_COMPRESSION_BY_TOKEN)
     print("test_int8_matches_fp16_causal_sparse128_multi_wg_gqa_swapped PASSED "
           f"(density={density:.2f})")
 

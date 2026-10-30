@@ -33,16 +33,26 @@
 // of sdpa_kernel_lsc_prefetch. K is quantized BY_CHANNEL when ==2 (one scale/zp pair per 16-token
 // sub-block per head_size channel) or BY_TOKEN when ==1 (one pair per token); V is always BY_TOKEN
 // regardless of mode -- matches opencl/tests/pageatten/kv_cache_quant_utils.py's own K/V asymmetry
-// exactly (see int8_kv_ref.py, the host-side oracle this wraps). Mirrors
-// KV_CACHE_COMPRESSION's convention in cm_sdpa_opt_prefill_dualsource.cm, applied here to the
-// single K/V source this kernel has (query and output stay plain half either way). The physical
-// K/V buffer is then 1 byte/element, so its own pitch/offset must be computed at
-// elem_size=sizeof(uchar) (see kv_elem_size below) -- Q/output pitch/offset calls below
-// deliberately keep using the 1-arg template form, which still defaults to sizeof(half).
-// Causal-only, no attn_mask (matches sdpa_kernel_lsc's own int8 scope). SPARSE_BLOCK_SIZE IS
-// supported here (both 128 and 256) -- see sdpa_kernel_lsc's doc comment for the two-level
-// skip-LOAD/skip-COMPUTE mask split SPARSE_BLOCK_SIZE==128 needs on top of 256's simpler
-// single-mask case.
+// exactly (see int8_kv_ref.py, the host-side oracle this wraps). Causal-only, no attn_mask (matches
+// sdpa_kernel_lsc's own int8 scope). SPARSE_BLOCK_SIZE IS supported here (both 128 and 256) -- see
+// sdpa_kernel_lsc's doc comment for the two-level skip-LOAD/skip-COMPUTE mask split
+// SPARSE_BLOCK_SIZE==128 needs on top of 256's simpler single-mask case.
+//
+// There is no separate key_scale/key_zp/value_scale/value_zp kernel parameter -- `key`/`value`
+// carry everything, using the SAME region-split cache layout as the real OpenVINO
+// BlockSparseAttention primitive (see cm_sdpa_opt_prefill_dualsource.cm's/kv_cache_write.cm's
+// module docstrings, which this kernel's int8 path now shares verbatim): region A (this batch's
+// `[kv_len, num_kv_heads, head_size]` quantized data, token-major/heads-interleaved per
+// K_TRANSPOSE_ORDER/V_TRANSPOSE_ORDER same as the plain half path) comes first, followed
+// immediately by region B (packed (scale, zp) half-pairs). V's region B (and K's when BY_TOKEN,
+// ==1) is head-major, TOKEN-CONTIGUOUS within a head, 4 bytes/token. K's region B when BY_CHANNEL
+// (==2; V always stays BY_TOKEN even then) is instead head-major then GROUP-major then
+// CHANNEL-contiguous within a 16-token group, 4 bytes/channel per group -- same total 4
+// bytes/token average either way. Because region A's data pitch is identical (plain, unpadded
+// head_size) regardless of K's compression granularity, both K modes share the exact same
+// region-A addressing as the plain (KV_CACHE_COMPRESSION==0) path -- no K_TRANSPOSE_ORDER
+// restriction, unlike an embedded per-token design where BY_CHANNEL's trailing per-head metadata
+// would have no natural home under a heads-interleaved order.
 #include "cm_sdpa_common.hpp"
 #include "cm_sdpa_opt_common.hpp"
 
@@ -68,6 +78,9 @@ namespace KERNEL_NAME {
 #ifndef KV_CACHE_COMPRESSION
 #define KV_CACHE_COMPRESSION 0
 #endif
+static_assert(KV_CACHE_COMPRESSION == 0 || KV_CACHE_COMPRESSION == 1 || KV_CACHE_COMPRESSION == 2,
+              "cm_sdpa_opt_prefill.cm only implements KV_CACHE_COMPRESSION 0 (NONE), 1 (BY_TOKEN) "
+              "or 2 (BY_CHANNEL)");
 
 _GENX_MAIN_ void KERNEL_NAME(
     half* query [[type("svmptr_t")]],
@@ -89,16 +102,6 @@ _GENX_MAIN_ void KERNEL_NAME(
     , bool* sparse_block_mask [[type("svmptr_t")]]
     , int num_q_blocks
     , int num_k_blocks
-#endif
-#if KV_CACHE_COMPRESSION
-    // Int8 dequant scale/zero-point tensors -- see cm_int8_kv_decode.hpp and int8_kv_ref.py (the
-    // host-side encode reference). key_scale/key_zp are [kv_len/16, head_size] when
-    // KV_CACHE_COMPRESSION==2 (BY_CHANNEL) or [kv_len] when ==1 (BY_TOKEN); value_scale/value_zp
-    // are always [kv_len] (V is always BY_TOKEN).
-    , half* key_scale [[type("svmptr_t")]]
-    , half* key_zp [[type("svmptr_t")]]
-    , half* value_scale [[type("svmptr_t")]]
-    , half* value_zp [[type("svmptr_t")]]
 #endif
     ) {
     constexpr int num_heads = CMFLA_NUM_HEADS;
@@ -135,6 +138,21 @@ _GENX_MAIN_ void KERNEL_NAME(
 #else
     constexpr int kv_elem_size = sizeof(half);
 #endif
+    // Region A (the K/V data itself) always uses the plain, unpadded head_size pitch, identically
+    // for BY_TOKEN and BY_CHANNEL -- scale/zp live in a separate region B appended after region A
+    // instead of being interleaved with the data (see this file's header comment), so region A's
+    // addressing needs no special-casing per compression mode and reuses the SAME
+    // get_seq_pitch_bytes/get_batch_byte_stride/get_head_byte_offset helpers the plain (mode 0)
+    // path already uses, just with kv_elem_size=1 (uchar) instead of sizeof(half). Each batch's
+    // FULL region-A+region-B chunk amortizes to (head_size+4) bytes/token on average regardless of
+    // K's compression granularity (region B is always 4 bytes/token: BY_TOKEN directly, BY_CHANNEL
+    // via 4*head_size bytes per 16-token group) -- used ONLY for the per-batch stride below, never
+    // for region A's own intra-batch pitch/offset.
+#if KV_CACHE_COMPRESSION
+    constexpr int cache_head_size_for_batch_stride = head_size + 4;
+#else
+    constexpr int cache_head_size_for_batch_stride = head_size;
+#endif
 
     uint q_seq_pitch = get_seq_pitch_bytes<Q_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
     uint k_seq_pitch = get_seq_pitch_bytes<K_TRANSPOSE_ORDER, kv_elem_size>(kv_len, num_kv_heads, head_size);
@@ -142,8 +160,8 @@ _GENX_MAIN_ void KERNEL_NAME(
     uint o_seq_pitch = get_seq_pitch_bytes<OUTPUT_TRANSPOSE_ORDER>(q_len, num_heads, head_size);
 
     uint q_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
-    uint k_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, head_size, kv_elem_size);
-    uint v_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, head_size, kv_elem_size);
+    uint k_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, cache_head_size_for_batch_stride, kv_elem_size);
+    uint v_batch_off = (uint)b * get_batch_byte_stride(kv_len, num_kv_heads, cache_head_size_for_batch_stride, kv_elem_size);
     uint o_batch_off = (uint)b * get_batch_byte_stride(q_len, num_heads, head_size);
 
     uint q_off = q_batch_off + get_head_byte_offset<Q_TRANSPOSE_ORDER>(h, q_len, head_size)
@@ -236,18 +254,27 @@ _GENX_MAIN_ void KERNEL_NAME(
     auto slm_K = cm_slm_alloc(K_SLM_SIZE);
     auto slm_V = cm_slm_alloc(V_SLM_SIZE);
 
-    // Scale/zp tensors are always a fixed, TRANSPOSE_ORDER-independent [B, num_kv_heads, ...,
-    // head_size-or-1] layout (see int8_kv_ref.py) -- unlike key/value's own byte layout, there's no
-    // meaningful "swapped" convention for quantization metadata, so this is plain [B,Hkv,...]
-    // element arithmetic, not get_seq_pitch_bytes/get_head_byte_offset. K is [num_sub_blocks,
-    // head_size] per (b,hkv) when BY_CHANNEL, else [kv_len]; V is always [kv_len].
+    // Region B (scale/zp): immediately after region A within the SAME key/value buffer -- see this
+    // file's header comment. Region A holds EVERY kv_head's data for this batch
+    // (kv_len*num_kv_heads*head_size bytes), so region B's base sits right after that; this
+    // specific kv_head's own sub-range then starts hkv*region_b_head_stride further in. K's stride
+    // is kv_len*4 bytes/head (BY_TOKEN, one (scale,zp) pair per token) or
+    // (kv_len/16)*head_size*4 bytes/head (BY_CHANNEL, one pair per channel per 16-token group); V's
+    // is always kv_len*4 bytes/head (V is always BY_TOKEN). Matches
+    // cm_sdpa_opt_prefill_dualsource.cm's / kv_cache_write.cm's region-split convention exactly.
+    uint region_a_size = (uint)kv_len * (uint)num_kv_heads * (uint)head_size;
 #if KV_CACHE_COMPRESSION == 2
-    int num_k_sub_blocks = (kv_len + 15) / 16;
-    uint k_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)num_k_sub_blocks * (uint)head_size;
+    uint region_b_head_stride_k = ((uint)kv_len / 16) * (uint)head_size * 4;
 #else
-    uint k_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len;
+    uint region_b_head_stride_k = (uint)kv_len * 4;
 #endif
-    uint v_meta_off = ((uint)b * num_kv_heads + (uint)hkv) * (uint)kv_len;
+    uint region_b_head_stride_v = (uint)kv_len * 4;
+    svmptr_t k_region_b_base = reinterpret_cast<svmptr_t>((uint8_t*)key + k_batch_off + region_a_size + (uint)hkv * region_b_head_stride_k);
+    svmptr_t v_region_b_base = reinterpret_cast<svmptr_t>((uint8_t*)value + v_batch_off + region_a_size + (uint)hkv * region_b_head_stride_v);
+    svmptr_t k_scale_ptr = k_region_b_base;
+    svmptr_t k_zp_ptr = k_region_b_base + 2;
+    svmptr_t v_scale_ptr = v_region_b_base;
+    svmptr_t v_zp_ptr = v_region_b_base + 2;
 
     // sdpa_kernel_lsc's load_slm_KV pipeline synchronizes the whole work-group via
     // cm_sbarrier/cm_fence, so every lane MUST run the exact same number of kv_pos loop
@@ -312,10 +339,10 @@ _GENX_MAIN_ void KERNEL_NAME(
         reinterpret_cast<svmptr_t>((uint8_t*)value + v_off),
         reinterpret_cast<svmptr_t>((uint8_t*)output + o_off),
         o_seq_pitch,
-        reinterpret_cast<svmptr_t>(key_scale + k_meta_off),
-        reinterpret_cast<svmptr_t>(key_zp + k_meta_off),
-        reinterpret_cast<svmptr_t>(value_scale + v_meta_off),
-        reinterpret_cast<svmptr_t>(value_zp + v_meta_off),
+        k_scale_ptr,
+        k_zp_ptr,
+        v_scale_ptr,
+        v_zp_ptr,
         // sparse_mask_ptr: this work-item's own row (already WG-uniform at SPARSE_BLOCK_SIZE==256,
         // genuinely per-lane at SPARSE_BLOCK_SIZE==128 -- see sdpa_kernel_lsc's doc comment).
         // Used for skip-COMPUTE in both cases (and also skip-LOAD at 256, where the two decisions

@@ -36,23 +36,30 @@ def build_cache_write_kernel(num_kv_heads, head_size):
     return cl.kernels(src, opts)
 
 
-def enqueue_cache_write(t_updates_np, write_indices, t_cache, num_kv_heads, head_size):
+def enqueue_cache_write(t_updates_np, write_indices, t_cache, num_kv_heads, head_size, lk_cache=None):
     """Lower-level entry point operating on an ALREADY-BUILT device tensor `t_cache` (mutated in
     place, same object returned) -- lets a caller reuse one cache tensor across multiple enqueues
     (e.g. a prefill read followed by a cache_write, both against the same buffer, as
     test_read_before_write_ordering does). t_updates_np: numpy half array
-    [n_new, tokens_per_group, num_kv_heads*head_size]."""
+    [n_new, tokens_per_group, num_kv_heads*head_size]. lk_cache: the cache's total physical
+    token-row count (num_slots*tokens_per_group), used by the kernel to bounds-check
+    write_indices -- defaults to t_cache's own slot/token-per-group extent when t_cache is a
+    [num_slots, tokens_per_group, ...] shaped device tensor (not available for a raw flat buffer,
+    in which case the caller must pass it explicitly)."""
     n_new, tokens_per_group, cache_write_dim = t_updates_np.shape
     assert cache_write_dim == num_kv_heads * head_size
     kernel = build_cache_write_kernel(num_kv_heads, head_size)
 
     t_updates = cl.tensor(np.ascontiguousarray(t_updates_np))
     t_write_indices = cl.tensor(write_indices.contiguous().to(torch.int32).numpy())
+    if lk_cache is None:
+        num_slots = t_cache.numpy().reshape(-1, tokens_per_group, cache_write_dim).shape[0]
+        lk_cache = num_slots * tokens_per_group
 
     GWS = [cache_write_dim // 16, tokens_per_group, n_new]
     LWS = [1, 1, 1]
     kernel.enqueue("kv_cache_write", GWS, LWS,
-                    t_updates, t_write_indices, t_cache, int(tokens_per_group), int(n_new))
+                    t_updates, t_write_indices, t_cache, int(tokens_per_group), int(n_new), int(lk_cache))
     return t_cache
 
 
